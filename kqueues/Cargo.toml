@@ -1,0 +1,13 @@
+[package]
+name = "nioruntime_kqueues"
+version = "0.0.1"
+authors = ["BMW Developers"]
+description = "kqueues library for nioruntime"
+license = "Apache-2.0"
+repository = "https://github.com/bitcoinmw/nioruntime"
+keywords = [ "crypto", "nioruntime", "mimblewimble" ]
+exclude = ["**/*.nio"]
+edition = "2018"
+
+[dependencies]
+kqueue = "1.0.3"

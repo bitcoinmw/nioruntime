@@ -1,0 +1,22 @@
+[package]
+name = "nioruntime"
+version = "0.0.1"
+authors = ["BitcoinMW Developers <bitcoinmw@protonmail.com>"]
+description = "A runtime for use with BitcoinMW"
+license = "Apache-2.0"
+repository = "https://github.com/bitcoinmw/nioruntime"
+keywords = [ "crypto", "bitcoinmw", "runtime" ]
+readme = "README.md"
+exclude = ["**/*.nio", "**/*.nio"]
+build = "src/build/build.rs"
+edition = "2018"
+
+[workspace]
+members = ["libnio", "kqueues", "util"]
+
+[dependencies]
+
+
+[build-dependencies]
+built = { version = "0.4", features = ["git2"]}
+

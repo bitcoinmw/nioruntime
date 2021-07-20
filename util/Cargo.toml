@@ -1,0 +1,15 @@
+[package]
+name = "nioruntime_util"
+version = "0.0.1"
+authors = ["BMW Developers"]
+description = "utilities for nioruntime"
+license = "Apache-2.0"
+repository = "https://github.com/bitcoinmw/nioruntime"
+keywords = [ "crypto", "nioruntime", "mimblewimble" ]
+exclude = ["**/*.nio"]
+edition = "2018"
+
+[dependencies]
+
+failure = "0.1"
+failure_derive = "0.1"
