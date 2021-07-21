@@ -34,7 +34,7 @@ pub enum ActionType {
 pub trait EventHandler {
 	/// Add a raw socket for windows event ports
 	#[cfg(target_os = "windows")]
-	fn add_socket<T: AsRawSocket + ?Sized>(
+	fn add_windows_socket<T: AsRawSocket + ?Sized>(
 		&mut self,
 		socket: &T,
 		atype: ActionType,
@@ -48,6 +48,7 @@ pub trait EventHandler {
 	fn remove_fd(&mut self, id: i32) -> Result<(), Error>;
 
 	fn add_tcp_stream(&mut self, stream: TcpStream) -> Result<i32, Error> {
+		stream.set_nonblocking(true)?;
 		#[cfg(any(unix, macos))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
