@@ -12,9 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::threadpool::ClosureHolder;
 use failure::{Backtrace, Context, Fail};
+use nix::errno::Errno;
 use std::fmt;
 use std::fmt::Display;
+use std::str::Utf8Error;
+use std::sync::mpsc::SendError;
 
 #[derive(Debug, Fail)]
 pub struct Error {
@@ -27,6 +31,12 @@ pub enum ErrorKind {
 	/// IOError Error
 	#[fail(display = "IOError Error: {}", _0)]
 	IOError(String),
+	/// Send Error
+	#[fail(display = "Send Error: {}", _0)]
+	SendError(String),
+	/// Internal Error
+	#[fail(display = "Internal Error: {}", _0)]
+	InternalError(String),
 }
 
 impl Display for Error {
@@ -74,6 +84,30 @@ impl From<std::io::Error> for Error {
 	fn from(e: std::io::Error) -> Error {
 		Error {
 			inner: Context::new(ErrorKind::IOError(format!("{}", e))),
+		}
+	}
+}
+
+impl From<Errno> for Error {
+	fn from(e: Errno) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::IOError(format!("{}", e))),
+		}
+	}
+}
+
+impl From<Utf8Error> for Error {
+	fn from(e: Utf8Error) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::IOError(format!("{}", e))),
+		}
+	}
+}
+
+impl From<SendError<ClosureHolder>> for Error {
+	fn from(e: SendError<ClosureHolder>) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::SendError(format!("{}", e))),
 		}
 	}
 }

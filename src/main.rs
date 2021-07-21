@@ -12,6 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nioruntime_kqueues::kqueues::KqueueEventHandler;
+use nioruntime_libnio::EventHandler;
+use nioruntime_util::Error;
+use std::net::TcpListener;
+
 fn main() {
-	println!("This is only a library crate. No main.");
+	let res = real_main();
+	match res {
+		Ok(_) => {}
+		Err(e) => println!("real_main generated Error: {}", e.to_string()),
+	}
+}
+
+fn real_main() -> Result<(), Error> {
+	let listener = TcpListener::bind("127.0.0.1:9999")?;
+	let mut kqe = KqueueEventHandler::new()?;
+	kqe.add_tcp_listener(&listener)?;
+	std::thread::park();
+	Ok(())
 }

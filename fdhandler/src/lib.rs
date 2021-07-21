@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod traits;
+mod fdhandler;
 
-pub use crate::traits::{ActionType, EventHandler};
+pub use crate::fdhandler::{EventType, FdHandler, ProcessEventResult, ResultType};
 pub use nioruntime_util as util;

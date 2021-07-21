@@ -22,6 +22,13 @@ use async_std::os::windows::io::AsRawSocket;
 #[cfg(any(unix, macos))]
 use std::os::unix::io::{AsRawFd, RawFd};
 
+#[derive(Debug, Clone)]
+pub enum ActionType {
+	AddStream,
+	AddListener,
+	Remove,
+}
+
 /// This trait encapsulates all required of the various supported platforms
 /// Currently: Kqueues (BSD/OSX), Epoll (Linux), and CompletionPorts (Windows)
 pub trait EventHandler {
@@ -29,55 +36,48 @@ pub trait EventHandler {
 	#[cfg(target_os = "windows")]
 	fn add_socket<T: AsRawSocket + ?Sized>(
 		&mut self,
-		token: usize,
 		socket: &T,
-	) -> Result<(), Error>;
-
-	/// Remove a raw socket for windows event ports
-	#[cfg(target_os = "windows")]
-	fn remove_socket<T: AsRawSocket + ?Sized>(
-		&mut self,
-		token: usize,
-		socket: &T,
-	) -> Result<(), Error>;
+		atype: ActionType,
+	) -> Result<i32, Error>;
 
 	/// Add a file desciptor for kqueues or epoll (linux, macos)
 	#[cfg(any(unix, macos))]
-	fn add_fd(&mut self, token: usize, fd: RawFd) -> Result<(), Error>;
+	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error>;
 
-	/// Remove a file descriptor for kqueues or epoll (linux, macos)
-	#[cfg(any(unix, macos))]
-	fn remove_fd(&mut self, token: usize, fd: RawFd) -> Result<(), Error>;
+	/// Remove the given id from the event handler
+	fn remove_fd(&mut self, id: i32) -> Result<(), Error>;
 
-	fn add_tcp_stream(&mut self, token: usize, stream: TcpStream) -> Result<(), Error> {
+	fn add_tcp_stream(&mut self, stream: TcpStream) -> Result<i32, Error> {
 		#[cfg(any(unix, macos))]
-		self.add_fd(token, stream.as_raw_fd())?;
+		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
-		self.add_socket(token, stream.as_raw_socket())?;
+		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
+		Ok(ret)
+	}
+
+	fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
+		// must be nonblocking
+		listener.set_nonblocking(true)?;
+		#[cfg(any(unix, macos))]
+		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
+		#[cfg(target_os = "windows")]
+		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
+		Ok(ret)
+	}
+
+	fn remove_tcp_stream(&mut self, stream: TcpStream) -> Result<(), Error> {
+		#[cfg(any(unix, macos))]
+		self.remove_fd(stream.as_raw_fd())?;
+		#[cfg(target_os = "windows")]
+		self.remove_socket(stream.as_raw_socket())?;
 		Ok(())
 	}
 
-	fn add_tcp_listener(&mut self, token: usize, listener: TcpListener) -> Result<(), Error> {
+	fn remove_tcp_listener(&mut self, listener: TcpListener) -> Result<(), Error> {
 		#[cfg(any(unix, macos))]
-		self.add_fd(token, listener.as_raw_fd())?;
+		self.remove_fd(listener.as_raw_fd())?;
 		#[cfg(target_os = "windows")]
-		self.add_socket(token, listener.as_raw_socket())?;
-		Ok(())
-	}
-
-	fn remove_tcp_stream(&mut self, token: usize, stream: TcpStream) -> Result<(), Error> {
-		#[cfg(any(unix, macos))]
-		self.remove_fd(token, stream.as_raw_fd())?;
-		#[cfg(target_os = "windows")]
-		self.remove_socket(token, stream.as_raw_socket())?;
-		Ok(())
-	}
-
-	fn remove_tcp_listener(&mut self, token: usize, listener: TcpListener) -> Result<(), Error> {
-		#[cfg(any(unix, macos))]
-		self.remove_fd(token, listener.as_raw_fd())?;
-		#[cfg(target_os = "windows")]
-		self.remove_socket(token, listener.as_raw_socket())?;
+		self.remove_socket(listener.as_raw_socket())?;
 		Ok(())
 	}
 }
