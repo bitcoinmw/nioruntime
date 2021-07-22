@@ -14,7 +14,6 @@
 
 use crate::error::Error;
 use futures::executor::block_on;
-use futures::FutureExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc;

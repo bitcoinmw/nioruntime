@@ -19,9 +19,7 @@ use kqueue_sys::EventFilter;
 use kqueue_sys::EventFlag;
 use kqueue_sys::FilterFlag;
 use kqueue_sys::{kevent, kqueue};
-use lazy_static::lazy_static;
 use libc::uintptr_t;
-use nioruntime_fdhandler::{EventType, FdHandler, ProcessEventResult, ResultType};
 use nioruntime_libnio::ActionType;
 use nioruntime_libnio::EventHandler;
 use nix::errno::Errno;
@@ -36,7 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::Duration;
 
-const INITIAL_MAX_FDS: usize = 100_000;
+const INITIAL_MAX_FDS: usize = 100;
 
 #[derive(Debug, Clone)]
 struct RawFdAction {
@@ -123,67 +121,16 @@ impl KqueueEventHandler {
 		Ok(KqueueEventHandler { proc_list })
 	}
 
-	fn setup_handlers(
-		fdhandler: &mut FdHandler,
-		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
-	) -> Result<(), Error> {
-		/*
-				fdhandler.register_on_read(move |fd, data| {
-					println!("in fdhandler.onread");
-					let str = std::str::from_utf8(&data[..]);
-					match str {
-						Ok(str) => {
-							println!("read {} bytes on fd[{}] \"{}\"", data.len(), fd, str,);
-						}
-						Err(e) => {
-							println!("read {} bytes of binary data on fd[{}]", data.len(), fd,);
-						}
-					}
-				})?;
-
-				let handler_queue_clone = handler_queue.clone();
-				fdhandler.register_on_close(move |fd| {
-					println!("on close handler: {}", fd);
-					let mut handler_queue = handler_queue.lock();
-					match handler_queue {
-						Ok(mut handler_queue) => {
-							handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Close));
-						}
-						Err(e) => {
-							println!("Unexpected handler error: {}", e.to_string());
-						}
-					}
-				})?;
-
-				fdhandler.register_on_accept(move |fd| {
-					println!("on accept handler: {}", fd);
-					let mut handler_queue = handler_queue_clone.lock();
-					match handler_queue {
-						Ok(mut handler_queue) => {
-							handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Accept));
-						}
-						Err(e) => {
-							println!("Unexpected handler error: {}", e.to_string());
-						}
-					}
-				})?;
-		*/
-		Ok(())
-	}
-
 	fn poll_loop(proc_list: &Arc<Mutex<Vec<RawFdAction>>>, queue: RawFd) -> Result<(), Error> {
 		let thread_pool = ThreadPool::new(4)?;
-		let mut fdhandler = FdHandler::new(4)?;
 		let handler_queue: Vec<HandlerEvent> = vec![];
 		let handler_queue = Arc::new(Mutex::new(handler_queue));
 
-		Self::setup_handlers(&mut fdhandler, handler_queue.clone())?;
-
 		let mut info_holder = Vec::new();
-		// preallocate what will most likely be enough forever
+		// preallocate some
 		info_holder.reserve(INITIAL_MAX_FDS);
 		for _ in 0..INITIAL_MAX_FDS {
-			info_holder.push(FdType::Unknown);
+			info_holder.push((FdType::Unknown, Arc::new(Mutex::new(false))));
 		}
 
 		println!("Server started");
@@ -226,10 +173,10 @@ impl KqueueEventHandler {
 						let len = info_holder.len();
 						if fd >= len {
 							for _ in len..fd + 1 {
-								info_holder.push(FdType::Unknown);
+								info_holder.push((FdType::Unknown, Arc::new(Mutex::new(false))));
 							}
 						}
-						info_holder[fd] = FdType::Stream;
+						info_holder[fd] = (FdType::Stream, Arc::new(Mutex::new(false)));
 					}
 					ActionType::AddListener => {
 						let fd = proc.fd as uintptr_t;
@@ -246,10 +193,10 @@ impl KqueueEventHandler {
 						let len = info_holder.len();
 						if fd >= len {
 							for _ in len..fd + 1 {
-								info_holder.push(FdType::Unknown);
+								info_holder.push((FdType::Unknown, Arc::new(Mutex::new(false))));
 							}
 						}
-						info_holder[fd] = FdType::Listener;
+						info_holder[fd] = (FdType::Listener, Arc::new(Mutex::new(false)));
 					}
 					ActionType::Remove => {}
 				}
@@ -277,10 +224,11 @@ impl KqueueEventHandler {
 							let len = info_holder.len();
 							if fd >= len {
 								for _ in len..fd + 1 {
-									info_holder.push(FdType::Unknown);
+									info_holder
+										.push((FdType::Unknown, Arc::new(Mutex::new(false))));
 								}
 							}
-							info_holder[fd] = FdType::Stream;
+							info_holder[fd] = (FdType::Stream, Arc::new(Mutex::new(false)));
 						}
 						HandlerEventType::Close => {
 							println!("closing at poll loop fd: {}", handler_event.fd);
@@ -291,7 +239,8 @@ impl KqueueEventHandler {
 								EventFlag::EV_DELETE,
 								FilterFlag::empty(),
 							));
-							info_holder[handler_event.fd as usize] = FdType::Unknown;
+							info_holder[handler_event.fd as usize] =
+								(FdType::Unknown, Arc::new(Mutex::new(false)));
 						}
 					}
 				}
@@ -321,9 +270,7 @@ impl KqueueEventHandler {
 
 			let res = match ret {
 				-1 => Self::process_error(ret_kev, &info_holder),
-				_ => {
-					Self::process_event(ret_kev, &info_holder, &thread_pool, handler_queue.clone())
-				}
+				_ => Self::process_event(ret_kev, &info_holder, &thread_pool, &handler_queue),
 			};
 
 			match res {
@@ -335,26 +282,32 @@ impl KqueueEventHandler {
 		}
 	}
 
-	fn process_error(kev: kevent, info_holder: &Vec<FdType>) -> Result<(), Error> {
+	fn process_error(
+		kev: kevent,
+		info_holder: &Vec<(FdType, Arc<Mutex<bool>>)>,
+	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
-		let fd_type = &info_holder[fd as usize];
+		let fd_type = &info_holder[fd as usize].0;
 		println!("Error on fd = {}, type = {:?}", fd, fd_type);
-		//fdhandler.process_fd_event(fd, EventType::Error)
 		Ok(())
 	}
 
 	fn process_event(
 		kev: kevent,
-		info_holder: &Vec<FdType>,
+		info_holder: &Vec<(FdType, Arc<Mutex<bool>>)>,
 		thread_pool: &ThreadPool,
-		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
+		handler_queue: &Arc<Mutex<Vec<HandlerEvent>>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
-		let fd_type = &info_holder[fd as usize];
+		let fd_type = &info_holder[fd as usize].0;
+		let lock = &info_holder[fd as usize].1;
+		let lock = lock.clone();
 
 		match fd_type {
 			FdType::Listener => {
 				println!("about to accept {}", fd);
+				// one at a time per fd
+				let _lock = lock.lock().unwrap();
 				let res = accept(fd);
 				match res {
 					Ok(res) => {
@@ -366,19 +319,20 @@ impl KqueueEventHandler {
 				}?;
 			}
 			FdType::Stream => {
+				let handler_queue = handler_queue.clone();
 				thread_pool.execute(async move {
-					let mut buf = [0u8; 1024];
+					let mut buf = [0u8; 100];
+					// in order to ensure sequence in tact, obtain the lock
+					let _lock = lock.lock().unwrap();
 					let res = read(fd, &mut buf);
 					let _ = match res {
 						Ok(res) => Self::process_read_result(fd, res, buf, handler_queue),
-						Err(e) => Self::process_read_err(fd, e, handler_queue),
+						Err(e) => Self::process_read_err(fd, e, &handler_queue),
 					};
 				})?;
 			}
 			FdType::Unknown => {
-				return Err(
-					ErrorKind::InternalError(format!("unexpected fd_type for fd: {}", fd)).into(),
-				);
+				println!("unexpected fd_type for fd: {}", fd);
 			}
 		};
 
@@ -388,7 +342,7 @@ impl KqueueEventHandler {
 	fn process_read_result(
 		fd: RawFd,
 		len: usize,
-		buf: [u8; 1024],
+		buf: [u8; 100],
 		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
 	) -> Result<(), Error> {
 		println!("read len = {}", len);
@@ -422,12 +376,11 @@ impl KqueueEventHandler {
 	fn process_read_err(
 		fd: RawFd,
 		error: Errno,
-		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
+		handler_queue: &Arc<Mutex<Vec<HandlerEvent>>>,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
 			Errno::EAGAIN => {}
-			Errno::EWOULDBLOCK => {}
 			_ => {
 				let handler_queue = handler_queue.lock();
 				match handler_queue {
@@ -448,7 +401,7 @@ impl KqueueEventHandler {
 	fn process_accept_result(
 		_acceptor: RawFd,
 		nfd: RawFd,
-		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
+		handler_queue: &Arc<Mutex<Vec<HandlerEvent>>>,
 	) -> Result<(), Error> {
 		println!("res was {}", nfd);
 		{
@@ -479,6 +432,5 @@ fn test_kqueues() -> Result<(), Error> {
 	let mut kqe = KqueueEventHandler::new()?;
 	kqe.add_tcp_listener(&listener)?;
 	std::thread::sleep(std::time::Duration::from_millis(1000));
-	//assert!(false);
 	Ok(())
 }
