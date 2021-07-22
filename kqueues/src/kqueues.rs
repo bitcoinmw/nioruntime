@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::duration_to_timespec;
+use crate::util::threadpool::ThreadPool;
 use crate::util::{Error, ErrorKind};
 use kqueue_sys::EventFilter;
 use kqueue_sys::EventFlag;
@@ -23,16 +24,19 @@ use libc::uintptr_t;
 use nioruntime_fdhandler::{EventType, FdHandler, ProcessEventResult, ResultType};
 use nioruntime_libnio::ActionType;
 use nioruntime_libnio::EventHandler;
+use nix::errno::Errno;
+use nix::fcntl::fcntl;
+use nix::fcntl::OFlag;
+use nix::fcntl::F_SETFL;
+use nix::sys::socket::accept;
+use nix::unistd::close;
+use nix::unistd::read;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::Duration;
 
 const INITIAL_MAX_FDS: usize = 100_000;
-
-lazy_static! {
-	static ref ARRAY: Mutex<FdHandler> = Mutex::new(FdHandler::new(4));
-}
 
 #[derive(Debug, Clone)]
 struct RawFdAction {
@@ -123,49 +127,52 @@ impl KqueueEventHandler {
 		fdhandler: &mut FdHandler,
 		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
 	) -> Result<(), Error> {
-		fdhandler.register_on_read(move |fd, data| {
-			println!("in fdhandler.onread");
-			let str = std::str::from_utf8(&data[..]);
-			match str {
-				Ok(str) => {
-					println!("read {} bytes on fd[{}] \"{}\"", data.len(), fd, str,);
-				}
-				Err(e) => {
-					println!("read {} bytes of binary data on fd[{}]", data.len(), fd,);
-				}
-			}
-		})?;
+		/*
+				fdhandler.register_on_read(move |fd, data| {
+					println!("in fdhandler.onread");
+					let str = std::str::from_utf8(&data[..]);
+					match str {
+						Ok(str) => {
+							println!("read {} bytes on fd[{}] \"{}\"", data.len(), fd, str,);
+						}
+						Err(e) => {
+							println!("read {} bytes of binary data on fd[{}]", data.len(), fd,);
+						}
+					}
+				})?;
 
-		let handler_queue_clone = handler_queue.clone();
-		fdhandler.register_on_close(move |fd| {
-			println!("on close handler: {}", fd);
-			let mut handler_queue = handler_queue.lock();
-			match handler_queue {
-				Ok(mut handler_queue) => {
-					handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Close));
-				}
-				Err(e) => {
-					println!("Unexpected handler error: {}", e.to_string());
-				}
-			}
-		})?;
+				let handler_queue_clone = handler_queue.clone();
+				fdhandler.register_on_close(move |fd| {
+					println!("on close handler: {}", fd);
+					let mut handler_queue = handler_queue.lock();
+					match handler_queue {
+						Ok(mut handler_queue) => {
+							handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Close));
+						}
+						Err(e) => {
+							println!("Unexpected handler error: {}", e.to_string());
+						}
+					}
+				})?;
 
-		fdhandler.register_on_accept(move |fd| {
-			println!("on accept handler: {}", fd);
-			let mut handler_queue = handler_queue_clone.lock();
-			match handler_queue {
-				Ok(mut handler_queue) => {
-					handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Accept));
-				}
-				Err(e) => {
-					println!("Unexpected handler error: {}", e.to_string());
-				}
-			}
-		})?;
+				fdhandler.register_on_accept(move |fd| {
+					println!("on accept handler: {}", fd);
+					let mut handler_queue = handler_queue_clone.lock();
+					match handler_queue {
+						Ok(mut handler_queue) => {
+							handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Accept));
+						}
+						Err(e) => {
+							println!("Unexpected handler error: {}", e.to_string());
+						}
+					}
+				})?;
+		*/
 		Ok(())
 	}
 
 	fn poll_loop(proc_list: &Arc<Mutex<Vec<RawFdAction>>>, queue: RawFd) -> Result<(), Error> {
+		let thread_pool = ThreadPool::new(4)?;
 		let mut fdhandler = FdHandler::new(4)?;
 		let handler_queue: Vec<HandlerEvent> = vec![];
 		let handler_queue = Arc::new(Mutex::new(handler_queue));
@@ -179,7 +186,6 @@ impl KqueueEventHandler {
 			info_holder.push(FdType::Unknown);
 		}
 
-		let mut event_result: Option<ProcessEventResult> = None;
 		println!("Server started");
 		loop {
 			let to_process;
@@ -194,6 +200,12 @@ impl KqueueEventHandler {
 				to_process = proc_list.clone();
 				proc_list.clear();
 			}
+
+			// give up time slice here
+			// so workers can complete first
+			// this reduces the "EAGAIN" from happening with read
+			// happening in multiple threads
+			std::thread::yield_now();
 
 			let mut kevs: Vec<kevent> = Vec::new();
 
@@ -285,53 +297,13 @@ impl KqueueEventHandler {
 				}
 				(*handler_queue).clear();
 			}
-			/*
-						match event_result.as_ref() {
-							Some(result) => {
-								match result.result_type {
-									ResultType::AcceptedFd => {
-										match result.fd {
-											Some(fd) => {
-												let fd = fd as uintptr_t;
-												kevs.push(kevent::new(
-													fd,
-													EventFilter::EVFILT_READ,
-													EventFlag::EV_ADD,
-													FilterFlag::empty(),
-												));
-
-												// make sure there's enough space
-												// most likely allocations will not be needed
-												// due to the large initial allocation
-												let len = info_holder.len();
-												if fd >= len {
-													for _ in len..fd + 1 {
-														info_holder.push(FdType::Unknown);
-													}
-												}
-												info_holder[fd] = FdType::Stream;
-											}
-											None => println!("unexpected error: no fd (accept)"),
-										}
-									}
-									ResultType::CloseFd => match result.fd {
-										Some(fd) => {
-											info_holder[fd as usize] = FdType::Unknown;
-										}
-										None => println!("unexpected error: no fd (close)"),
-									},
-									_ => {}
-								}
-							}
-							None => {}
-						}
-			*/
 			let mut ret_kev = kevent::new(
 				0,
 				EventFilter::EVFILT_SYSCOUNT,
 				EventFlag::empty(),
 				FilterFlag::empty(),
 			);
+
 			let ret = unsafe {
 				kevent(
 					queue,
@@ -347,34 +319,62 @@ impl KqueueEventHandler {
 				continue;
 			}
 
-			match ret {
-				-1 => Self::process_error(ret_kev, &fdhandler, &info_holder),
-				_ => Self::process_event(ret_kev, &fdhandler, &info_holder),
+			let res = match ret {
+				-1 => Self::process_error(ret_kev, &info_holder),
+				_ => {
+					Self::process_event(ret_kev, &info_holder, &thread_pool, handler_queue.clone())
+				}
 			};
+
+			match res {
+				Ok(_) => {}
+				Err(e) => {
+					println!("Unexpected error in poll loop: {}", e.to_string());
+				}
+			}
 		}
 	}
 
-	fn process_error(
-		kev: kevent,
-		fdhandler: &'static FdHandler,
-		info_holder: &Vec<FdType>,
-	) -> Result<(), Error> {
+	fn process_error(kev: kevent, info_holder: &Vec<FdType>) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		let fd_type = &info_holder[fd as usize];
 		println!("Error on fd = {}, type = {:?}", fd, fd_type);
-		fdhandler.process_fd_event(fd, EventType::Error)
+		//fdhandler.process_fd_event(fd, EventType::Error)
+		Ok(())
 	}
 
 	fn process_event(
 		kev: kevent,
-		fdhandler: &'static FdHandler,
 		info_holder: &Vec<FdType>,
+		thread_pool: &ThreadPool,
+		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		let fd_type = &info_holder[fd as usize];
-		let result = match fd_type {
-			FdType::Listener => fdhandler.process_fd_event(fd, EventType::Accept)?,
-			FdType::Stream => fdhandler.process_fd_event(fd, EventType::Read)?,
+
+		match fd_type {
+			FdType::Listener => {
+				println!("about to accept {}", fd);
+				let res = accept(fd);
+				match res {
+					Ok(res) => {
+						// set non-blocking
+						fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap()))?;
+						Self::process_accept_result(fd, res, handler_queue)
+					}
+					Err(e) => Self::process_accept_err(fd, e),
+				}?;
+			}
+			FdType::Stream => {
+				thread_pool.execute(async move {
+					let mut buf = [0u8; 1024];
+					let res = read(fd, &mut buf);
+					let _ = match res {
+						Ok(res) => Self::process_read_result(fd, res, buf, handler_queue),
+						Err(e) => Self::process_read_err(fd, e, handler_queue),
+					};
+				})?;
+			}
 			FdType::Unknown => {
 				return Err(
 					ErrorKind::InternalError(format!("unexpected fd_type for fd: {}", fd)).into(),
@@ -382,7 +382,92 @@ impl KqueueEventHandler {
 			}
 		};
 
-		Ok(result)
+		Ok(())
+	}
+
+	fn process_read_result(
+		fd: RawFd,
+		len: usize,
+		buf: [u8; 1024],
+		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
+	) -> Result<(), Error> {
+		println!("read len = {}", len);
+		if len > 0 {
+			let utf8_ver = std::str::from_utf8(&buf[0..len as usize]);
+			match utf8_ver {
+				Ok(s) => {
+					println!("read {} bytes = '{}'", len, s,);
+				}
+				Err(_e) => {
+					println!("{} binary bytes of data", len)
+				}
+			}
+		} else {
+			println!("read 0 bytes");
+			// close
+			let handler_queue = handler_queue.lock();
+			match handler_queue {
+				Ok(mut handler_queue) => {
+					handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Close));
+				}
+				Err(e) => {
+					println!("Unexpected handler error: {}", e.to_string());
+				}
+			}
+			close(fd)?;
+		}
+		Ok(())
+	}
+
+	fn process_read_err(
+		fd: RawFd,
+		error: Errno,
+		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
+	) -> Result<(), Error> {
+		// don't close if it's an EAGAIN or one of the other non-terminal errors
+		match error {
+			Errno::EAGAIN => {}
+			Errno::EWOULDBLOCK => {}
+			_ => {
+				let handler_queue = handler_queue.lock();
+				match handler_queue {
+					Ok(mut handler_queue) => {
+						handler_queue.push(HandlerEvent::new(fd, HandlerEventType::Close));
+					}
+					Err(e) => {
+						println!("Unexpected handler error: {}", e.to_string());
+					}
+				}
+				close(fd)?;
+			}
+		}
+		println!("read error on {}, error: {}", fd, error);
+		Ok(())
+	}
+
+	fn process_accept_result(
+		_acceptor: RawFd,
+		nfd: RawFd,
+		handler_queue: Arc<Mutex<Vec<HandlerEvent>>>,
+	) -> Result<(), Error> {
+		println!("res was {}", nfd);
+		{
+			let handler_queue = handler_queue.lock();
+			match handler_queue {
+				Ok(mut handler_queue) => {
+					handler_queue.push(HandlerEvent::new(nfd, HandlerEventType::Accept));
+				}
+				Err(e) => {
+					println!("Unexpected handler error: {}", e.to_string());
+				}
+			}
+		}
+		Ok(())
+	}
+
+	fn process_accept_err(_acceptor: RawFd, error: Errno) -> Result<(), Error> {
+		println!("error on acceptor: {}", error);
+		Ok(())
 	}
 }
 

@@ -14,6 +14,7 @@
 
 use crate::error::Error;
 use futures::executor::block_on;
+use futures::FutureExt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc;
@@ -23,12 +24,6 @@ use std::thread;
 
 pub struct FuturesHolder {
 	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
-}
-
-impl FuturesHolder {
-	fn get_inner(&mut self) -> &mut Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>> {
-		&mut self.inner
-	}
 }
 
 pub struct ThreadPool {
@@ -44,7 +39,7 @@ impl ThreadPool {
 		for _ in 0..size {
 			let rx = rx.clone();
 			thread::spawn(move || loop {
-				let mut task = {
+				let task = {
 					let rx = rx.lock();
 					match rx {
 						Ok(rx) => match (*rx).recv() {
@@ -61,9 +56,7 @@ impl ThreadPool {
 					}
 				};
 
-				println!("recv task");
-				block_on(task.get_inner());
-				println!("done");
+				block_on(task.inner);
 			});
 		}
 		let tx = Arc::new(Mutex::new(tx));
@@ -86,25 +79,44 @@ impl ThreadPool {
 #[test]
 fn test_thread_pool() -> Result<(), Error> {
 	let tp = ThreadPool::new(10).unwrap();
+	let tp = Arc::new(Mutex::new(tp));
 	let x = Arc::new(Mutex::new(0));
 	let x1 = x.clone();
 	let x2 = x.clone();
 	let x3 = x.clone();
+	let tp1 = tp.clone();
+	let tp2 = tp.clone();
+	let tp3 = tp.clone();
 
-	tp.execute(async move {
-		let mut x = x.lock().unwrap();
-		*x += 1;
-	})?;
+	thread::spawn(move || {
+		let tp = tp1.clone();
+		let tp = tp.lock().unwrap();
+		tp.execute(async move {
+			let mut x = x.lock().unwrap();
+			*x += 1;
+		})
+		.unwrap();
+	});
 
-	tp.execute(async move {
-		let mut x = x1.lock().unwrap();
-		*x += 1;
-	})?;
+	thread::spawn(move || {
+		let tp = tp2.clone();
+		let tp = tp.lock().unwrap();
+		tp.execute(async move {
+			let mut x = x1.lock().unwrap();
+			*x += 1;
+		})
+		.unwrap();
+	});
 
-	tp.execute(async move {
-		let mut x = x2.lock().unwrap();
-		*x += 1;
-	})?;
+	thread::spawn(move || {
+		let tp = tp3.clone();
+		let tp = tp.lock().unwrap();
+		tp.execute(async move {
+			let mut x = x2.lock().unwrap();
+			*x += 1;
+		})
+		.unwrap();
+	});
 
 	// wait for executors to complete
 	std::thread::sleep(std::time::Duration::from_millis(300));

@@ -17,12 +17,15 @@ use crate::util::Error;
 use nix::sys::socket::accept;
 use nix::unistd::close;
 use nix::unistd::read;
+use std::future::Future;
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
 
 pub struct ReadClosureHolder {
-	closure: Box<dyn Fn(RawFd, &[u8]) -> ()>,
+	//closure: Box<dyn Fn(RawFd, &[u8]) -> ()>,
+	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
-
+/*
 impl ReadClosureHolder {
 	pub fn new<F>(f: F) -> Self
 	where
@@ -33,11 +36,13 @@ impl ReadClosureHolder {
 		}
 	}
 }
+*/
 
 pub struct AcceptClosureHolder {
-	closure: Box<dyn Fn(RawFd) -> ()>,
+	//	closure: Box<dyn Fn(RawFd) -> ()>,
+	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
-
+/*
 impl AcceptClosureHolder {
 	pub fn new<F>(f: F) -> Self
 	where
@@ -48,11 +53,12 @@ impl AcceptClosureHolder {
 		}
 	}
 }
-
+*/
 pub struct CloseClosureHolder {
-	closure: Box<dyn Fn(RawFd) -> ()>,
+	//	closure: Box<dyn Fn(RawFd) -> ()>,
+	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
-
+/*
 impl CloseClosureHolder {
 	pub fn new<F>(f: F) -> Self
 	where
@@ -63,6 +69,7 @@ impl CloseClosureHolder {
 		}
 	}
 }
+*/
 
 pub struct FdHandler {
 	read_pool: ThreadPool,
@@ -111,50 +118,66 @@ impl FdHandler {
 		self.do_process_fd_event(fd, etype)
 	}
 
+	fn do_process_future<F>(&'static self, fut: F) -> Result<(), Error>
+	where
+		F: Future<Output = (i32, [u8; 1024])> + Send + Sync + 'static,
+	{
+		//self.read_pool.execute(fut);
+		Ok(())
+	}
+
 	fn do_process_fd_event(&'static self, fd: RawFd, etype: EventType) -> Result<(), Error> {
 		match etype {
 			EventType::Accept => {
 				let res = accept(fd)?;
 				if res > 0 {
-					match &self.accept_handler {
-						Some(handler) => (handler.closure)(res),
-						None => {}
-					}
+					/*
+										match &self.accept_handler {
+											Some(handler) => (handler.closure)(res),
+											None => {}
+										}
+					*/
 				}
 			}
 			EventType::Read => {
-				self.read_pool.execute(async {
-					self.process_read(fd);
-				});
+				/*
+								self.read_pool.execute(async move {
+									self.process_read(fd);
+								});
+				*/
 			}
 			_ => {}
 		}
 		Ok(())
 	}
+	/*
+		pub fn register_on_read<F>(&mut self, inner: F) -> Result<(), Error>
+		where
+			//F: Fn(RawFd, &[u8]) -> () + 'static + Sync,
+			F: Future<Output = ()> + Send + Sync + 'static
+		{
+			self.read_handler = Some(ReadClosureHolder { inner: Box::pin(inner) });
+			Ok(())
+		}
 
-	pub fn register_on_read<F>(&mut self, handler: F) -> Result<(), Error>
-	where
-		F: Fn(RawFd, &[u8]) -> () + 'static + Sync,
-	{
-		self.read_handler = Some(ReadClosureHolder::new(handler));
-		Ok(())
-	}
+		pub fn register_on_close<F>(&mut self, inner: F) -> Result<(), Error>
+		where
+			//F: Fn(RawFd) -> () + 'static + Sync,
+			F: Future<Output = ()> + Send + Sync + 'static
+		{
+			self.close_handler = Some(CloseClosureHolder { inner: Box::pin(inner) });
+			Ok(())
+		}
 
-	pub fn register_on_close<F>(&mut self, handler: F) -> Result<(), Error>
-	where
-		F: Fn(RawFd) -> () + 'static + Sync,
-	{
-		self.close_handler = Some(CloseClosureHolder::new(handler));
-		Ok(())
-	}
-
-	pub fn register_on_accept<F>(&mut self, handler: F) -> Result<(), Error>
-	where
-		F: Fn(RawFd) -> () + 'static + Sync,
-	{
-		self.accept_handler = Some(AcceptClosureHolder::new(handler));
-		Ok(())
-	}
+		pub fn register_on_accept<F>(&mut self, inner: F) -> Result<(), Error>
+		where
+			//F: Fn(RawFd) -> () + 'static + Sync,
+			F: Future<Output = ()> + Send + Sync + 'static
+		{
+			self.accept_handler = Some(AcceptClosureHolder { inner: Box::pin(inner) });
+			Ok(())
+		}
+	*/
 
 	fn process_read(&self, fd: RawFd) -> Result<(), Error> {
 		// first try to read if we can without blocking
@@ -162,32 +185,38 @@ impl FdHandler {
 		let res = read(fd, &mut buf);
 		match res {
 			Ok(len) => {
-				match len {
-					len if len <= 0 => {
-						// end of stream or error
-						// need to close and let upstream know
-						let _ = close(fd);
-						match &self.close_handler {
-							Some(handler) => (handler.closure)(fd),
-							None => {}
-						}
-					}
-					len if len > 0 => match &self.read_handler {
-						Some(handler) => (handler.closure)(fd, &buf[0..len]),
-						None => {}
-					},
-					_ => {}
-				}
+				/*
+								match len {
+									len if len <= 0 => {
+										// end of stream or error
+										// need to close and let upstream know
+										let _ = close(fd);
+
+										match &self.close_handler {
+											Some(handler) => (handler.closure)(fd),
+											None => {}
+										}
+
+									}
+									len if len > 0 => match &self.read_handler {
+										Some(handler) => (handler.closure)(fd, &buf[0..len]),
+										None => {}
+									},
+									_ => {}
+								}
+				*/
 			}
 			Err(e) => {
 				println!("read on fd = {} resulted in error: {}", fd, e.to_string());
 				// close
 				let _ = close(fd);
 				println!("close complete");
-				match &self.close_handler {
-					Some(handler) => (handler.closure)(fd),
-					None => {}
-				}
+				/*
+								match &self.close_handler {
+									Some(handler) => (handler.closure)(fd),
+									None => {}
+								}
+				*/
 			}
 		}
 
