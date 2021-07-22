@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::threadpool::ClosureHolder;
+use crate::threadpool::FuturesHolder;
 use failure::{Backtrace, Context, Fail};
 use nix::errno::Errno;
 use std::fmt;
 use std::fmt::Display;
 use std::str::Utf8Error;
-use std::sync::mpsc::SendError;
 
 #[derive(Debug, Fail)]
 pub struct Error {
@@ -104,10 +103,10 @@ impl From<Utf8Error> for Error {
 	}
 }
 
-impl From<SendError<ClosureHolder>> for Error {
-	fn from(e: SendError<ClosureHolder>) -> Error {
+impl From<std::sync::mpsc::SendError<FuturesHolder>> for Error {
+	fn from(e: std::sync::mpsc::SendError<FuturesHolder>) -> Error {
 		Error {
-			inner: Context::new(ErrorKind::SendError(format!("{}", e))),
+			inner: Context::new(ErrorKind::IOError(format!("{}", e))),
 		}
 	}
 }

@@ -18,6 +18,7 @@ use kqueue_sys::EventFilter;
 use kqueue_sys::EventFlag;
 use kqueue_sys::FilterFlag;
 use kqueue_sys::{kevent, kqueue};
+use lazy_static::lazy_static;
 use libc::uintptr_t;
 use nioruntime_fdhandler::{EventType, FdHandler, ProcessEventResult, ResultType};
 use nioruntime_libnio::ActionType;
@@ -28,6 +29,10 @@ use std::thread::spawn;
 use std::time::Duration;
 
 const INITIAL_MAX_FDS: usize = 100_000;
+
+lazy_static! {
+	static ref ARRAY: Mutex<FdHandler> = Mutex::new(FdHandler::new(4));
+}
 
 #[derive(Debug, Clone)]
 struct RawFdAction {
@@ -157,7 +162,6 @@ impl KqueueEventHandler {
 				}
 			}
 		})?;
-
 		Ok(())
 	}
 
@@ -352,7 +356,7 @@ impl KqueueEventHandler {
 
 	fn process_error(
 		kev: kevent,
-		fdhandler: &FdHandler,
+		fdhandler: &'static FdHandler,
 		info_holder: &Vec<FdType>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
@@ -363,7 +367,7 @@ impl KqueueEventHandler {
 
 	fn process_event(
 		kev: kevent,
-		fdhandler: &FdHandler,
+		fdhandler: &'static FdHandler,
 		info_holder: &Vec<FdType>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;

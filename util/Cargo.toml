@@ -13,4 +13,5 @@ edition = "2018"
 
 failure = "0.1"
 failure_derive = "0.1"
+futures = "0.3.0"
 nix = "0.22.0"

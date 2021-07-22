@@ -26,7 +26,7 @@ pub struct ReadClosureHolder {
 impl ReadClosureHolder {
 	pub fn new<F>(f: F) -> Self
 	where
-		F: Fn(RawFd, &[u8]) -> () + 'static,
+		F: Fn(RawFd, &[u8]) -> () + 'static + Sync,
 	{
 		ReadClosureHolder {
 			closure: Box::new(f),
@@ -41,7 +41,7 @@ pub struct AcceptClosureHolder {
 impl AcceptClosureHolder {
 	pub fn new<F>(f: F) -> Self
 	where
-		F: Fn(RawFd) -> () + 'static,
+		F: Fn(RawFd) -> () + 'static + Sync,
 	{
 		AcceptClosureHolder {
 			closure: Box::new(f),
@@ -56,7 +56,7 @@ pub struct CloseClosureHolder {
 impl CloseClosureHolder {
 	pub fn new<F>(f: F) -> Self
 	where
-		F: Fn(RawFd) -> () + 'static,
+		F: Fn(RawFd) -> () + 'static + Sync,
 	{
 		CloseClosureHolder {
 			closure: Box::new(f),
@@ -107,11 +107,11 @@ impl FdHandler {
 		})
 	}
 
-	pub fn process_fd_event(&self, fd: RawFd, etype: EventType) -> Result<(), Error> {
+	pub fn process_fd_event(&'static self, fd: RawFd, etype: EventType) -> Result<(), Error> {
 		self.do_process_fd_event(fd, etype)
 	}
 
-	fn do_process_fd_event(&self, fd: RawFd, etype: EventType) -> Result<(), Error> {
+	fn do_process_fd_event(&'static self, fd: RawFd, etype: EventType) -> Result<(), Error> {
 		match etype {
 			EventType::Accept => {
 				let res = accept(fd)?;
@@ -123,9 +123,9 @@ impl FdHandler {
 				}
 			}
 			EventType::Read => {
-				//self.read_pool.execute(move || {
-				self.process_read(fd);
-				//});
+				self.read_pool.execute(async {
+					self.process_read(fd);
+				});
 			}
 			_ => {}
 		}
@@ -134,7 +134,7 @@ impl FdHandler {
 
 	pub fn register_on_read<F>(&mut self, handler: F) -> Result<(), Error>
 	where
-		F: Fn(RawFd, &[u8]) -> () + 'static,
+		F: Fn(RawFd, &[u8]) -> () + 'static + Sync,
 	{
 		self.read_handler = Some(ReadClosureHolder::new(handler));
 		Ok(())
@@ -142,7 +142,7 @@ impl FdHandler {
 
 	pub fn register_on_close<F>(&mut self, handler: F) -> Result<(), Error>
 	where
-		F: Fn(RawFd) -> () + 'static,
+		F: Fn(RawFd) -> () + 'static + Sync,
 	{
 		self.close_handler = Some(CloseClosureHolder::new(handler));
 		Ok(())
@@ -150,7 +150,7 @@ impl FdHandler {
 
 	pub fn register_on_accept<F>(&mut self, handler: F) -> Result<(), Error>
 	where
-		F: Fn(RawFd) -> () + 'static,
+		F: Fn(RawFd) -> () + 'static + Sync,
 	{
 		self.accept_handler = Some(AcceptClosureHolder::new(handler));
 		Ok(())

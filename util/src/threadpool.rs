@@ -13,46 +13,42 @@
 // limitations under the License.
 
 use crate::error::Error;
+use futures::executor::block_on;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
-pub struct ClosureHolder {
-	closure: Box<dyn Fn() -> ()>,
+pub struct FuturesHolder {
+	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
 
-impl ClosureHolder {
-	pub fn new<F>(f: F) -> Self
-	where
-		F: Fn() -> () + 'static,
-	{
-		ClosureHolder {
-			closure: Box::new(f),
-		}
+impl FuturesHolder {
+	fn get_inner(&mut self) -> &mut Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>> {
+		&mut self.inner
 	}
 }
 
-unsafe impl Send for ClosureHolder {}
-
 pub struct ThreadPool {
-	tx: mpsc::Sender<ClosureHolder>,
+	tx: Arc<Mutex<mpsc::Sender<FuturesHolder>>>,
 }
 
 impl ThreadPool {
 	pub fn new(size: usize) -> Result<Self, Error> {
-		let (tx, rx): (mpsc::Sender<ClosureHolder>, mpsc::Receiver<ClosureHolder>) =
+		let (tx, rx): (mpsc::Sender<FuturesHolder>, mpsc::Receiver<FuturesHolder>) =
 			mpsc::channel();
 		let rx = Arc::new(Mutex::new(rx));
 
 		for _ in 0..size {
 			let rx = rx.clone();
 			thread::spawn(move || loop {
-				let f = {
+				let mut task = {
 					let rx = rx.lock();
 					match rx {
 						Ok(rx) => match (*rx).recv() {
-							Ok(closure) => closure,
+							Ok(task) => task,
 							Err(e) => {
 								println!("unexpected error in threadpool: {}", e.to_string());
 								continue;
@@ -65,18 +61,24 @@ impl ThreadPool {
 					}
 				};
 
-				(f.closure)();
+				println!("recv task");
+				block_on(task.get_inner());
+				println!("done");
 			});
 		}
+		let tx = Arc::new(Mutex::new(tx));
 		Ok(ThreadPool { tx })
 	}
 
 	pub fn execute<F>(&self, f: F) -> Result<(), Error>
 	where
-		F: Fn() -> () + 'static,
+		F: Future<Output = ()> + Send + Sync + 'static,
 	{
-		let c = ClosureHolder::new(f);
-		self.tx.send(c)?;
+		let f = FuturesHolder { inner: Box::pin(f) };
+		{
+			let tx = self.tx.lock().unwrap();
+			tx.send(f)?;
+		}
 		Ok(())
 	}
 }
@@ -89,17 +91,17 @@ fn test_thread_pool() -> Result<(), Error> {
 	let x2 = x.clone();
 	let x3 = x.clone();
 
-	tp.execute(move || {
+	tp.execute(async move {
 		let mut x = x.lock().unwrap();
 		*x += 1;
 	})?;
 
-	tp.execute(move || {
+	tp.execute(async move {
 		let mut x = x1.lock().unwrap();
 		*x += 1;
 	})?;
 
-	tp.execute(move || {
+	tp.execute(async move {
 		let mut x = x2.lock().unwrap();
 		*x += 1;
 	})?;
