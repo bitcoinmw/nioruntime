@@ -29,6 +29,16 @@ fn real_main() -> Result<(), Error> {
 	let listener = TcpListener::bind("127.0.0.1:9999")?;
 	let mut kqe = KqueueEventHandler::new()?;
 	kqe.add_tcp_listener(&listener)?;
+
+	let mut i = 0;
+	loop {
+		std::thread::sleep(std::time::Duration::from_secs(1));
+		//let _ = kqe.wakeup();
+		i += 1;
+		if i == 10000000 {
+			break;
+		}
+	}
 	std::thread::park();
 	Ok(())
 }
