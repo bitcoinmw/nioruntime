@@ -93,7 +93,7 @@ struct OnRead<F> {
 	on_read: F,
 }
 
-impl<F> OnRead<F> where F: Fn(i32, &[u8], u32) -> () + Send + 'static + Clone + Sync {}
+impl<F> OnRead<F> where F: Fn(&[u8], usize) -> (&[u8], usize, usize) + Send + 'static + Clone + Sync {}
 
 struct Callbacks<F> {
 	on_read: Option<OnRead<F>>,
@@ -141,7 +141,7 @@ impl<F> EventHandler for KqueueEventHandler<F> {
 
 impl<F> KqueueEventHandler<F>
 where
-	F: Fn(i32, &[u8], u32) -> () + Send + 'static + Clone + Sync,
+	F: Fn(&[u8], usize) -> (&[u8], usize, usize) + Send + 'static + Clone + Sync,
 {
 	fn do_wakeup_with_lock(data: &mut GuardedData<F>) -> Result<(RawFd, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
@@ -169,16 +169,31 @@ where
 		Ok(())
 	}
 
-	pub fn write(&self, id: i32, data: &[u8]) -> Result<(), Error> {
+	fn write(
+		id: i32,
+		data: &[u8],
+		offset: usize,
+		len: usize,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+	) -> Result<(), Error> {
+		if len + offset > data.len() {
+			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
+				"offset+len='{}',data.len='{}'",
+				offset + len,
+				data.len()
+			))
+			.into());
+		}
+
 		// update GuardedData with our write_buffers, notification message, and wakeup
 		let id_idx = id as uintptr_t;
 		let (fd, wakeup_scheduled) = {
-			let mut guarded_data = self.data.lock().map_err(|e| {
+			let mut guarded_data = guarded_data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 				error
 			})?;
 
-			let mut rem = data.len();
+			let mut rem = len;
 			let mut count = 0;
 			loop {
 				let len = match rem <= BUFFER_SIZE {
@@ -191,8 +206,8 @@ where
 					buffer: [0u8; BUFFER_SIZE],
 				};
 
-				let start = count * BUFFER_SIZE;
-				let end = count * BUFFER_SIZE + (len as usize);
+				let start = offset + count * BUFFER_SIZE;
+				let end = offset + count * BUFFER_SIZE + (len as usize);
 				write_buffer.buffer[0..(len as usize)].copy_from_slice(&data[start..end]);
 
 				let cur_len = guarded_data.write_buffers.len();
@@ -735,7 +750,7 @@ where
 			FdType::Stream => {
 				let guarded_data = guarded_data.clone();
 				thread_pool.execute(async move {
-					let mut buf = [0u8; 100];
+					let mut buf = [0u8; BUFFER_SIZE];
 					// in order to ensure sequence in tact, obtain the lock
 					let res = read(fd, &mut buf);
 					let _ = match res {
@@ -767,21 +782,16 @@ where
 	fn process_read_result(
 		fd: RawFd,
 		len: usize,
-		buf: [u8; 100],
+		buf: [u8; BUFFER_SIZE],
 		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 		on_read: F,
 	) -> Result<(), Error> {
 		if len > 0 {
-			(on_read)(fd, &buf, len as u32);
-			let utf8_ver = std::str::from_utf8(&buf[0..len as usize]);
-			match utf8_ver {
-				Ok(s) => {
-					println!("read {} bytes on fd = {} = '{}'", len, fd, s);
-				}
-				Err(_e) => {
-					println!("{} binary bytes of data on fd = {}", len, fd)
-				}
+			let (resp, offset, len) = (on_read)(&buf, len);
+			if len > 0 {
+				Self::write(fd, resp, offset, len, guarded_data)?;
 			}
+
 			Self::push_handler_event(fd, HandlerEventType::Resume, guarded_data, true)?;
 		} else {
 			println!("read 0 bytes EOF closing fd = {}", fd);

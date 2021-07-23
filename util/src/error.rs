@@ -36,6 +36,9 @@ pub enum ErrorKind {
 	/// Internal Error
 	#[fail(display = "Internal Error: {}", _0)]
 	InternalError(String),
+	/// Array Index out of bounds
+	#[fail(display = "ArrayIndexOutofBounds: {}", _0)]
+	ArrayIndexOutofBounds(String),
 }
 
 impl Display for Error {
