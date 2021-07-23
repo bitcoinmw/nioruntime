@@ -39,6 +39,9 @@ pub enum ErrorKind {
 	/// Array Index out of bounds
 	#[fail(display = "ArrayIndexOutofBounds: {}", _0)]
 	ArrayIndexOutofBounds(String),
+	/// Setup Error
+	#[fail(display = "Setup Error: {}", _0)]
+	SetupError(String),
 }
 
 impl Display for Error {

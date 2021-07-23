@@ -47,7 +47,7 @@ pub trait EventHandler {
 	/// Remove the given id from the event handler
 	fn remove_fd(&mut self, id: i32) -> Result<(), Error>;
 
-	fn add_tcp_stream(&mut self, stream: TcpStream) -> Result<i32, Error> {
+	fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<i32, Error> {
 		stream.set_nonblocking(true)?;
 		#[cfg(any(unix, macos))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;

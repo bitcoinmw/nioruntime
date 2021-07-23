@@ -40,6 +40,7 @@ fn real_main() -> Result<(), Error> {
 	kqe.set_on_write_fail(move |connection_id, message_id| {
 		println!("message fail for cid={},mid={}", connection_id, message_id);
 	})?;
+	kqe.start()?;
 	kqe.add_tcp_listener(&listener)?;
 	std::thread::park();
 	Ok(())

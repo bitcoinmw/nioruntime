@@ -106,10 +106,12 @@ struct Callbacks<F, G, H, I, J> {
 struct GuardedData<F, G, H, I, J> {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
+	wakeup_rx: RawFd,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
 	write_buffers: Vec<LinkedList<WriteBuffer<I, J>>>,
+	queue: Option<RawFd>,
 	callbacks: Callbacks<F, G, H, I, J>,
 }
 
@@ -117,12 +119,31 @@ pub struct KqueueEventHandler<F, G, H, I, J> {
 	data: Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 }
 
-impl<F, G, H, I, J> EventHandler for KqueueEventHandler<F, G, H, I, J> {
+impl<F, G, H, I, J> EventHandler for KqueueEventHandler<F, G, H, I, J>
+where
+	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
+		+ Send
+		+ 'static
+		+ Clone
+		+ Sync
+		+ Unpin,
+	G: Fn(u128) -> () + Send + 'static + Clone + Sync,
+	H: Fn(u128) -> () + Send + 'static + Clone + Sync,
+	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
+	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
+{
 	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error> {
+		self.ensure_handlers()?;
+
 		let mut data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
+
+		if data.queue.is_none() {
+			return Err(ErrorKind::SetupError("queue must be started first".to_string()).into());
+		}
+
 		let fd_actions = &mut data.fd_actions;
 		fd_actions.push(RawFdAction::new(fd, atype));
 		Ok(fd.into())
@@ -141,12 +162,76 @@ impl<F, G, H, I, J> EventHandler for KqueueEventHandler<F, G, H, I, J> {
 
 impl<F, G, H, I, J> KqueueEventHandler<F, G, H, I, J>
 where
-	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize) + Send + 'static + Clone + Sync,
+	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
+		+ Send
+		+ 'static
+		+ Clone
+		+ Sync
+		+ Unpin,
 	G: Fn(u128) -> () + Send + 'static + Clone + Sync,
 	H: Fn(u128) -> () + Send + 'static + Clone + Sync,
 	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
 	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
 {
+	fn ensure_handlers(&self) -> Result<(), Error> {
+		let data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		match data.callbacks.on_read {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_read callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		match data.callbacks.on_accept {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_accept callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		match data.callbacks.on_close {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_close callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		match data.callbacks.on_write_fail {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_write_fail callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		match data.callbacks.on_write_success {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_write_success callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		Ok(())
+	}
+
 	fn do_wakeup_with_lock(data: &mut GuardedData<F, G, H, I, J>) -> Result<(RawFd, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
 		if !wakeup_scheduled {
@@ -307,8 +392,10 @@ where
 	}
 
 	pub fn new() -> Self {
-		// create the kqueue
-		let queue = unsafe { kqueue() };
+		/*
+				// create the kqueue
+				let queue = unsafe { kqueue() };
+		*/
 
 		// create the pipe (for wakeups)
 		let (rx, tx) = pipe().unwrap();
@@ -324,19 +411,53 @@ where
 		let guarded_data = GuardedData {
 			fd_actions: vec![],
 			wakeup_fd: tx,
+			wakeup_rx: rx,
 			wakeup_scheduled: false,
 			handler_events: vec![],
 			write_pending: vec![],
 			write_buffers: vec![LinkedList::new()],
+			queue: None,
 			callbacks,
 		};
-		let write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
+		//let write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
-		let cloned_guarded_data = guarded_data.clone();
-		let mut cloned_write_buffers = write_buffers.clone();
+
+		/*
+				let cloned_guarded_data = guarded_data.clone();
+				let mut cloned_write_buffers = write_buffers.clone();
+
+				spawn(move || {
+					let res = Self::poll_loop(&cloned_guarded_data, &mut cloned_write_buffers, queue, rx);
+					match res {
+						Ok(_) => {
+							println!("poll_loop exited normally");
+						}
+						Err(e) => {
+							println!("FATAL: Unexpected error in poll loop: {}", e.to_string());
+						}
+					}
+				});
+		*/
+
+		KqueueEventHandler { data: guarded_data }
+	}
+
+	pub fn start(&self) -> Result<(), Error> {
+		// create the kqueue
+		let queue = unsafe { kqueue() };
+		{
+			let mut guarded_data = self.data.lock().map_err(|e| {
+				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+				error
+			})?;
+			guarded_data.queue = Some(queue);
+		}
+
+		let mut write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
+		let cloned_guarded_data = self.data.clone();
 
 		spawn(move || {
-			let res = Self::poll_loop(&cloned_guarded_data, &mut cloned_write_buffers, queue, rx);
+			let res = Self::poll_loop(&cloned_guarded_data, &mut write_buffers, queue);
 			match res {
 				Ok(_) => {
 					println!("poll_loop exited normally");
@@ -347,16 +468,23 @@ where
 			}
 		});
 
-		KqueueEventHandler { data: guarded_data }
+		Ok(())
 	}
 
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
 		queue: RawFd,
-		rx: RawFd,
 	) -> Result<(), Error> {
 		let thread_pool = ThreadPool::new(4)?;
+
+		let rx = {
+			let guarded_data = guarded_data.lock().map_err(|e| {
+				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+				error
+			})?;
+			guarded_data.wakeup_rx
+		};
 
 		let mut read_fd_type = Vec::new();
 		// preallocate some
@@ -1020,8 +1148,13 @@ fn test_echo() -> Result<(), Error> {
 	use std::net::TcpStream;
 
 	let listener = TcpListener::bind("127.0.0.1:9981")?;
+	let mut stream = TcpStream::connect("127.0.0.1:9981")?;
 	let mut kqe = KqueueEventHandler::new();
-	kqe.set_on_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
+
+	kqe.set_on_read(move |_connection_id, _message_id, buf: &[u8], len| {
+		println!("got: {:?}", &buf[0..len]);
+		(buf, 0, len)
+	})?;
 	kqe.set_on_accept(move |connection_id| println!("accept conn: {}", connection_id))?;
 	kqe.set_on_close(move |connection_id| println!("close conn: {}", connection_id))?;
 	kqe.set_on_write_success(move |connection_id, message_id| {
@@ -1033,13 +1166,20 @@ fn test_echo() -> Result<(), Error> {
 	kqe.set_on_write_fail(move |connection_id, message_id| {
 		println!("message fail for cid={},mid={}", connection_id, message_id);
 	})?;
-	kqe.add_tcp_listener(&listener)?;
 
-	let mut tcp_stream = TcpStream::connect("127.0.0.1:9981")?;
-	tcp_stream.write(&[1, 2, 3, 4, 5])?;
+	kqe.start()?;
+	let _listener_id = kqe.add_tcp_listener(&listener)?;
+	/*
+		let stream_id = kqe.add_tcp_stream(
+			&stream,
+		)?;
+	*/
+
+	stream.write(&[1, 2, 3, 4, 5])?;
 
 	let mut response = [0u8; 128];
-	let res = tcp_stream.read(&mut response)?;
+
+	let res = stream.read(&mut response)?;
 	assert_eq!(res, 5);
 	assert_eq!(response[0], 1);
 	assert_eq!(response[1], 2);
@@ -1047,5 +1187,7 @@ fn test_echo() -> Result<(), Error> {
 	assert_eq!(response[3], 4);
 	assert_eq!(response[4], 5);
 
+	//std::thread::sleep(std::time::Duration::from_millis(100));
+	//assert!(false);
 	Ok(())
 }
