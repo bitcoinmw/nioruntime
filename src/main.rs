@@ -27,7 +27,20 @@ fn main() {
 
 fn real_main() -> Result<(), Error> {
 	let listener = TcpListener::bind("127.0.0.1:9999")?;
-	let mut kqe = KqueueEventHandler::new()?;
+	let mut kqe = KqueueEventHandler::new();
+
+	kqe.set_on_read(move |id, buf, len| {
+		let utf8_ver = std::str::from_utf8(&buf[0..len as usize]);
+		match utf8_ver {
+			Ok(s) => {
+				println!("closure read[{}]={}", id, s);
+			}
+			Err(e) => {
+				println!("error: {}", e.to_string());
+			}
+		}
+	})?;
+
 	kqe.add_tcp_listener(&listener)?;
 
 	let mut i = 0;

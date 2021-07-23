@@ -89,29 +89,35 @@ struct WriteBuffer {
 	buffer: [u8; BUFFER_SIZE],
 }
 
-struct Callbacks {
-	on_read: Option<u8>,
-	on_accept: Option<u8>,
-	on_close: Option<u8>,
-	on_write_success: Option<u8>,
-	on_write_fail: Option<u8>,
+struct OnRead<F> {
+	on_read: F,
 }
 
-struct GuardedData {
+impl<F> OnRead<F> where F: Fn(i32, &[u8], u32) -> () + Send + 'static + Clone + Sync {}
+
+struct Callbacks<F> {
+	on_read: Option<OnRead<F>>,
+	//on_accept: Option<Box<dyn Fn(i32) -> () + Send + 'static>>,
+	//on_close: Option<Box<dyn Fn(i32, &[u8]) -> () + Send + 'static>>,
+	//on_write_success: Option<Box<dyn Fn(i32, u64) -> () + Send + 'static>>,
+	//on_write_fail: Option<Box<dyn Fn(i32, u64) -> () + Send + 'static>>,
+}
+
+struct GuardedData<F> {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
 	write_buffers: Vec<LinkedList<WriteBuffer>>,
-	callbacks: Callbacks,
+	callbacks: Callbacks<F>,
 }
 
-pub struct KqueueEventHandler {
-	data: Arc<Mutex<GuardedData>>,
+pub struct KqueueEventHandler<F> {
+	data: Arc<Mutex<GuardedData<F>>>,
 }
 
-impl EventHandler for KqueueEventHandler {
+impl<F> EventHandler for KqueueEventHandler<F> {
 	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error> {
 		let mut data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -133,8 +139,11 @@ impl EventHandler for KqueueEventHandler {
 	}
 }
 
-impl KqueueEventHandler {
-	fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(RawFd, bool), Error> {
+impl<F> KqueueEventHandler<F>
+where
+	F: Fn(i32, &[u8], u32) -> () + Send + 'static + Clone + Sync,
+{
+	fn do_wakeup_with_lock(data: &mut GuardedData<F>) -> Result<(RawFd, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
 		if !wakeup_scheduled {
 			data.wakeup_scheduled = true;
@@ -142,7 +151,7 @@ impl KqueueEventHandler {
 		Ok((data.wakeup_fd, wakeup_scheduled))
 	}
 
-	fn do_wakeup(data: &Arc<Mutex<GuardedData>>) -> Result<(), Error> {
+	fn do_wakeup(data: &Arc<Mutex<GuardedData<F>>>) -> Result<(), Error> {
 		let mut data = data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
@@ -211,17 +220,32 @@ impl KqueueEventHandler {
 		Ok(())
 	}
 
-	pub fn new() -> Result<KqueueEventHandler, Error> {
+	pub fn set_on_read(&mut self, on_read: F) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.callbacks.on_read = Some(OnRead { on_read });
+
+		Ok(())
+	}
+
+	pub fn new() -> Self {
 		// create the kqueue
 		let queue = unsafe { kqueue() };
 
 		// create the pipe (for wakeups)
-		let (rx, tx) = pipe()?;
+		let (rx, tx) = pipe().unwrap();
 
-		if (queue as i32) < 0 {
-			// OS Level error (no fds available?)
-			return Err(ErrorKind::InternalError("could not create kqueue".to_string()).into());
-		}
+		let callbacks = Callbacks {
+			//on_read: OnRead { on_read },
+			on_read: None,
+			//on_accept: None,
+			//on_close: None,
+			//on_write_success: None,
+			//on_write_fail: None,
+		};
 
 		let guarded_data = GuardedData {
 			fd_actions: vec![],
@@ -230,13 +254,7 @@ impl KqueueEventHandler {
 			handler_events: vec![],
 			write_pending: vec![],
 			write_buffers: vec![LinkedList::new()],
-			callbacks: Callbacks {
-				on_read: None,
-				on_accept: None,
-				on_close: None,
-				on_write_success: None,
-				on_write_fail: None,
-			},
+			callbacks,
 		};
 		let write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
@@ -255,11 +273,11 @@ impl KqueueEventHandler {
 			}
 		});
 
-		Ok(KqueueEventHandler { data: guarded_data })
+		KqueueEventHandler { data: guarded_data }
 	}
 
 	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
 		queue: RawFd,
 		rx: RawFd,
@@ -312,6 +330,7 @@ impl KqueueEventHandler {
 			let to_process;
 			let handler_events;
 			let write_pending;
+			let on_read;
 			{
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
 					let error: Error =
@@ -321,6 +340,13 @@ impl KqueueEventHandler {
 				to_process = guarded_data.fd_actions.clone();
 				handler_events = guarded_data.handler_events.clone();
 				write_pending = guarded_data.write_pending.clone();
+				on_read = guarded_data
+					.callbacks
+					.on_read
+					.as_ref()
+					.unwrap()
+					.on_read
+					.clone();
 				guarded_data.fd_actions.clear();
 				guarded_data.handler_events.clear();
 				guarded_data.write_pending.clear();
@@ -538,6 +564,7 @@ impl KqueueEventHandler {
 					&thread_pool,
 					guarded_data,
 					write_buffers,
+					on_read,
 				),
 			};
 
@@ -561,14 +588,15 @@ impl KqueueEventHandler {
 		kev: kevent,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
+		on_read: F,
 	) -> Result<(), Error> {
 		if kev.filter == EVFILT_WRITE {
 			Self::process_event_write(kev, thread_pool, write_buffers, guarded_data)?;
 		}
 		if kev.filter == EVFILT_READ {
-			Self::process_event_read(kev, read_fd_type, thread_pool, guarded_data)?;
+			Self::process_event_read(kev, read_fd_type, thread_pool, guarded_data, on_read)?;
 		}
 
 		Ok(())
@@ -578,7 +606,7 @@ impl KqueueEventHandler {
 		kev: kevent,
 		thread_pool: &ThreadPool,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		{
@@ -686,7 +714,8 @@ impl KqueueEventHandler {
 		kev: kevent,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		on_read: F,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		let fd_type = &read_fd_type[fd as usize];
@@ -710,7 +739,7 @@ impl KqueueEventHandler {
 					// in order to ensure sequence in tact, obtain the lock
 					let res = read(fd, &mut buf);
 					let _ = match res {
-						Ok(res) => Self::process_read_result(fd, res, buf, &guarded_data),
+						Ok(res) => Self::process_read_result(fd, res, buf, &guarded_data, on_read),
 						Err(e) => Self::process_read_err(fd, e, &guarded_data),
 					};
 				})?;
@@ -739,9 +768,11 @@ impl KqueueEventHandler {
 		fd: RawFd,
 		len: usize,
 		buf: [u8; 100],
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		on_read: F,
 	) -> Result<(), Error> {
 		if len > 0 {
+			(on_read)(fd, &buf, len as u32);
 			let utf8_ver = std::str::from_utf8(&buf[0..len as usize]);
 			match utf8_ver {
 				Ok(s) => {
@@ -764,7 +795,7 @@ impl KqueueEventHandler {
 	fn process_read_err(
 		fd: RawFd,
 		error: Errno,
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
@@ -784,7 +815,7 @@ impl KqueueEventHandler {
 	fn process_accept_result(
 		_acceptor: RawFd,
 		nfd: RawFd,
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 	) -> Result<(), Error> {
 		println!("accepted fd = {}", nfd);
 		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false)?;
@@ -799,7 +830,7 @@ impl KqueueEventHandler {
 	fn push_handler_event(
 		fd: RawFd,
 		event_type: HandlerEventType,
-		guarded_data: &Arc<Mutex<GuardedData>>,
+		guarded_data: &Arc<Mutex<GuardedData<F>>>,
 		wakeup: bool,
 	) -> Result<(), Error> {
 		{
