@@ -38,6 +38,7 @@ use rand::Rng;
 use std::collections::LinkedList;
 use std::convert::TryInto;
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 use std::time::Duration;
@@ -96,11 +97,11 @@ struct WriteBuffer<I, J> {
 }
 
 struct Callbacks<F, G, H, I, J> {
-	on_read: Option<F>,
-	on_accept: Option<G>,
-	on_close: Option<H>,
-	on_write_success: Option<I>,
-	on_write_fail: Option<J>,
+	on_read: Option<Pin<Box<F>>>,
+	on_accept: Option<Pin<Box<G>>>,
+	on_close: Option<Pin<Box<H>>>,
+	on_write_success: Option<Pin<Box<I>>>,
+	on_write_fail: Option<Pin<Box<J>>>,
 }
 
 struct GuardedData<F, G, H, I, J> {
@@ -110,7 +111,7 @@ struct GuardedData<F, G, H, I, J> {
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
-	write_buffers: Vec<LinkedList<WriteBuffer<I, J>>>,
+	write_buffers: Vec<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>,
 	queue: Option<RawFd>,
 	callbacks: Callbacks<F, G, H, I, J>,
 }
@@ -265,8 +266,8 @@ where
 		len: usize,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 		msg_id: u128,
-		on_write_success: I,
-		on_write_fail: J,
+		on_write_success: Pin<Box<I>>,
+		on_write_fail: Pin<Box<J>>,
 	) -> Result<(), Error> {
 		if len + offset > data.len() {
 			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
@@ -342,7 +343,7 @@ where
 			error
 		})?;
 
-		guarded_data.callbacks.on_read = Some(on_read);
+		guarded_data.callbacks.on_read = Some(Box::pin(on_read));
 
 		Ok(())
 	}
@@ -353,7 +354,7 @@ where
 			error
 		})?;
 
-		guarded_data.callbacks.on_accept = Some(on_accept);
+		guarded_data.callbacks.on_accept = Some(Box::pin(on_accept));
 
 		Ok(())
 	}
@@ -364,7 +365,7 @@ where
 			error
 		})?;
 
-		guarded_data.callbacks.on_close = Some(on_close);
+		guarded_data.callbacks.on_close = Some(Box::pin(on_close));
 
 		Ok(())
 	}
@@ -375,7 +376,7 @@ where
 			error
 		})?;
 
-		guarded_data.callbacks.on_write_success = Some(on_write_success);
+		guarded_data.callbacks.on_write_success = Some(Box::pin(on_write_success));
 
 		Ok(())
 	}
@@ -386,7 +387,7 @@ where
 			error
 		})?;
 
-		guarded_data.callbacks.on_write_fail = Some(on_write_fail);
+		guarded_data.callbacks.on_write_fail = Some(Box::pin(on_write_fail));
 
 		Ok(())
 	}
@@ -473,7 +474,7 @@ where
 
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		queue: RawFd,
 	) -> Result<(), Error> {
 		let thread_pool = ThreadPool::new(4)?;
@@ -803,12 +804,12 @@ where
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
-		on_read: F,
-		on_accept: G,
-		on_close: H,
-		on_write_success: I,
-		on_write_fail: J,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		on_read: Pin<Box<F>>,
+		on_accept: Pin<Box<G>>,
+		on_close: Pin<Box<H>>,
+		on_write_success: Pin<Box<I>>,
+		on_write_fail: Pin<Box<J>>,
 	) -> Result<(), Error> {
 		if kev.filter == EVFILT_WRITE {
 			Self::process_event_write(kev, thread_pool, write_buffers, guarded_data)?;
@@ -833,7 +834,7 @@ where
 	fn process_event_write(
 		kev: kevent,
 		thread_pool: &ThreadPool,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
@@ -969,11 +970,11 @@ where
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
-		on_read: F,
-		on_accept: G,
-		on_close: H,
-		on_write_success: I,
-		on_write_fail: J,
+		on_read: Pin<Box<F>>,
+		on_accept: Pin<Box<G>>,
+		on_close: Pin<Box<H>>,
+		on_write_success: Pin<Box<I>>,
+		on_write_fail: Pin<Box<J>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		let fd_type = &read_fd_type[fd as usize];
@@ -1037,10 +1038,10 @@ where
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
-		on_read: F,
-		on_close: H,
-		on_write_success: I,
-		on_write_fail: J,
+		on_read: Pin<Box<F>>,
+		on_close: Pin<Box<H>>,
+		on_write_success: Pin<Box<I>>,
+		on_write_fail: Pin<Box<J>>,
 	) -> Result<(), Error> {
 		if len > 0 {
 			let msg_id: u128 = thread_rng().gen::<u128>();
@@ -1072,7 +1073,7 @@ where
 		fd: RawFd,
 		error: Errno,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
-		on_close: H,
+		on_close: Pin<Box<H>>,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
@@ -1169,10 +1170,11 @@ fn test_echo() -> Result<(), Error> {
 
 	kqe.start()?;
 	let _listener_id = kqe.add_tcp_listener(&listener)?;
+
 	/*
-		let stream_id = kqe.add_tcp_stream(
-			&stream,
-		)?;
+			let stream_id = kqe.add_tcp_stream(
+				&stream,
+			)?;
 	*/
 
 	stream.write(&[1, 2, 3, 4, 5])?;
