@@ -32,8 +32,9 @@ fn real_main() -> Result<(), Error> {
 
 	let mut i = 0;
 	loop {
-		std::thread::sleep(std::time::Duration::from_secs(1));
+		std::thread::sleep(std::time::Duration::from_secs(10));
 		//let _ = kqe.wakeup();
+		kqe.write(7, b"hi\n")?;
 		i += 1;
 		if i == 10000000 {
 			break;
