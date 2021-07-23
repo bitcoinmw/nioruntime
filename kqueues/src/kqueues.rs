@@ -33,7 +33,10 @@ use nix::unistd::close;
 use nix::unistd::pipe;
 use nix::unistd::read;
 use nix::unistd::write;
+use rand::thread_rng;
+use rand::Rng;
 use std::collections::LinkedList;
+use std::convert::TryInto;
 use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
@@ -83,41 +86,38 @@ enum FdType {
 	Unknown,
 }
 
-struct WriteBuffer {
+struct WriteBuffer<I, J> {
 	offset: u16,
 	len: u16,
 	buffer: [u8; BUFFER_SIZE],
+	msg_id: u128,
+	on_write_success: Option<I>,
+	on_write_fail: Option<J>,
 }
 
-struct OnRead<F> {
-	on_read: F,
+struct Callbacks<F, G, H, I, J> {
+	on_read: Option<F>,
+	on_accept: Option<G>,
+	on_close: Option<H>,
+	on_write_success: Option<I>,
+	on_write_fail: Option<J>,
 }
 
-impl<F> OnRead<F> where F: Fn(&[u8], usize) -> (&[u8], usize, usize) + Send + 'static + Clone + Sync {}
-
-struct Callbacks<F> {
-	on_read: Option<OnRead<F>>,
-	//on_accept: Option<Box<dyn Fn(i32) -> () + Send + 'static>>,
-	//on_close: Option<Box<dyn Fn(i32, &[u8]) -> () + Send + 'static>>,
-	//on_write_success: Option<Box<dyn Fn(i32, u64) -> () + Send + 'static>>,
-	//on_write_fail: Option<Box<dyn Fn(i32, u64) -> () + Send + 'static>>,
-}
-
-struct GuardedData<F> {
+struct GuardedData<F, G, H, I, J> {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
-	write_buffers: Vec<LinkedList<WriteBuffer>>,
-	callbacks: Callbacks<F>,
+	write_buffers: Vec<LinkedList<WriteBuffer<I, J>>>,
+	callbacks: Callbacks<F, G, H, I, J>,
 }
 
-pub struct KqueueEventHandler<F> {
-	data: Arc<Mutex<GuardedData<F>>>,
+pub struct KqueueEventHandler<F, G, H, I, J> {
+	data: Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 }
 
-impl<F> EventHandler for KqueueEventHandler<F> {
+impl<F, G, H, I, J> EventHandler for KqueueEventHandler<F, G, H, I, J> {
 	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error> {
 		let mut data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -139,11 +139,15 @@ impl<F> EventHandler for KqueueEventHandler<F> {
 	}
 }
 
-impl<F> KqueueEventHandler<F>
+impl<F, G, H, I, J> KqueueEventHandler<F, G, H, I, J>
 where
-	F: Fn(&[u8], usize) -> (&[u8], usize, usize) + Send + 'static + Clone + Sync,
+	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize) + Send + 'static + Clone + Sync,
+	G: Fn(u128) -> () + Send + 'static + Clone + Sync,
+	H: Fn(u128) -> () + Send + 'static + Clone + Sync,
+	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
+	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
 {
-	fn do_wakeup_with_lock(data: &mut GuardedData<F>) -> Result<(RawFd, bool), Error> {
+	fn do_wakeup_with_lock(data: &mut GuardedData<F, G, H, I, J>) -> Result<(RawFd, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
 		if !wakeup_scheduled {
 			data.wakeup_scheduled = true;
@@ -151,7 +155,7 @@ where
 		Ok((data.wakeup_fd, wakeup_scheduled))
 	}
 
-	fn do_wakeup(data: &Arc<Mutex<GuardedData<F>>>) -> Result<(), Error> {
+	fn do_wakeup(data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>) -> Result<(), Error> {
 		let mut data = data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
@@ -174,7 +178,10 @@ where
 		data: &[u8],
 		offset: usize,
 		len: usize,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		msg_id: u128,
+		on_write_success: I,
+		on_write_fail: J,
 	) -> Result<(), Error> {
 		if len + offset > data.len() {
 			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
@@ -204,6 +211,15 @@ where
 					offset: 0,
 					len,
 					buffer: [0u8; BUFFER_SIZE],
+					msg_id,
+					on_write_success: match rem <= BUFFER_SIZE {
+						true => Some(on_write_success.clone()),
+						false => None,
+					},
+					on_write_fail: match rem <= BUFFER_SIZE {
+						true => Some(on_write_fail.clone()),
+						false => None,
+					},
 				};
 
 				let start = offset + count * BUFFER_SIZE;
@@ -241,7 +257,51 @@ where
 			error
 		})?;
 
-		guarded_data.callbacks.on_read = Some(OnRead { on_read });
+		guarded_data.callbacks.on_read = Some(on_read);
+
+		Ok(())
+	}
+
+	pub fn set_on_accept(&mut self, on_accept: G) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.callbacks.on_accept = Some(on_accept);
+
+		Ok(())
+	}
+
+	pub fn set_on_close(&mut self, on_close: H) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.callbacks.on_close = Some(on_close);
+
+		Ok(())
+	}
+
+	pub fn set_on_write_success(&mut self, on_write_success: I) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.callbacks.on_write_success = Some(on_write_success);
+
+		Ok(())
+	}
+
+	pub fn set_on_write_fail(&mut self, on_write_fail: J) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.callbacks.on_write_fail = Some(on_write_fail);
 
 		Ok(())
 	}
@@ -254,12 +314,11 @@ where
 		let (rx, tx) = pipe().unwrap();
 
 		let callbacks = Callbacks {
-			//on_read: OnRead { on_read },
 			on_read: None,
-			//on_accept: None,
-			//on_close: None,
-			//on_write_success: None,
-			//on_write_fail: None,
+			on_accept: None,
+			on_close: None,
+			on_write_success: None,
+			on_write_fail: None,
 		};
 
 		let guarded_data = GuardedData {
@@ -292,8 +351,8 @@ where
 	}
 
 	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
 		queue: RawFd,
 		rx: RawFd,
 	) -> Result<(), Error> {
@@ -346,6 +405,10 @@ where
 			let handler_events;
 			let write_pending;
 			let on_read;
+			let on_accept;
+			let on_close;
+			let on_write_success;
+			let on_write_fail;
 			{
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
 					let error: Error =
@@ -355,12 +418,20 @@ where
 				to_process = guarded_data.fd_actions.clone();
 				handler_events = guarded_data.handler_events.clone();
 				write_pending = guarded_data.write_pending.clone();
-				on_read = guarded_data
+				on_read = guarded_data.callbacks.on_read.as_ref().unwrap().clone();
+				on_accept = guarded_data.callbacks.on_accept.as_ref().unwrap().clone();
+				on_close = guarded_data.callbacks.on_close.as_ref().unwrap().clone();
+				on_write_success = guarded_data
 					.callbacks
-					.on_read
+					.on_write_success
 					.as_ref()
 					.unwrap()
-					.on_read
+					.clone();
+				on_write_fail = guarded_data
+					.callbacks
+					.on_write_fail
+					.as_ref()
+					.unwrap()
 					.clone();
 				guarded_data.fd_actions.clear();
 				guarded_data.handler_events.clear();
@@ -512,10 +583,6 @@ where
 				&& last_fd != 0 && read_fd_type[last_fd as usize] == FdType::Stream
 				&& ret_kev.filter == EVFILT_READ
 			{
-				println!(
-					"pushing disabling events: {:?}",
-					read_fd_type[last_fd as usize]
-				);
 				kevs.push(kevent::new(
 					last_fd,
 					EventFilter::EVFILT_READ,
@@ -580,6 +647,10 @@ where
 					guarded_data,
 					write_buffers,
 					on_read,
+					on_accept,
+					on_close,
+					on_write_success,
+					on_write_fail,
 				),
 			};
 
@@ -603,15 +674,29 @@ where
 		kev: kevent,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
 		on_read: F,
+		on_accept: G,
+		on_close: H,
+		on_write_success: I,
+		on_write_fail: J,
 	) -> Result<(), Error> {
 		if kev.filter == EVFILT_WRITE {
 			Self::process_event_write(kev, thread_pool, write_buffers, guarded_data)?;
 		}
 		if kev.filter == EVFILT_READ {
-			Self::process_event_read(kev, read_fd_type, thread_pool, guarded_data, on_read)?;
+			Self::process_event_read(
+				kev,
+				read_fd_type,
+				thread_pool,
+				guarded_data,
+				on_read,
+				on_accept,
+				on_close,
+				on_write_success,
+				on_write_fail,
+			)?;
 		}
 
 		Ok(())
@@ -620,8 +705,8 @@ where
 	fn process_event_write(
 		kev: kevent,
 		thread_pool: &ThreadPool,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<I, J>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		{
@@ -669,7 +754,19 @@ where
 								Ok(len) => {
 									if len == (front_mut.len - front_mut.offset) as usize {
 										match (*linked_list).pop_front() {
-											Some(_) => {}
+											Some(write_buffer) => {
+												// check if there's a write success
+												// handler and call it if so
+												match write_buffer.on_write_success {
+													Some(h) => {
+														(h)(
+															fd.try_into().unwrap_or(0),
+															write_buffer.msg_id,
+														);
+													}
+													None => {}
+												}
+											}
 											None => {
 												println!("unexpected error couldn't pop");
 											}
@@ -706,6 +803,20 @@ where
 								}
 								Err(e) => {
 									println!("write error: {}", e.to_string());
+									loop {
+										if (*linked_list).is_empty() {
+											break;
+										}
+										match (*linked_list).pop_front() {
+											Some(item) => match item.on_write_fail {
+												Some(h) => {
+													(h)(fd.try_into().unwrap_or(0), item.msg_id);
+												}
+												None => {}
+											},
+											None => {}
+										}
+									}
 									(*linked_list).clear();
 								}
 							}
@@ -729,8 +840,12 @@ where
 		kev: kevent,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 		on_read: F,
+		on_accept: G,
+		on_close: H,
+		on_write_success: I,
+		on_write_fail: J,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		let fd_type = &read_fd_type[fd as usize];
@@ -742,6 +857,7 @@ where
 					Ok(res) => {
 						// set non-blocking
 						fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap()))?;
+						(on_accept)(res as u128);
 						Self::process_accept_result(fd, res, guarded_data)
 					}
 					Err(e) => Self::process_accept_err(fd, e),
@@ -754,8 +870,17 @@ where
 					// in order to ensure sequence in tact, obtain the lock
 					let res = read(fd, &mut buf);
 					let _ = match res {
-						Ok(res) => Self::process_read_result(fd, res, buf, &guarded_data, on_read),
-						Err(e) => Self::process_read_err(fd, e, &guarded_data),
+						Ok(res) => Self::process_read_result(
+							fd,
+							res,
+							buf,
+							&guarded_data,
+							on_read,
+							on_close,
+							on_write_success,
+							on_write_fail,
+						),
+						Err(e) => Self::process_read_err(fd, e, &guarded_data, on_close),
 					};
 				})?;
 			}
@@ -783,21 +908,34 @@ where
 		fd: RawFd,
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 		on_read: F,
+		on_close: H,
+		on_write_success: I,
+		on_write_fail: J,
 	) -> Result<(), Error> {
 		if len > 0 {
-			let (resp, offset, len) = (on_read)(&buf, len);
+			let msg_id: u128 = thread_rng().gen::<u128>();
+			let (resp, offset, len) = (on_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len);
 			if len > 0 {
-				Self::write(fd, resp, offset, len, guarded_data)?;
+				Self::write(
+					fd,
+					resp,
+					offset,
+					len,
+					guarded_data,
+					msg_id,
+					on_write_success,
+					on_write_fail,
+				)?;
 			}
 
 			Self::push_handler_event(fd, HandlerEventType::Resume, guarded_data, true)?;
 		} else {
-			println!("read 0 bytes EOF closing fd = {}", fd);
 			// close
 			Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
 			let _ = close(fd);
+			(on_close)(fd.try_into().unwrap_or(0));
 		}
 		Ok(())
 	}
@@ -805,7 +943,8 @@ where
 	fn process_read_err(
 		fd: RawFd,
 		error: Errno,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		on_close: H,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
@@ -816,6 +955,7 @@ where
 				println!("closing with error fd = {}", fd);
 				Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
 				let _ = close(fd);
+				(on_close)(fd.try_into().unwrap_or(0));
 			}
 		}
 		println!("read error on {}, error: {}", fd, error);
@@ -825,9 +965,8 @@ where
 	fn process_accept_result(
 		_acceptor: RawFd,
 		nfd: RawFd,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 	) -> Result<(), Error> {
-		println!("accepted fd = {}", nfd);
 		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false)?;
 		Ok(())
 	}
@@ -840,7 +979,7 @@ where
 	fn push_handler_event(
 		fd: RawFd,
 		event_type: HandlerEventType,
-		guarded_data: &Arc<Mutex<GuardedData<F>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 		wakeup: bool,
 	) -> Result<(), Error> {
 		{
@@ -874,12 +1013,39 @@ where
 }
 
 #[test]
-fn test_kqueues() -> Result<(), Error> {
+fn test_echo() -> Result<(), Error> {
+	use std::io::Read;
+	use std::io::Write;
 	use std::net::TcpListener;
+	use std::net::TcpStream;
 
-	let listener = TcpListener::bind("127.0.0.1:9999")?;
-	let mut kqe = KqueueEventHandler::new()?;
+	let listener = TcpListener::bind("127.0.0.1:9981")?;
+	let mut kqe = KqueueEventHandler::new();
+	kqe.set_on_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
+	kqe.set_on_accept(move |connection_id| println!("accept conn: {}", connection_id))?;
+	kqe.set_on_close(move |connection_id| println!("close conn: {}", connection_id))?;
+	kqe.set_on_write_success(move |connection_id, message_id| {
+		println!(
+			"message success for cid={},mid={}",
+			connection_id, message_id
+		);
+	})?;
+	kqe.set_on_write_fail(move |connection_id, message_id| {
+		println!("message fail for cid={},mid={}", connection_id, message_id);
+	})?;
 	kqe.add_tcp_listener(&listener)?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
+
+	let mut tcp_stream = TcpStream::connect("127.0.0.1:9981")?;
+	tcp_stream.write(&[1, 2, 3, 4, 5])?;
+
+	let mut response = [0u8; 128];
+	let res = tcp_stream.read(&mut response)?;
+	assert_eq!(res, 5);
+	assert_eq!(response[0], 1);
+	assert_eq!(response[1], 2);
+	assert_eq!(response[2], 3);
+	assert_eq!(response[3], 4);
+	assert_eq!(response[4], 5);
+
 	Ok(())
 }
