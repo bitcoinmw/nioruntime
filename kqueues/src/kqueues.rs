@@ -98,15 +98,16 @@ struct WriteBuffer<I, J> {
 	on_write_fail: Option<J>,
 }
 
-struct Callbacks<F, G, H, I, J> {
+struct Callbacks<F, G, H, I, J, K> {
 	on_read: Option<Pin<Box<F>>>,
 	on_accept: Option<Pin<Box<G>>>,
 	on_close: Option<Pin<Box<H>>>,
 	on_write_success: Option<Pin<Box<I>>>,
 	on_write_fail: Option<Pin<Box<J>>>,
+	on_client_read: Option<Pin<Box<K>>>,
 }
 
-struct GuardedData<F, G, H, I, J> {
+struct GuardedData<F, G, H, I, J, K> {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
 	wakeup_rx: RawFd,
@@ -115,14 +116,14 @@ struct GuardedData<F, G, H, I, J> {
 	write_pending: Vec<RawFd>,
 	write_buffers: Vec<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>,
 	queue: Option<RawFd>,
-	callbacks: Callbacks<F, G, H, I, J>,
+	callbacks: Callbacks<F, G, H, I, J, K>,
 }
 
-pub struct KqueueEventHandler<F, G, H, I, J> {
-	data: Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+pub struct KqueueEventHandler<F, G, H, I, J, K> {
+	data: Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 }
 
-impl<F, G, H, I, J> KqueueEventHandler<F, G, H, I, J>
+impl<F, G, H, I, J, K> KqueueEventHandler<F, G, H, I, J, K>
 where
 	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
 		+ Send
@@ -134,8 +135,32 @@ where
 	H: Fn(u128) -> () + Send + 'static + Clone + Sync,
 	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
 	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
+	K: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
+		+ Send
+		+ 'static
+		+ Clone
+		+ Sync
+		+ Unpin,
 {
 	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<i32, Error> {
+		// make sure we have a client on_read handler configured
+		{
+			let data = self.data.lock().map_err(|e| {
+				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+				error
+			})?;
+
+			match data.callbacks.on_read {
+				Some(_) => {}
+				None => {
+					return Err(ErrorKind::SetupError(
+						"on_read callback must be registered first".to_string(),
+					)
+					.into());
+				}
+			}
+		}
+
 		stream.set_nonblocking(true)?;
 		#[cfg(any(unix, macos))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
@@ -240,7 +265,9 @@ where
 		Ok(())
 	}
 
-	fn do_wakeup_with_lock(data: &mut GuardedData<F, G, H, I, J>) -> Result<(RawFd, bool), Error> {
+	fn do_wakeup_with_lock(
+		data: &mut GuardedData<F, G, H, I, J, K>,
+	) -> Result<(RawFd, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
 		if !wakeup_scheduled {
 			data.wakeup_scheduled = true;
@@ -248,7 +275,7 @@ where
 		Ok((data.wakeup_fd, wakeup_scheduled))
 	}
 
-	fn do_wakeup(data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>) -> Result<(), Error> {
+	fn do_wakeup(data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>) -> Result<(), Error> {
 		let mut data = data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
@@ -271,7 +298,7 @@ where
 		data: &[u8],
 		offset: usize,
 		len: usize,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		msg_id: u128,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
@@ -399,12 +426,18 @@ where
 		Ok(())
 	}
 
-	pub fn new() -> Self {
-		/*
-				// create the kqueue
-				let queue = unsafe { kqueue() };
-		*/
+	pub fn set_on_client_read(&mut self, on_client_read: K) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
 
+		guarded_data.callbacks.on_client_read = Some(Box::pin(on_client_read));
+
+		Ok(())
+	}
+
+	pub fn new() -> Self {
 		// create the pipe (for wakeups)
 		let (rx, tx) = pipe().unwrap();
 
@@ -414,6 +447,7 @@ where
 			on_close: None,
 			on_write_success: None,
 			on_write_fail: None,
+			on_client_read: None,
 		};
 
 		let guarded_data = GuardedData {
@@ -427,25 +461,7 @@ where
 			queue: None,
 			callbacks,
 		};
-		//let write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
-
-		/*
-				let cloned_guarded_data = guarded_data.clone();
-				let mut cloned_write_buffers = write_buffers.clone();
-
-				spawn(move || {
-					let res = Self::poll_loop(&cloned_guarded_data, &mut cloned_write_buffers, queue, rx);
-					match res {
-						Ok(_) => {
-							println!("poll_loop exited normally");
-						}
-						Err(e) => {
-							println!("FATAL: Unexpected error in poll loop: {}", e.to_string());
-						}
-					}
-				});
-		*/
 
 		KqueueEventHandler { data: guarded_data }
 	}
@@ -480,7 +496,7 @@ where
 	}
 
 	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		queue: RawFd,
 	) -> Result<(), Error> {
@@ -501,6 +517,13 @@ where
 			read_fd_type.push(FdType::Unknown);
 		}
 		read_fd_type[rx as usize] = FdType::Wakeup;
+
+		let mut use_on_client_read = Vec::new();
+		// preallocate some
+		use_on_client_read.reserve(INITIAL_MAX_FDS);
+		for _ in 0..INITIAL_MAX_FDS {
+			use_on_client_read.push(false);
+		}
 
 		// same for write_buffers
 		for _ in 0..INITIAL_MAX_FDS {
@@ -545,6 +568,7 @@ where
 			let on_close;
 			let on_write_success;
 			let on_write_fail;
+			let on_client_read;
 			{
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
 					let error: Error =
@@ -569,6 +593,13 @@ where
 					.as_ref()
 					.unwrap()
 					.clone();
+				on_client_read = guarded_data
+					.callbacks
+					.on_client_read
+					.as_ref()
+					.unwrap()
+					.clone();
+
 				guarded_data.fd_actions.clear();
 				guarded_data.handler_events.clear();
 				guarded_data.write_pending.clear();
@@ -594,7 +625,16 @@ where
 								read_fd_type.push(FdType::Unknown);
 							}
 						}
+
 						read_fd_type[fd] = FdType::Stream;
+
+						let len = use_on_client_read.len();
+						if fd >= len {
+							for _ in len..fd + 1 {
+								use_on_client_read.push(false);
+							}
+						}
+						use_on_client_read[fd] = true;
 					}
 					ActionType::AddListener => {
 						let fd = proc.fd as uintptr_t;
@@ -613,6 +653,14 @@ where
 							}
 						}
 						read_fd_type[fd] = FdType::Listener;
+
+						let len = use_on_client_read.len();
+						if fd >= len {
+							for _ in len..fd + 1 {
+								use_on_client_read.push(false);
+							}
+						}
+						use_on_client_read[fd] = false;
 					}
 					ActionType::Remove => {
 						let fd = proc.fd as uintptr_t;
@@ -656,6 +704,14 @@ where
 							}
 						}
 						read_fd_type[fd] = FdType::Stream;
+
+						let len = use_on_client_read.len();
+						if fd >= len {
+							for _ in len..fd + 1 {
+								use_on_client_read.push(false);
+							}
+						}
+						use_on_client_read[fd] = false;
 					}
 					HandlerEventType::Close => {
 						let fd = handler_event.fd as uintptr_t;
@@ -666,6 +722,7 @@ where
 							FilterFlag::empty(),
 						));
 						read_fd_type[handler_event.fd as usize] = FdType::Unknown;
+						use_on_client_read[handler_event.fd as usize] = false;
 
 						// delete any unwritten buffers
 						if fd < write_buffers.len() {
@@ -787,6 +844,8 @@ where
 					on_close,
 					on_write_success,
 					on_write_fail,
+					on_client_read,
+					use_on_client_read[ret_kev.ident as usize],
 				),
 			};
 
@@ -810,13 +869,15 @@ where
 		kev: kevent,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		on_read: Pin<Box<F>>,
 		on_accept: Pin<Box<G>>,
 		on_close: Pin<Box<H>>,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
+		on_client_read: Pin<Box<K>>,
+		use_on_client_read: bool,
 	) -> Result<(), Error> {
 		if kev.filter == EVFILT_WRITE {
 			Self::process_event_write(kev, thread_pool, write_buffers, guarded_data)?;
@@ -832,6 +893,8 @@ where
 				on_close,
 				on_write_success,
 				on_write_fail,
+				on_client_read,
+				use_on_client_read,
 			)?;
 		}
 
@@ -842,7 +905,7 @@ where
 		kev: kevent,
 		thread_pool: &ThreadPool,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		{
@@ -976,12 +1039,14 @@ where
 		kev: kevent,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_read: Pin<Box<F>>,
 		on_accept: Pin<Box<G>>,
 		on_close: Pin<Box<H>>,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
+		on_client_read: Pin<Box<K>>,
+		use_on_client_read: bool,
 	) -> Result<(), Error> {
 		let fd = kev.ident as RawFd;
 		let fd_type = &read_fd_type[fd as usize];
@@ -1015,6 +1080,8 @@ where
 							on_close,
 							on_write_success,
 							on_write_fail,
+							on_client_read,
+							use_on_client_read,
 						),
 						Err(e) => Self::process_read_err(fd, e, &guarded_data, on_close),
 					};
@@ -1044,15 +1111,20 @@ where
 		fd: RawFd,
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_read: Pin<Box<F>>,
 		on_close: Pin<Box<H>>,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
+		on_client_read: Pin<Box<K>>,
+		use_on_client_read: bool,
 	) -> Result<(), Error> {
 		if len > 0 {
 			let msg_id: u128 = thread_rng().gen::<u128>();
-			let (resp, offset, len) = (on_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len);
+			let (resp, offset, len) = match use_on_client_read {
+				true => (on_client_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
+				false => (on_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
+			};
 			if len > 0 {
 				Self::write(
 					fd,
@@ -1079,7 +1151,7 @@ where
 	fn process_read_err(
 		fd: RawFd,
 		error: Errno,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_close: Pin<Box<H>>,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
@@ -1101,7 +1173,7 @@ where
 	fn process_accept_result(
 		_acceptor: RawFd,
 		nfd: RawFd,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 	) -> Result<(), Error> {
 		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false)?;
 		Ok(())
@@ -1115,7 +1187,7 @@ where
 	fn push_handler_event(
 		fd: RawFd,
 		event_type: HandlerEventType,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		wakeup: bool,
 	) -> Result<(), Error> {
 		{
@@ -1150,63 +1222,46 @@ where
 
 #[test]
 fn test_echo() -> Result<(), Error> {
-	use std::io::Read;
 	use std::io::Write;
 	use std::net::TcpListener;
 	use std::net::TcpStream;
 
+	let x = Arc::new(Mutex::new(0));
+	let x_clone = x.clone();
+
 	let listener = TcpListener::bind("127.0.0.1:9981")?;
 	let mut stream = TcpStream::connect("127.0.0.1:9981")?;
-	//let mut stream2 = TcpStream::connect("127.0.0.1:9981")?;
+	let _stream2 = TcpStream::connect("127.0.0.1:9981")?;
 	let mut kqe = KqueueEventHandler::new();
 
-	kqe.set_on_read(move |_connection_id, _message_id, buf: &[u8], len| {
-		println!("got: {:?}", &buf[0..len]);
-		(buf, 0, len)
-	})?;
+	// echo
+	kqe.set_on_read(|_, _, buf: &[u8], len| (buf, 0, len))?;
 
-	kqe.set_on_accept(move |connection_id| println!("accept conn: {}", connection_id))?;
-	kqe.set_on_close(move |connection_id| println!("close conn: {}", connection_id))?;
-	kqe.set_on_write_success(move |connection_id, message_id| {
-		println!(
-			"message success for cid={},mid={}",
-			connection_id, message_id
-		);
-	})?;
-	kqe.set_on_write_fail(move |connection_id, message_id| {
-		println!("message fail for cid={},mid={}", connection_id, message_id);
+	kqe.set_on_accept(|_| {})?;
+	kqe.set_on_close(|_| {})?;
+	kqe.set_on_write_success(|_, _| {})?;
+	kqe.set_on_write_fail(|_, _| {})?;
+	kqe.set_on_client_read(move |_connection_id, _message_id, buf: &[u8], len| {
+		assert_eq!(len, 5);
+		assert_eq!(buf[0], 1);
+		assert_eq!(buf[1], 2);
+		assert_eq!(buf[2], 3);
+		assert_eq!(buf[3], 4);
+		assert_eq!(buf[4], 5);
+		let mut x = x.lock().unwrap();
+		(*x) += 5;
+		(buf, 0, 0)
 	})?;
 
 	kqe.start()?;
-	let _listener_id = kqe.add_tcp_listener(&listener)?;
-	/*
-		let stream_id = kqe.add_tcp_stream(
-			&stream,
-					Box::pin(move || {
-							println!("Hi");
-					})
-		)?;
 
-			let stream_id = kqe.add_tcp_stream(
-					&stream2,
-					Box::pin(move || {
-							println!("Hi2");
-					})
-			)?;
-	*/
+	kqe.add_tcp_listener(&listener)?;
+	kqe.add_tcp_stream(&stream)?;
+
 	stream.write(&[1, 2, 3, 4, 5])?;
-
-	let mut response = [0u8; 128];
-
-	let res = stream.read(&mut response)?;
-	assert_eq!(res, 5);
-	assert_eq!(response[0], 1);
-	assert_eq!(response[1], 2);
-	assert_eq!(response[2], 3);
-	assert_eq!(response[3], 4);
-	assert_eq!(response[4], 5);
-
-	//std::thread::sleep(std::time::Duration::from_millis(100));
-	//assert!(false);
+	// wait long enough to make sure the client got the message
+	std::thread::sleep(std::time::Duration::from_millis(100));
+	let x = x_clone.lock().unwrap();
+	assert_eq!((*x), 5);
 	Ok(())
 }

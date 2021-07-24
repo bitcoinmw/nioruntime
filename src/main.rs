@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use nioruntime_kqueues::kqueues::KqueueEventHandler;
-use nioruntime_libnio::EventHandler;
 use nioruntime_util::Error;
 use std::net::TcpListener;
 
@@ -29,6 +28,7 @@ fn real_main() -> Result<(), Error> {
 	let listener = TcpListener::bind("127.0.0.1:9999")?;
 	let mut kqe = KqueueEventHandler::new();
 	kqe.set_on_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
+	kqe.set_on_client_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
 	kqe.set_on_accept(move |connection_id| println!("accept conn: {}", connection_id))?;
 	kqe.set_on_close(move |connection_id| println!("close conn: {}", connection_id))?;
 	kqe.set_on_write_success(move |connection_id, message_id| {
