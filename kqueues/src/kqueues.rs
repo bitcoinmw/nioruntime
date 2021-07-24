@@ -23,7 +23,6 @@ use kqueue_sys::FilterFlag;
 use kqueue_sys::{kevent, kqueue};
 use libc::uintptr_t;
 use nioruntime_libnio::ActionType;
-use nioruntime_libnio::EventHandler;
 use nix::errno::Errno;
 use nix::fcntl::fcntl;
 use nix::fcntl::OFlag;
@@ -37,6 +36,9 @@ use rand::thread_rng;
 use rand::Rng;
 use std::collections::LinkedList;
 use std::convert::TryInto;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -120,7 +122,7 @@ pub struct KqueueEventHandler<F, G, H, I, J> {
 	data: Arc<Mutex<GuardedData<F, G, H, I, J>>>,
 }
 
-impl<F, G, H, I, J> EventHandler for KqueueEventHandler<F, G, H, I, J>
+impl<F, G, H, I, J> KqueueEventHandler<F, G, H, I, J>
 where
 	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
 		+ Send
@@ -133,6 +135,25 @@ where
 	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
 	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
 {
+	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<i32, Error> {
+		stream.set_nonblocking(true)?;
+		#[cfg(any(unix, macos))]
+		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
+		#[cfg(target_os = "windows")]
+		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
+		Ok(ret)
+	}
+
+	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
+		// must be nonblocking
+		listener.set_nonblocking(true)?;
+		#[cfg(any(unix, macos))]
+		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
+		#[cfg(target_os = "windows")]
+		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
+		Ok(ret)
+	}
+
 	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error> {
 		self.ensure_handlers()?;
 
@@ -150,7 +171,7 @@ where
 		Ok(fd.into())
 	}
 
-	fn remove_fd(&mut self, fd: RawFd) -> Result<(), Error> {
+	fn _remove_fd(&mut self, fd: RawFd) -> Result<(), Error> {
 		let mut data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
@@ -159,21 +180,7 @@ where
 		fd_actions.push(RawFdAction::new(fd, ActionType::Remove));
 		Ok(())
 	}
-}
 
-impl<F, G, H, I, J> KqueueEventHandler<F, G, H, I, J>
-where
-	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
-		+ Send
-		+ 'static
-		+ Clone
-		+ Sync
-		+ Unpin,
-	G: Fn(u128) -> () + Send + 'static + Clone + Sync,
-	H: Fn(u128) -> () + Send + 'static + Clone + Sync,
-	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
-	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
-{
 	fn ensure_handlers(&self) -> Result<(), Error> {
 		let data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -1150,12 +1157,14 @@ fn test_echo() -> Result<(), Error> {
 
 	let listener = TcpListener::bind("127.0.0.1:9981")?;
 	let mut stream = TcpStream::connect("127.0.0.1:9981")?;
+	//let mut stream2 = TcpStream::connect("127.0.0.1:9981")?;
 	let mut kqe = KqueueEventHandler::new();
 
 	kqe.set_on_read(move |_connection_id, _message_id, buf: &[u8], len| {
 		println!("got: {:?}", &buf[0..len]);
 		(buf, 0, len)
 	})?;
+
 	kqe.set_on_accept(move |connection_id| println!("accept conn: {}", connection_id))?;
 	kqe.set_on_close(move |connection_id| println!("close conn: {}", connection_id))?;
 	kqe.set_on_write_success(move |connection_id, message_id| {
@@ -1170,13 +1179,21 @@ fn test_echo() -> Result<(), Error> {
 
 	kqe.start()?;
 	let _listener_id = kqe.add_tcp_listener(&listener)?;
-
 	/*
+		let stream_id = kqe.add_tcp_stream(
+			&stream,
+					Box::pin(move || {
+							println!("Hi");
+					})
+		)?;
+
 			let stream_id = kqe.add_tcp_stream(
-				&stream,
+					&stream2,
+					Box::pin(move || {
+							println!("Hi2");
+					})
 			)?;
 	*/
-
 	stream.write(&[1, 2, 3, 4, 5])?;
 
 	let mut response = [0u8; 128];

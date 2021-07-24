@@ -102,7 +102,7 @@ fn test_thread_pool() -> Result<(), Error> {
 		let tp = tp.lock().unwrap();
 		tp.execute(async move {
 			let mut x = x1.lock().unwrap();
-			*x += 1;
+			*x += 2;
 		})
 		.unwrap();
 	});
@@ -112,7 +112,7 @@ fn test_thread_pool() -> Result<(), Error> {
 		let tp = tp.lock().unwrap();
 		tp.execute(async move {
 			let mut x = x2.lock().unwrap();
-			*x += 1;
+			*x += 3;
 		})
 		.unwrap();
 	});
@@ -120,7 +120,7 @@ fn test_thread_pool() -> Result<(), Error> {
 	// wait for executors to complete
 	std::thread::sleep(std::time::Duration::from_millis(300));
 	let x = x3.lock().unwrap();
-	assert_eq!(*x, 3);
+	assert_eq!(*x, 6);
 
 	Ok(())
 }
