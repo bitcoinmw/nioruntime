@@ -1,0 +1,26 @@
+name: nioruntime
+author: The BMW Developers
+
+args:
+    - client:
+        help: Run the test client
+        short: c
+        long: client
+        takes_value: false
+    - count:
+        help: Number of iterations to run per thread
+        short: x
+        long: count
+        value_name: count
+        takes_value: true
+    - threads:
+        help: Number of client threads to run
+        short: t
+        long: threads
+        value_name: threads
+        takes_value: true
+    - debug:
+        help: Whether to print debugging information
+        short: d
+        long: debug
+        takes_value: false

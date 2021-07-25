@@ -15,6 +15,7 @@
 use crate::threadpool::FuturesHolder;
 use failure::{Backtrace, Context, Fail};
 use nix::errno::Errno;
+use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Display;
 use std::str::Utf8Error;
@@ -42,6 +43,15 @@ pub enum ErrorKind {
 	/// Setup Error
 	#[fail(display = "Setup Error: {}", _0)]
 	SetupError(String),
+	/// Log not configured
+	#[fail(display = "Log not configured Error: {}", _0)]
+	LogNotConfigured(String),
+	/// OsString error
+	#[fail(display = "OsString Error: {}", _0)]
+	OsStringError(String),
+	/// Poison error multiple locks
+	#[fail(display = "Poison Error: {}", _0)]
+	PoisonError(String),
 }
 
 impl Display for Error {
@@ -113,6 +123,14 @@ impl From<std::sync::mpsc::SendError<FuturesHolder>> for Error {
 	fn from(e: std::sync::mpsc::SendError<FuturesHolder>) -> Error {
 		Error {
 			inner: Context::new(ErrorKind::IOError(format!("{}", e))),
+		}
+	}
+}
+
+impl From<OsString> for Error {
+	fn from(e: OsString) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::OsStringError(format!("{:?}", e))),
 		}
 	}
 }

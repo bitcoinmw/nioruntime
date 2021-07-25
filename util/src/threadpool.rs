@@ -45,11 +45,13 @@ impl ThreadPool {
 							Ok(task) => task,
 							Err(e) => {
 								println!("unexpected error in threadpool: {}", e.to_string());
+								std::thread::sleep(std::time::Duration::from_millis(1000));
 								continue;
 							}
 						},
 						Err(e) => {
 							println!("unexpected error in threadpool: {}", e.to_string());
+							std::thread::sleep(std::time::Duration::from_millis(1000));
 							continue;
 						}
 					}

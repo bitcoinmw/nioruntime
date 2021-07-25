@@ -60,15 +60,15 @@ impl RawFdAction {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 enum HandlerEventType {
 	Accept,
 	Close,
-	Resume,
+	ResumeRead,
 	ResumeWrite,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 struct HandlerEvent {
 	etype: HandlerEventType,
 	fd: RawFd,
@@ -80,7 +80,7 @@ impl HandlerEvent {
 	}
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum FdType {
 	Wakeup,
 	Listener,
@@ -107,11 +107,24 @@ struct Callbacks<F, G, H, I, J, K> {
 	on_client_read: Option<Pin<Box<K>>>,
 }
 
+#[derive(PartialEq, Debug)]
+enum ConnectionState {
+	Ok,
+	Closing,
+}
+
+impl Default for ConnectionState {
+	fn default() -> Self {
+		ConnectionState::Ok
+	}
+}
+
 struct GuardedData<F, G, H, I, J, K> {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
 	wakeup_rx: RawFd,
 	wakeup_scheduled: bool,
+	connection_state: Vec<ConnectionState>,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
 	write_buffers: Vec<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>,
@@ -288,6 +301,29 @@ where
 		Ok(())
 	}
 
+	fn value_of<T>(vec: &Vec<T>, i: usize) -> Option<&T>
+	where
+		T: Default,
+	{
+		match vec.len() > i {
+			true => Some(&vec[i]),
+			false => None,
+		}
+	}
+
+	fn check_and_set<T>(vec: &mut Vec<T>, i: usize, value: T)
+	where
+		T: Default,
+	{
+		let cur_len = vec.len();
+		if cur_len <= i {
+			for _ in cur_len..i + 1 {
+				vec.push(T::default());
+			}
+		}
+		vec[i] = value;
+	}
+
 	pub fn wakeup(&mut self) -> Result<(), Error> {
 		Self::do_wakeup(&self.data)?;
 		Ok(())
@@ -455,6 +491,7 @@ where
 			wakeup_fd: tx,
 			wakeup_rx: rx,
 			wakeup_scheduled: false,
+			connection_state: vec![],
 			handler_events: vec![],
 			write_pending: vec![],
 			write_buffers: vec![LinkedList::new()],
@@ -495,6 +532,148 @@ where
 		Ok(())
 	}
 
+	fn process_handler_events(
+		last_fd: uintptr_t,
+		handler_events: Vec<HandlerEvent>,
+		write_pending: Vec<RawFd>,
+		kevs: &mut Vec<kevent>,
+		ret_kev: kevent,
+		read_fd_type: &mut Vec<FdType>,
+		use_on_client_read: &mut Vec<bool>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+	) -> Result<(), Error> {
+		let mut resume_collision = false;
+		for handler_event in handler_events {
+			match handler_event.etype {
+				HandlerEventType::Accept => {
+					let fd = handler_event.fd as uintptr_t;
+					kevs.push(kevent::new(
+						fd,
+						EventFilter::EVFILT_READ,
+						EventFlag::EV_ADD,
+						FilterFlag::empty(),
+					));
+					// make sure there's enough space
+					let len = read_fd_type.len();
+					if fd >= len {
+						for _ in len..fd + 1 {
+							read_fd_type.push(FdType::Unknown);
+						}
+					}
+					read_fd_type[fd] = FdType::Stream;
+
+					let len = use_on_client_read.len();
+					if fd >= len {
+						for _ in len..fd + 1 {
+							use_on_client_read.push(false);
+						}
+					}
+					use_on_client_read[fd] = false;
+				}
+				HandlerEventType::Close => {
+					let fd = handler_event.fd as uintptr_t;
+					kevs.push(kevent::new(
+						fd,
+						EventFilter::EVFILT_READ,
+						EventFlag::EV_DELETE,
+						FilterFlag::empty(),
+					));
+					kevs.push(kevent::new(
+						fd,
+						EventFilter::EVFILT_WRITE,
+						EventFlag::EV_DELETE,
+						FilterFlag::empty(),
+					));
+					read_fd_type[handler_event.fd as usize] = FdType::Unknown;
+					use_on_client_read[handler_event.fd as usize] = false;
+
+					// delete any unwritten buffers
+					if fd < write_buffers.len() {
+						let mut linked_list = write_buffers[fd as usize].lock().map_err(|e| {
+							let error: Error =
+								ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+							error
+						})?;
+						(*linked_list).clear();
+					}
+				}
+				HandlerEventType::ResumeRead => {
+					let fd = handler_event.fd as uintptr_t;
+					if last_fd != fd || ret_kev.filter != EVFILT_READ {
+						kevs.push(kevent::new(
+							fd,
+							EventFilter::EVFILT_READ,
+							EventFlag::EV_ADD,
+							FilterFlag::empty(),
+						));
+						let len = read_fd_type.len();
+						if fd >= len {
+							for _ in len..fd + 1 {
+								read_fd_type.push(FdType::Unknown);
+							}
+						}
+						read_fd_type[fd] = FdType::Stream;
+					} else {
+						resume_collision = true;
+					}
+				}
+				HandlerEventType::ResumeWrite => {
+					let fd = handler_event.fd as uintptr_t;
+					if last_fd != fd || ret_kev.filter != EVFILT_WRITE {
+						kevs.push(kevent::new(
+							fd,
+							EventFilter::EVFILT_WRITE,
+							EventFlag::EV_ADD,
+							FilterFlag::empty(),
+						));
+					} else {
+						resume_collision = true;
+					}
+				}
+			}
+		}
+
+		if !resume_collision
+			&& last_fd != 0
+			&& read_fd_type[last_fd as usize] == FdType::Stream
+			&& ret_kev.filter == EVFILT_READ
+		{
+			kevs.push(kevent::new(
+				last_fd,
+				EventFilter::EVFILT_READ,
+				EventFlag::EV_DELETE,
+				FilterFlag::empty(),
+			));
+			read_fd_type[last_fd] = FdType::PausedStream;
+		}
+
+		if !resume_collision
+			&& last_fd != 0
+			&& (read_fd_type[last_fd as usize] == FdType::Stream
+				|| read_fd_type[last_fd as usize] == FdType::PausedStream)
+			&& ret_kev.filter == EVFILT_WRITE
+		{
+			kevs.push(kevent::new(
+				last_fd,
+				EventFilter::EVFILT_WRITE,
+				EventFlag::EV_DELETE,
+				FilterFlag::empty(),
+			));
+		}
+
+		// handle write_pending
+		for pending in write_pending {
+			let pending = pending as uintptr_t;
+			kevs.push(kevent::new(
+				pending,
+				EventFilter::EVFILT_WRITE,
+				EventFlag::EV_ADD,
+				FilterFlag::empty(),
+			));
+		}
+		Ok(())
+	}
+
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
@@ -509,7 +688,6 @@ where
 			})?;
 			guarded_data.wakeup_rx
 		};
-
 		let mut read_fd_type = Vec::new();
 		// preallocate some
 		read_fd_type.reserve(INITIAL_MAX_FDS);
@@ -558,7 +736,6 @@ where
 			)
 		};
 
-		println!("Server started");
 		loop {
 			let to_process;
 			let handler_events;
@@ -685,129 +862,16 @@ where
 
 			// check if we accepted a connection
 			let last_fd = ret_kev.ident as uintptr_t;
-			let mut resume_collision = false;
-			for handler_event in handler_events {
-				match handler_event.etype {
-					HandlerEventType::Accept => {
-						let fd = handler_event.fd as uintptr_t;
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_READ,
-							EventFlag::EV_ADD,
-							FilterFlag::empty(),
-						));
-						// make sure there's enough space
-						let len = read_fd_type.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								read_fd_type.push(FdType::Unknown);
-							}
-						}
-						read_fd_type[fd] = FdType::Stream;
-
-						let len = use_on_client_read.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								use_on_client_read.push(false);
-							}
-						}
-						use_on_client_read[fd] = false;
-					}
-					HandlerEventType::Close => {
-						let fd = handler_event.fd as uintptr_t;
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_READ,
-							EventFlag::EV_DELETE,
-							FilterFlag::empty(),
-						));
-						read_fd_type[handler_event.fd as usize] = FdType::Unknown;
-						use_on_client_read[handler_event.fd as usize] = false;
-
-						// delete any unwritten buffers
-						if fd < write_buffers.len() {
-							let mut linked_list =
-								write_buffers[fd as usize].lock().map_err(|e| {
-									let error: Error =
-										ErrorKind::InternalError(format!("Poison Error: {}", e))
-											.into();
-									error
-								})?;
-							(*linked_list).clear();
-						}
-					}
-					HandlerEventType::Resume => {
-						let fd = handler_event.fd as uintptr_t;
-						if last_fd != fd || ret_kev.filter != EVFILT_READ {
-							kevs.push(kevent::new(
-								fd,
-								EventFilter::EVFILT_READ,
-								EventFlag::EV_ADD,
-								FilterFlag::empty(),
-							));
-							let len = read_fd_type.len();
-							if fd >= len {
-								for _ in len..fd + 1 {
-									read_fd_type.push(FdType::Unknown);
-								}
-							}
-							read_fd_type[fd] = FdType::Stream;
-						} else {
-							resume_collision = true;
-						}
-					}
-					HandlerEventType::ResumeWrite => {
-						let fd = handler_event.fd as uintptr_t;
-						if last_fd != fd || ret_kev.filter != EVFILT_WRITE {
-							kevs.push(kevent::new(
-								fd,
-								EventFilter::EVFILT_WRITE,
-								EventFlag::EV_ADD,
-								FilterFlag::empty(),
-							));
-						} else {
-							resume_collision = true;
-						}
-					}
-				}
-			}
-
-			if !resume_collision
-				&& last_fd != 0 && read_fd_type[last_fd as usize] == FdType::Stream
-				&& ret_kev.filter == EVFILT_READ
-			{
-				kevs.push(kevent::new(
-					last_fd,
-					EventFilter::EVFILT_READ,
-					EventFlag::EV_DELETE,
-					FilterFlag::empty(),
-				));
-				read_fd_type[last_fd] = FdType::PausedStream;
-			}
-
-			if !resume_collision
-				&& last_fd != 0 && (read_fd_type[last_fd as usize] == FdType::Stream
-				|| read_fd_type[last_fd as usize] == FdType::PausedStream)
-				&& ret_kev.filter == EVFILT_WRITE
-			{
-				kevs.push(kevent::new(
-					last_fd,
-					EventFilter::EVFILT_WRITE,
-					EventFlag::EV_DELETE,
-					FilterFlag::empty(),
-				));
-			}
-
-			// handle write_pending
-			for pending in write_pending {
-				let pending = pending as uintptr_t;
-				kevs.push(kevent::new(
-					pending,
-					EventFilter::EVFILT_WRITE,
-					EventFlag::EV_ADD,
-					FilterFlag::empty(),
-				));
-			}
+			Self::process_handler_events(
+				last_fd,
+				handler_events,
+				write_pending,
+				&mut kevs,
+				ret_kev,
+				&mut read_fd_type,
+				&mut use_on_client_read,
+				write_buffers,
+			)?;
 
 			ret_kev = kevent::new(
 				0,
@@ -916,7 +980,7 @@ where
 
 			let cur_len = write_buffers.len();
 			if cur_len <= fd as usize {
-				for _ in cur_len..fd as usize {
+				for _ in cur_len..(fd + 1) as usize {
 					write_buffers.push(Arc::new(Mutex::new(LinkedList::new())));
 				}
 			}
@@ -1064,8 +1128,11 @@ where
 					Err(e) => Self::process_accept_err(fd, e),
 				}?;
 			}
-			FdType::Stream => {
+			FdType::Stream | FdType::PausedStream => {
+				// note that a PausedStream may still get a read event to close,
+				// so we process it
 				let guarded_data = guarded_data.clone();
+				let fd_type = fd_type.clone();
 				thread_pool.execute(async move {
 					let mut buf = [0u8; BUFFER_SIZE];
 					// in order to ensure sequence in tact, obtain the lock
@@ -1082,16 +1149,14 @@ where
 							on_write_fail,
 							on_client_read,
 							use_on_client_read,
+							fd_type,
 						),
-						Err(e) => Self::process_read_err(fd, e, &guarded_data, on_close),
+						Err(e) => Self::process_read_err(fd, e, &guarded_data, on_close, fd_type),
 					};
 				})?;
 			}
 			FdType::Unknown => {
 				println!("unexpected fd_type (unknown) for fd: {}", fd);
-			}
-			FdType::PausedStream => {
-				println!("unexpected fd_type (paused stream) for fd: {}", fd);
 			}
 			FdType::Wakeup => {
 				read(fd, &mut [0u8; 1])?;
@@ -1118,8 +1183,12 @@ where
 		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
+		fd_type: FdType,
 	) -> Result<(), Error> {
 		if len > 0 {
+			if fd_type == FdType::PausedStream {
+				println!("unexpected read on paused stream: {}", fd);
+			}
 			let msg_id: u128 = thread_rng().gen::<u128>();
 			let (resp, offset, len) = match use_on_client_read {
 				true => (on_client_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
@@ -1138,12 +1207,15 @@ where
 				)?;
 			}
 
-			Self::push_handler_event(fd, HandlerEventType::Resume, guarded_data, true)?;
+			Self::push_handler_event(fd, HandlerEventType::ResumeRead, guarded_data, true)?;
 		} else {
 			// close
-			Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
-			let _ = close(fd);
-			(on_close)(fd.try_into().unwrap_or(0));
+			let is_dup =
+				Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
+			if !is_dup {
+				let _ = close(fd);
+				(on_close)(fd.try_into().unwrap_or(0));
+			}
 		}
 		Ok(())
 	}
@@ -1153,20 +1225,22 @@ where
 		error: Errno,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_close: Pin<Box<H>>,
+		_fd_type: FdType,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
 			Errno::EAGAIN => {
-				Self::push_handler_event(fd, HandlerEventType::Resume, guarded_data, false)?;
+				Self::push_handler_event(fd, HandlerEventType::ResumeRead, guarded_data, false)?;
 			}
 			_ => {
-				println!("closing with error fd = {}", fd);
-				Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
-				let _ = close(fd);
-				(on_close)(fd.try_into().unwrap_or(0));
+				let is_dup =
+					Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
+				if !is_dup {
+					let _ = close(fd);
+					(on_close)(fd.try_into().unwrap_or(0));
+				}
 			}
 		}
-		println!("read error on {}, error: {}", fd, error);
 		Ok(())
 	}
 
@@ -1189,17 +1263,50 @@ where
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		wakeup: bool,
-	) -> Result<(), Error> {
+	) -> Result<bool, Error> {
+		let mut is_dup = false;
 		{
 			let guarded_data = guarded_data.lock();
 			let mut wakeup_fd = 0;
 			let mut wakeup_scheduled = false;
-
 			match guarded_data {
 				Ok(mut guarded_data) => {
-					guarded_data
+					// check for duplicates
+					let nevent = HandlerEvent::new(fd, event_type.clone());
+					is_dup = guarded_data
 						.handler_events
-						.push(HandlerEvent::new(fd, event_type));
+						.iter()
+						.any(|event| event.etype == nevent.etype && event.fd == nevent.fd);
+
+					match Self::value_of(&guarded_data.connection_state, fd as usize) {
+						Some(state) => {
+							if *state == ConnectionState::Closing {
+								is_dup = true;
+							}
+						}
+						None => {}
+					}
+
+					// mark this connection for future iterations
+					match event_type {
+						HandlerEventType::Close => {
+							Self::check_and_set(
+								&mut guarded_data.connection_state,
+								fd as usize,
+								ConnectionState::Closing,
+							);
+						}
+						_ => Self::check_and_set(
+							&mut guarded_data.connection_state,
+							fd as usize,
+							ConnectionState::Ok,
+						),
+					}
+
+					if !is_dup || event_type != HandlerEventType::Close {
+						guarded_data.handler_events.push(nevent);
+					}
+
 					if wakeup {
 						wakeup_scheduled = guarded_data.wakeup_scheduled;
 						if !wakeup_scheduled {
@@ -1216,7 +1323,7 @@ where
 				write(wakeup_fd, &[0u8; 1])?;
 			}
 		}
-		Ok(())
+		Ok(is_dup)
 	}
 }
 

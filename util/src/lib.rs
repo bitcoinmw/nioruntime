@@ -13,6 +13,8 @@
 // limitations under the License.
 
 mod error;
+mod log;
 pub mod threadpool;
 
 pub use crate::error::{Error, ErrorKind};
+pub use crate::log::Log;
