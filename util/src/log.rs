@@ -77,8 +77,9 @@ impl LogParams {
 			.as_millis();
 
 		// check if rotation is needed
-		if self.file.is_some() && self.cur_size >= self.max_size
-			|| time_now.saturating_sub(self.init_age_millis) > self.max_age_millis
+		if self.file.is_some()
+			&& (self.cur_size >= self.max_size
+				|| time_now.saturating_sub(self.init_age_millis) > self.max_age_millis)
 		{
 			self.rotate()?;
 			let mut file = self.file.as_ref().unwrap();

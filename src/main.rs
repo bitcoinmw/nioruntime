@@ -49,10 +49,12 @@ fn client_thread(
 	log: &LOG,
 	time: SystemTime,
 	tlat_sum: Arc<Mutex<f64>>,
+	tlat_max: Arc<Mutex<u128>>,
 ) -> Result<(), Error> {
 	let mut stream = TcpStream::connect("127.0.0.1:9999")?;
 	let buf = &mut [0; 128];
 	let mut lat_sum = 0.0;
+	let mut lat_max = 0;
 	for i in 0..count {
 		if i != 0 && i % 10000 == 0 {
 			let mut log = log.lock().map_err(|e| {
@@ -68,6 +70,9 @@ fn client_thread(
 		let len = stream.read(buf)?;
 		let elapsed = start_query.elapsed().unwrap().as_nanos();
 		lat_sum += elapsed as f64;
+		if elapsed > lat_max {
+			lat_max = elapsed;
+		}
 		assert_eq!(len, 5);
 		assert_eq!(buf[0], 1);
 		assert_eq!(buf[1], 2);
@@ -86,6 +91,12 @@ fn client_thread(
 	{
 		let mut tlat_sum = tlat_sum.lock().unwrap();
 		(*tlat_sum) += lat_sum;
+	}
+	{
+		let mut tlat_max = tlat_max.lock().unwrap();
+		if lat_max > *tlat_max {
+			(*tlat_max) = lat_max;
+		}
 	}
 	Ok(())
 }
@@ -138,11 +149,13 @@ fn real_main() -> Result<(), Error> {
 		let mut jhs = vec![];
 		let time = std::time::SystemTime::now();
 		let tlat_sum = Arc::new(Mutex::new(0.0));
+		let tlat_max = Arc::new(Mutex::new(0));
 		for i in 0..threads {
 			let id = i.clone();
 			let tlat_sum = tlat_sum.clone();
+			let tlat_max = tlat_max.clone();
 			jhs.push(std::thread::spawn(move || {
-				let res = client_thread(count, id, log, time, tlat_sum.clone());
+				let res = client_thread(count, id, log, time, tlat_sum.clone(), tlat_max.clone());
 				match res {
 					Ok(_) => {}
 					Err(e) => println!("Error in client thread: {}", e.to_string()),
@@ -159,6 +172,7 @@ fn real_main() -> Result<(), Error> {
 				error
 			})?;
 			let elapsed_millis = time.elapsed().unwrap().as_millis();
+			let lat_max = tlat_max.lock().unwrap();
 			log.log(&format!("Complete at={} ms", elapsed_millis))?;
 			let total_qps = 1000 as f64 * (count as f64 * threads as f64 / elapsed_millis as f64);
 			log.log(&format!("Total QPS={}", total_qps))?;
@@ -166,6 +180,10 @@ fn real_main() -> Result<(), Error> {
 			log.log(&format!(
 				"Average latency={}ms",
 				(*tlat) / (1_000_000 * count * threads) as f64
+			))?;
+			log.log(&format!(
+				"Max latency={}ms",
+				(*lat_max) as f64 / (1_000_000 as f64),
 			))?;
 		}
 	} else {
@@ -178,22 +196,52 @@ fn real_main() -> Result<(), Error> {
 		}
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
 		let mut kqe = KqueueEventHandler::new();
-		kqe.set_on_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
-		kqe.set_on_client_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
-		kqe.set_on_accept(move |_connection_id| {})?;
+		kqe.set_on_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
+		kqe.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
+		kqe.set_on_accept(move |_connection_id| Ok(()))?;
 		kqe.set_on_close(move |connection_id| {
-			let mut log = log.lock().unwrap();
-			log.log(&format!("=====================close {}", connection_id))
-				.unwrap();
+			let log = log.lock();
+			let res = match log {
+				Ok(mut log) => log.log(&format!("=====================close {}", connection_id)),
+				Err(e) => Err(ErrorKind::PoisonError(format!(
+					"Logging gerneated poison error: {}",
+					e.to_string()
+				))
+				.into()),
+			};
+			match res {
+				Ok(_) => {}
+				Err(e) => println!(
+					"Logging generated error: {}\nAttempted Log message: {}",
+					e.to_string(),
+					format!("=====================close {}", connection_id),
+				),
+			}
+			Ok(())
 		})?;
-		kqe.set_on_write_success(move |_connection_id, _message_id| {})?;
+		kqe.set_on_write_success(move |_connection_id, _message_id| Ok(()))?;
 		kqe.set_on_write_fail(move |connection_id, message_id| {
-			let mut log = log.lock().unwrap();
-			log.log(&format!(
-				"message fail for cid={},mid={}",
-				connection_id, message_id
-			))
-			.unwrap();
+			let log = log.lock();
+			let res = match log {
+				Ok(mut log) => log.log(&format!(
+					"message fail for cid={},mid={}",
+					connection_id, message_id
+				)),
+				Err(e) => Err(ErrorKind::PoisonError(format!(
+					"Logging gerneated poison error: {}",
+					e.to_string()
+				))
+				.into()),
+			};
+			match res {
+				Ok(_) => {}
+				Err(e) => println!(
+					"Logging generated error: {}\nAttempted Log message: {}",
+					e.to_string(),
+					&format!("message fail for cid={},mid={}", connection_id, message_id)
+				),
+			}
+			Ok(())
 		})?;
 		kqe.start()?;
 		kqe.add_tcp_listener(&listener)?;

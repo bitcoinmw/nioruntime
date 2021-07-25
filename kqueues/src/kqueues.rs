@@ -138,17 +138,17 @@ pub struct KqueueEventHandler<F, G, H, I, J, K> {
 
 impl<F, G, H, I, J, K> KqueueEventHandler<F, G, H, I, J, K>
 where
-	F: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
+	F: Fn(u128, u128, &[u8], usize) -> Result<(&[u8], usize, usize), Error>
 		+ Send
 		+ 'static
 		+ Clone
 		+ Sync
 		+ Unpin,
-	G: Fn(u128) -> () + Send + 'static + Clone + Sync,
-	H: Fn(u128) -> () + Send + 'static + Clone + Sync,
-	I: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
-	J: Fn(u128, u128) -> () + Send + 'static + Clone + Sync,
-	K: Fn(u128, u128, &[u8], usize) -> (&[u8], usize, usize)
+	G: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
+	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
+	I: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
+	J: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
+	K: Fn(u128, u128, &[u8], usize) -> Result<(&[u8], usize, usize), Error>
 		+ Send
 		+ 'static
 		+ Clone
@@ -1023,10 +1023,14 @@ where
 													// handler and call it if so
 													match write_buffer.on_write_success {
 														Some(h) => {
-															(h)(
+															let hres = (h)(
 																fd.try_into().unwrap_or(0),
 																write_buffer.msg_id,
 															);
+															match hres {
+																Ok(_) => {},
+																Err(e) => println!("on_write_success callback resulted in: {}", e.to_string()),
+															}
 														}
 														None => {}
 													}
@@ -1077,10 +1081,15 @@ where
 											match (*linked_list).pop_front() {
 												Some(item) => match item.on_write_fail {
 													Some(h) => {
-														(h)(
+														let hres = (h)(
 															fd.try_into().unwrap_or(0),
 															item.msg_id,
 														);
+														match hres {
+                                                                                                                	Ok(_) => {},
+                                                                                                                	Err(e) => println!("on_write_fail callback resulted in: {}", e.to_string()),
+                                                                                                                }
+								
 													}
 													None => {}
 												},
@@ -1140,7 +1149,11 @@ where
 								error
 							},
 						)?;
-						(on_accept)(res as u128);
+						let accept_res = (on_accept)(res as u128);
+						match accept_res {
+							Ok(_) => {}
+							Err(e) => println!("on_accept callback resulted in: {}", e.to_string()),
+						}
 						Self::process_accept_result(fd, res, guarded_data)
 					}
 					Err(e) => Self::process_accept_err(fd, e),
@@ -1224,31 +1237,48 @@ where
 				println!("unexpected read on paused stream: {}", fd);
 			}
 			let msg_id: u128 = thread_rng().gen::<u128>();
-			let (resp, offset, len) = match use_on_client_read {
+			let result = match use_on_client_read {
+				//let (resp, offset, len) = match use_on_client_read {
 				true => (on_client_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
 				false => (on_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
 			};
-			if len > 0 {
-				Self::write(
-					fd,
-					resp,
-					offset,
-					len,
-					guarded_data,
-					msg_id,
-					on_write_success,
-					on_write_fail,
-				)?;
-			}
 
-			Self::push_handler_event(fd, HandlerEventType::ResumeRead, guarded_data, true)?;
+			match result {
+				Ok((resp, offset, len)) => {
+					if len > 0 {
+						Self::write(
+							fd,
+							resp,
+							offset,
+							len,
+							guarded_data,
+							msg_id,
+							on_write_success,
+							on_write_fail,
+						)?;
+						Self::push_handler_event(
+							fd,
+							HandlerEventType::ResumeRead,
+							guarded_data,
+							true,
+						)?;
+					}
+				}
+				Err(e) => {
+					println!("Client callback resulted in error: {}", e.to_string());
+				}
+			}
 		} else {
 			// close
 			let is_dup =
 				Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
 			if !is_dup {
 				let _ = close(fd);
-				(on_close)(fd.try_into().unwrap_or(0));
+				let close_res = (on_close)(fd.try_into().unwrap_or(0));
+				match close_res {
+					Ok(_) => {}
+					Err(e) => println!("on close callback resulted in error: {}", e.to_string()),
+				}
 			}
 		}
 		Ok(())
@@ -1271,7 +1301,11 @@ where
 					Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
 				if !is_dup {
 					let _ = close(fd);
-					(on_close)(fd.try_into().unwrap_or(0));
+					let res = (on_close)(fd.try_into().unwrap_or(0));
+					match res {
+						Ok(_) => {}
+						Err(e) => println!("on_close callback resulted in: {}", e.to_string()),
+					}
 				}
 			}
 		}
@@ -1385,12 +1419,12 @@ fn test_echo() -> Result<(), Error> {
 	let mut kqe = KqueueEventHandler::new();
 
 	// echo
-	kqe.set_on_read(|_, _, buf: &[u8], len| (buf, 0, len))?;
+	kqe.set_on_read(|_, _, buf: &[u8], len| Ok((buf, 0, len)))?;
 
-	kqe.set_on_accept(|_| {})?;
-	kqe.set_on_close(|_| {})?;
-	kqe.set_on_write_success(|_, _| {})?;
-	kqe.set_on_write_fail(|_, _| {})?;
+	kqe.set_on_accept(|_| Ok(()))?;
+	kqe.set_on_close(|_| Ok(()))?;
+	kqe.set_on_write_success(|_, _| Ok(()))?;
+	kqe.set_on_write_fail(|_, _| Ok(()))?;
 	kqe.set_on_client_read(move |_connection_id, _message_id, buf: &[u8], len| {
 		assert_eq!(len, 5);
 		assert_eq!(buf[0], 1);
@@ -1400,7 +1434,7 @@ fn test_echo() -> Result<(), Error> {
 		assert_eq!(buf[4], 5);
 		let mut x = x.lock().unwrap();
 		(*x) += 5;
-		(buf, 0, 0)
+		Ok((buf, 0, 0))
 	})?;
 
 	kqe.start()?;
