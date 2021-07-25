@@ -1001,40 +1001,59 @@ where
 		let write_buffer_clone = write_buffers[fd as usize].clone();
 		let guarded_data_clone = guarded_data.clone();
 
-		thread_pool.execute(async move {
-			let write_buffer = write_buffer_clone.lock();
-			match write_buffer {
-				Ok(mut linked_list) => {
-					let front_mut = (*linked_list).front_mut();
-					match front_mut {
-						Some(front_mut) => {
-							let res = write(
-								fd,
-								&front_mut.buffer
-									[(front_mut.offset as usize)..(front_mut.len as usize)],
-							);
-							match res {
-								Ok(len) => {
-									if len == (front_mut.len - front_mut.offset) as usize {
-										match (*linked_list).pop_front() {
-											Some(write_buffer) => {
-												// check if there's a write success
-												// handler and call it if so
-												match write_buffer.on_write_success {
-													Some(h) => {
-														(h)(
-															fd.try_into().unwrap_or(0),
-															write_buffer.msg_id,
-														);
+		thread_pool
+			.execute(async move {
+				let write_buffer = write_buffer_clone.lock();
+				match write_buffer {
+					Ok(mut linked_list) => {
+						let front_mut = (*linked_list).front_mut();
+						match front_mut {
+							Some(front_mut) => {
+								let res = write(
+									fd,
+									&front_mut.buffer
+										[(front_mut.offset as usize)..(front_mut.len as usize)],
+								);
+								match res {
+									Ok(len) => {
+										if len == (front_mut.len - front_mut.offset) as usize {
+											match (*linked_list).pop_front() {
+												Some(write_buffer) => {
+													// check if there's a write success
+													// handler and call it if so
+													match write_buffer.on_write_success {
+														Some(h) => {
+															(h)(
+																fd.try_into().unwrap_or(0),
+																write_buffer.msg_id,
+															);
+														}
+														None => {}
 													}
-													None => {}
+												}
+												None => {
+													println!("unexpected error couldn't pop");
 												}
 											}
-											None => {
-												println!("unexpected error couldn't pop");
+											if !(*linked_list).is_empty() {
+												let res = Self::push_handler_event(
+													fd,
+													HandlerEventType::ResumeWrite,
+													&guarded_data_clone,
+													true,
+												);
+												match res {
+													Ok(_) => {}
+													Err(e) => {
+														println!(
+															"handler push err: {}",
+															e.to_string()
+														)
+													}
+												}
 											}
-										}
-										if !(*linked_list).is_empty() {
+										} else {
+											front_mut.offset += len as u16;
 											let res = Self::push_handler_event(
 												fd,
 												HandlerEventType::ResumeWrite,
@@ -1048,53 +1067,46 @@ where
 												}
 											}
 										}
-									} else {
-										front_mut.offset += len as u16;
-										let res = Self::push_handler_event(
-											fd,
-											HandlerEventType::ResumeWrite,
-											&guarded_data_clone,
-											true,
-										);
-										match res {
-											Ok(_) => {}
-											Err(e) => {
-												println!("handler push err: {}", e.to_string())
+									}
+									Err(e) => {
+										println!("write error: {}", e.to_string());
+										loop {
+											if (*linked_list).is_empty() {
+												break;
+											}
+											match (*linked_list).pop_front() {
+												Some(item) => match item.on_write_fail {
+													Some(h) => {
+														(h)(
+															fd.try_into().unwrap_or(0),
+															item.msg_id,
+														);
+													}
+													None => {}
+												},
+												None => {}
 											}
 										}
+										(*linked_list).clear();
 									}
-								}
-								Err(e) => {
-									println!("write error: {}", e.to_string());
-									loop {
-										if (*linked_list).is_empty() {
-											break;
-										}
-										match (*linked_list).pop_front() {
-											Some(item) => match item.on_write_fail {
-												Some(h) => {
-													(h)(fd.try_into().unwrap_or(0), item.msg_id);
-												}
-												None => {}
-											},
-											None => {}
-										}
-									}
-									(*linked_list).clear();
 								}
 							}
-						}
-						None => {
-							println!("unepxected none");
+							None => {
+								println!("unepxected none");
+							}
 						}
 					}
+					Err(e) => println!(
+						"unexpected error with locking write_buffer: {}",
+						e.to_string()
+					),
 				}
-				Err(e) => println!(
-					"unexpected error with locking write_buffer: {}",
-					e.to_string()
-				),
-			}
-		})?;
+			})
+			.map_err(|e| {
+				let error: Error =
+					ErrorKind::InternalError(format!("write thread pool error: {}", e)).into();
+				error
+			})?;
 
 		Ok(())
 	}
@@ -1121,7 +1133,13 @@ where
 				match res {
 					Ok(res) => {
 						// set non-blocking
-						fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap()))?;
+						fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap())).map_err(
+							|e| {
+								let error: Error =
+									ErrorKind::InternalError(format!("fcntl error: {}", e)).into();
+								error
+							},
+						)?;
 						(on_accept)(res as u128);
 						Self::process_accept_result(fd, res, guarded_data)
 					}
@@ -1133,33 +1151,49 @@ where
 				// so we process it
 				let guarded_data = guarded_data.clone();
 				let fd_type = fd_type.clone();
-				thread_pool.execute(async move {
-					let mut buf = [0u8; BUFFER_SIZE];
-					// in order to ensure sequence in tact, obtain the lock
-					let res = read(fd, &mut buf);
-					let _ = match res {
-						Ok(res) => Self::process_read_result(
-							fd,
-							res,
-							buf,
-							&guarded_data,
-							on_read,
-							on_close,
-							on_write_success,
-							on_write_fail,
-							on_client_read,
-							use_on_client_read,
-							fd_type,
-						),
-						Err(e) => Self::process_read_err(fd, e, &guarded_data, on_close, fd_type),
-					};
-				})?;
+				thread_pool
+					.execute(async move {
+						let mut buf = [0u8; BUFFER_SIZE];
+						// in order to ensure sequence in tact, obtain the lock
+						let res = read(fd, &mut buf);
+						let _ = match res {
+							Ok(res) => Self::process_read_result(
+								fd,
+								res,
+								buf,
+								&guarded_data,
+								on_read,
+								on_close,
+								on_write_success,
+								on_write_fail,
+								on_client_read,
+								use_on_client_read,
+								fd_type,
+							),
+							Err(e) => {
+								Self::process_read_err(fd, e, &guarded_data, on_close, fd_type)
+							}
+						};
+					})
+					.map_err(|e| {
+						let error: Error =
+							ErrorKind::InternalError(format!("read thread pool error: {}", e))
+								.into();
+						error
+					})?;
 			}
 			FdType::Unknown => {
 				println!("unexpected fd_type (unknown) for fd: {}", fd);
 			}
 			FdType::Wakeup => {
-				read(fd, &mut [0u8; 1])?;
+				read(fd, &mut [0u8; 1]).map_err(|e| {
+					let error: Error = ErrorKind::InternalError(format!(
+						"Error reading from pipe, {}",
+						e.to_string()
+					))
+					.into();
+					error
+				})?;
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
 					let error: Error =
 						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -1249,7 +1283,16 @@ where
 		nfd: RawFd,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 	) -> Result<(), Error> {
-		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false)?;
+		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false).map_err(
+			|e| {
+				let error: Error = ErrorKind::InternalError(format!(
+					"push handler event error: {}",
+					e.to_string()
+				))
+				.into();
+				error
+			},
+		)?;
 		Ok(())
 	}
 

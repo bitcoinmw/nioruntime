@@ -43,11 +43,18 @@ fn main() {
 	}
 }
 
-fn client_thread(count: usize, id: usize, log: &LOG, time: SystemTime) -> Result<(), Error> {
+fn client_thread(
+	count: usize,
+	id: usize,
+	log: &LOG,
+	time: SystemTime,
+	tlat_sum: Arc<Mutex<f64>>,
+) -> Result<(), Error> {
 	let mut stream = TcpStream::connect("127.0.0.1:9999")?;
 	let buf = &mut [0; 128];
+	let mut lat_sum = 0.0;
 	for i in 0..count {
-		if i % 10000 == 0 {
+		if i != 0 && i % 10000 == 0 {
 			let mut log = log.lock().map_err(|e| {
 				let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
 				error
@@ -56,8 +63,11 @@ fn client_thread(count: usize, id: usize, log: &LOG, time: SystemTime) -> Result
 			let qps = (i as f64 / elapsed as f64) * 1000 as f64;
 			log.log(&format!("iteration {} on thread {}, qps={}", i, id, qps))?;
 		}
+		let start_query = std::time::SystemTime::now();
 		let res = stream.write(&[1, 2, 3, 4, 5]);
 		let len = stream.read(buf)?;
+		let elapsed = start_query.elapsed().unwrap().as_nanos();
+		lat_sum += elapsed as f64;
 		assert_eq!(len, 5);
 		assert_eq!(buf[0], 1);
 		assert_eq!(buf[1], 2);
@@ -73,7 +83,10 @@ fn client_thread(count: usize, id: usize, log: &LOG, time: SystemTime) -> Result
 		}
 	}
 	std::thread::sleep(std::time::Duration::from_millis(100));
-	println!("thread {} complete", id);
+	{
+		let mut tlat_sum = tlat_sum.lock().unwrap();
+		(*tlat_sum) += lat_sum;
+	}
 	Ok(())
 }
 
@@ -89,8 +102,7 @@ fn real_main() -> Result<(), Error> {
 			10 * 1024 * 1024, // 10mb
 			60 * 60 * 1000,   // 1hr
 			true,
-			"Log - nioruntime\n\
-------------------------------------------------------------------------------",
+			"",
 		)?;
 	}
 	let yml = load_yaml!("nio.yml");
@@ -112,17 +124,25 @@ fn real_main() -> Result<(), Error> {
 	};
 
 	if client {
-		println!("running client");
-		println!("threads={}", threads);
-		println!("count={}", count);
+		{
+			let mut log = log.lock().map_err(|e| {
+				let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
+				error
+			})?;
+
+			log.log(&format!("running client"))?;
+			log.log(&format!("threads={}", threads))?;
+			log.log(&format!("count={}", count))?;
+		}
 
 		let mut jhs = vec![];
 		let time = std::time::SystemTime::now();
+		let tlat_sum = Arc::new(Mutex::new(0.0));
 		for i in 0..threads {
 			let id = i.clone();
-
+			let tlat_sum = tlat_sum.clone();
 			jhs.push(std::thread::spawn(move || {
-				let res = client_thread(count, id, log, time);
+				let res = client_thread(count, id, log, time, tlat_sum.clone());
 				match res {
 					Ok(_) => {}
 					Err(e) => println!("Error in client thread: {}", e.to_string()),
@@ -133,7 +153,21 @@ fn real_main() -> Result<(), Error> {
 		for jh in jhs {
 			jh.join().expect("panic in thread");
 		}
-		println!("complete at={}", time.elapsed().unwrap().as_millis());
+		{
+			let mut log = log.lock().map_err(|e| {
+				let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
+				error
+			})?;
+			let elapsed_millis = time.elapsed().unwrap().as_millis();
+			log.log(&format!("Complete at={} ms", elapsed_millis))?;
+			let total_qps = 1000 as f64 * (count as f64 * threads as f64 / elapsed_millis as f64);
+			log.log(&format!("Total QPS={}", total_qps))?;
+			let tlat = tlat_sum.lock().unwrap();
+			log.log(&format!(
+				"Average latency={}ms",
+				(*tlat) / (1_000_000 * count * threads) as f64
+			))?;
+		}
 	} else {
 		{
 			let mut log = log.lock().map_err(|e| {
@@ -144,10 +178,7 @@ fn real_main() -> Result<(), Error> {
 		}
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
 		let mut kqe = KqueueEventHandler::new();
-		kqe.set_on_read(move |_connection_id, _message_id, buf, len| {
-			//println!("on read {}", _connection_id);
-			(buf, 0, len)
-		})?;
+		kqe.set_on_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
 		kqe.set_on_client_read(move |_connection_id, _message_id, buf, len| (buf, 0, len))?;
 		kqe.set_on_accept(move |_connection_id| {})?;
 		kqe.set_on_close(move |connection_id| {
@@ -157,7 +188,12 @@ fn real_main() -> Result<(), Error> {
 		})?;
 		kqe.set_on_write_success(move |_connection_id, _message_id| {})?;
 		kqe.set_on_write_fail(move |connection_id, message_id| {
-			println!("message fail for cid={},mid={}", connection_id, message_id);
+			let mut log = log.lock().unwrap();
+			log.log(&format!(
+				"message fail for cid={},mid={}",
+				connection_id, message_id
+			))
+			.unwrap();
 		})?;
 		kqe.start()?;
 		kqe.add_tcp_listener(&listener)?;
