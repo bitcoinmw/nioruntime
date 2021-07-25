@@ -1089,7 +1089,6 @@ where
                                                                                                                 	Ok(_) => {},
                                                                                                                 	Err(e) => println!("on_write_fail callback resulted in: {}", e.to_string()),
                                                                                                                 }
-								
 													}
 													None => {}
 												},
