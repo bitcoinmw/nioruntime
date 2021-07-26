@@ -48,6 +48,7 @@ use std::time::Duration;
 
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
+const MAX_EVENTS_KQUEUE: i32 = 100;
 
 #[derive(Debug, Clone)]
 struct RawFdAction {
@@ -752,7 +753,7 @@ where
 		}
 
 		let mut ret_kevs = vec![];
-		for _ in 0..10 {
+		for _ in 0..MAX_EVENTS_KQUEUE {
 			ret_kevs.push(kevent::new(
 				0,
 				EventFilter::EVFILT_SYSCOUNT,
@@ -777,7 +778,7 @@ where
 				kevs.as_ptr(),
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
-				10,
+				MAX_EVENTS_KQUEUE,
 				&duration_to_timespec(Duration::from_millis(1)),
 			)
 		};
@@ -925,7 +926,7 @@ where
 					kevs.as_ptr(),
 					kevs.len() as i32,
 					ret_kevs.as_mut_ptr(),
-					10,
+					MAX_EVENTS_KQUEUE,
 					&duration_to_timespec(Duration::from_millis(100)),
 				)
 			};
@@ -962,26 +963,62 @@ where
 				continue;
 			}
 
+			// first process write buffers in a single batch
+			let mut fds = vec![];
 			for i in 0..ret_count {
-				let res = Self::process_event(
-					ret_kevs[i as usize],
-					&read_fd_type,
-					&thread_pool,
-					guarded_data,
-					write_buffers,
-					on_read.clone(),
-					on_accept.clone(),
-					on_close.clone(),
-					on_write_success.clone(),
-					on_write_fail.clone(),
-					on_client_read.clone(),
-					use_on_client_read[ret_kevs[i as usize].ident as usize],
-				);
+				let kev = ret_kevs[i as usize];
+				if kev.filter == EVFILT_WRITE {
+					fds.push(kev.ident as RawFd);
+				}
+			}
+			let res = Self::process_write_buffers(fds, guarded_data, write_buffers);
 
-				match res {
-					Ok(_) => {}
-					Err(e) => {
-						log!("Unexpected error in poll loop: {}", e.to_string());
+			match res {
+				Ok(_) => {}
+				Err(e) => {
+					log!(
+						"Unexpected error in poll loop (write buffers): {}",
+						e.to_string()
+					);
+				}
+			}
+
+			for i in 0..ret_count {
+				let kev = ret_kevs[i as usize];
+				if kev.filter == EVFILT_WRITE && !kev.flags.contains(EventFlag::EV_DELETE) {
+					let res = Self::process_event_write(
+						kev.ident as RawFd,
+						&thread_pool,
+						write_buffers,
+						guarded_data,
+					);
+					match res {
+						Ok(_) => {}
+						Err(e) => {
+							log!("Unexpected error in poll loop: {}", e.to_string());
+						}
+					}
+				}
+				if kev.filter == EVFILT_READ {
+					let res = Self::process_event_read(
+						kev.ident as RawFd,
+						&read_fd_type,
+						&thread_pool,
+						guarded_data,
+						on_read.clone(),
+						on_accept.clone(),
+						on_close.clone(),
+						on_write_success.clone(),
+						on_write_fail.clone(),
+						on_client_read.clone(),
+						use_on_client_read[kev.ident as usize],
+					);
+
+					match res {
+						Ok(_) => {}
+						Err(e) => {
+							log!("Unexpected error in poll loop: {}", e.to_string());
+						}
 					}
 				}
 			}
@@ -989,59 +1026,21 @@ where
 	}
 
 	fn process_error() -> Result<(), Error> {
-		log!("Error in event queue");
+		log!("Error in event queue, {}", std::io::Error::last_os_error());
 		Ok(())
 	}
 
-	fn process_event(
-		kev: kevent,
-		read_fd_type: &Vec<FdType>,
-		thread_pool: &ThreadPool,
+	fn process_write_buffers(
+		fds: Vec<RawFd>,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		on_read: Pin<Box<F>>,
-		on_accept: Pin<Box<G>>,
-		on_close: Pin<Box<H>>,
-		on_write_success: Pin<Box<I>>,
-		on_write_fail: Pin<Box<J>>,
-		on_client_read: Pin<Box<K>>,
-		use_on_client_read: bool,
 	) -> Result<(), Error> {
-		if kev.filter == EVFILT_WRITE && !kev.flags.contains(EventFlag::EV_DELETE) {
-			Self::process_event_write(kev, thread_pool, write_buffers, guarded_data)?;
-		}
-		if kev.filter == EVFILT_READ {
-			Self::process_event_read(
-				kev,
-				read_fd_type,
-				thread_pool,
-				guarded_data,
-				on_read,
-				on_accept,
-				on_close,
-				on_write_success,
-				on_write_fail,
-				on_client_read,
-				use_on_client_read,
-			)?;
-		}
+		let mut guarded_data = guarded_data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
 
-		Ok(())
-	}
-
-	fn process_event_write(
-		kev: kevent,
-		thread_pool: &ThreadPool,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-	) -> Result<(), Error> {
-		let fd = kev.ident as RawFd;
-		{
-			let mut guarded_data = guarded_data.lock().map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?;
-
+		for fd in fds {
 			let cur_len = write_buffers.len();
 			if cur_len <= fd as usize {
 				for _ in cur_len..(fd + 1) as usize {
@@ -1062,6 +1061,15 @@ where
 			}
 		}
 
+		Ok(())
+	}
+
+	fn process_event_write(
+		fd: RawFd,
+		thread_pool: &ThreadPool,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+	) -> Result<(), Error> {
 		let write_buffer_clone = write_buffers[fd as usize].clone();
 		let guarded_data_clone = guarded_data.clone();
 
@@ -1184,7 +1192,7 @@ where
 	}
 
 	fn process_event_read(
-		kev: kevent,
+		fd: RawFd,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &ThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
@@ -1196,7 +1204,6 @@ where
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
 	) -> Result<(), Error> {
-		let fd = kev.ident as RawFd;
 		let fd_type = &read_fd_type[fd as usize];
 		match fd_type {
 			FdType::Listener => {
@@ -1363,7 +1370,6 @@ where
 				let is_dup =
 					Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
 				if !is_dup {
-					log!("++++++++++++close {}", fd);
 					let _ = close(fd);
 					let res = (on_close)(fd.try_into().unwrap_or(0));
 					match res {
