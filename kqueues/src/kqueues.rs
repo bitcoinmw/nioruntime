@@ -594,6 +594,14 @@ where
 								ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 							error
 						})?;
+
+						let mut iter = (*linked_list).iter();
+						loop {
+							match iter.next() {
+								Some(item) => drop(item),
+								None => break,
+							}
+						}
 						(*linked_list).clear();
 					}
 				}

@@ -19,6 +19,12 @@ args:
         long: threads
         value_name: threads
         takes_value: true
+    - itt:
+        help: Number of times to repeat the test
+        short: i
+        long: itt
+        value_name: itt
+        takes_value: true
     - debug:
         help: Whether to print debugging information
         short: d

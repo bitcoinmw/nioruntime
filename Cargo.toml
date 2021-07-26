@@ -19,6 +19,7 @@ members = ["libnio", "kqueues", "util"]
 nioruntime_util = { path = "./util" }
 nioruntime_kqueues = { path = "./kqueues" }
 nioruntime_libnio = { path = "./libnio" }
+nix = "0.22.0"
 
 clap = { version = "2.33", features = ["yaml"] }
 lazy_static = "1.4.0"

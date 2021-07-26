@@ -18,3 +18,5 @@ pub mod threadpool;
 
 pub use crate::error::{Error, ErrorKind};
 pub use crate::log::Log;
+pub use crate::log::LogConfig;
+pub use crate::log::LOG;
