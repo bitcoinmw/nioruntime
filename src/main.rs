@@ -15,8 +15,7 @@
 use clap::load_yaml;
 use clap::App;
 use nioruntime_kqueues::kqueues::KqueueEventHandler;
-use nioruntime_util::log;
-use nioruntime_util::Error;
+use nioruntime_util::*;
 use nix::unistd::close;
 use std::io::Read;
 use std::io::Write;
@@ -130,6 +129,7 @@ fn client_thread(
 }
 
 fn real_main() -> Result<(), Error> {
+	log_config!(nioruntime_util::LogConfig::default())?;
 	{
 		//log_config!(nioruntime_util::LogConfig::default())?;
 		//log!("ok {} {} x={:?}", 1, "second str", "hi");

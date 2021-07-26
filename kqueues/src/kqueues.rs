@@ -23,6 +23,7 @@ use kqueue_sys::FilterFlag;
 use kqueue_sys::{kevent, kqueue};
 use libc::uintptr_t;
 use nioruntime_libnio::ActionType;
+use nioruntime_util::log;
 use nix::errno::Errno;
 use nix::fcntl::fcntl;
 use nix::fcntl::OFlag;
@@ -521,10 +522,10 @@ where
 			let res = Self::poll_loop(&cloned_guarded_data, &mut write_buffers, queue);
 			match res {
 				Ok(_) => {
-					println!("poll_loop exited normally");
+					log!("poll_loop exited normally");
 				}
 				Err(e) => {
-					println!("FATAL: Unexpected error in poll loop: {}", e.to_string());
+					log!("FATAL: Unexpected error in poll loop: {}", e.to_string());
 				}
 			}
 		});
@@ -532,18 +533,32 @@ where
 		Ok(())
 	}
 
+	fn contained_event_for(
+		fd: uintptr_t,
+		event_type: EventFilter,
+		ret_kevs: &Vec<kevent>,
+		ret_count: i32,
+	) -> bool {
+		for i in 0..ret_count {
+			let kev = ret_kevs[i as usize];
+			if kev.ident == fd && kev.filter == event_type {
+				return true;
+			}
+		}
+		false
+	}
+
 	fn process_handler_events(
-		last_fd: uintptr_t,
 		handler_events: Vec<HandlerEvent>,
 		write_pending: Vec<RawFd>,
 		kevs: &mut Vec<kevent>,
-		ret_kev: kevent,
+		ret_kevs: &Vec<kevent>,
+		ret_count: i32,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 	) -> Result<(), Error> {
-		let mut resume_collision = false;
-		for handler_event in handler_events {
+		for handler_event in &handler_events {
 			match handler_event.etype {
 				HandlerEventType::Accept => {
 					let fd = handler_event.fd as uintptr_t;
@@ -607,7 +622,7 @@ where
 				}
 				HandlerEventType::ResumeRead => {
 					let fd = handler_event.fd as uintptr_t;
-					if last_fd != fd || ret_kev.filter != EVFILT_READ {
+					if !Self::contained_event_for(fd, EVFILT_READ, ret_kevs, ret_count) {
 						kevs.push(kevent::new(
 							fd,
 							EventFilter::EVFILT_READ,
@@ -621,52 +636,72 @@ where
 							}
 						}
 						read_fd_type[fd] = FdType::Stream;
-					} else {
-						resume_collision = true;
 					}
 				}
 				HandlerEventType::ResumeWrite => {
 					let fd = handler_event.fd as uintptr_t;
-					if last_fd != fd || ret_kev.filter != EVFILT_WRITE {
+					if !Self::contained_event_for(fd, EVFILT_WRITE, ret_kevs, ret_count) {
 						kevs.push(kevent::new(
 							fd,
 							EventFilter::EVFILT_WRITE,
 							EventFlag::EV_ADD,
 							FilterFlag::empty(),
 						));
-					} else {
-						resume_collision = true;
 					}
 				}
 			}
 		}
 
-		if !resume_collision
-			&& last_fd != 0
-			&& read_fd_type[last_fd as usize] == FdType::Stream
-			&& ret_kev.filter == EVFILT_READ
-		{
-			kevs.push(kevent::new(
-				last_fd,
-				EventFilter::EVFILT_READ,
-				EventFlag::EV_DELETE,
-				FilterFlag::empty(),
-			));
-			read_fd_type[last_fd] = FdType::PausedStream;
-		}
+		// remove events that have already been processed (will be added back in with handler events)
+		// this ensures only a single event is being processed at a time
+		let mut i = 0;
+		for kev in ret_kevs {
+			if i >= ret_count {
+				break;
+			}
+			i += 1;
 
-		if !resume_collision
-			&& last_fd != 0
-			&& (read_fd_type[last_fd as usize] == FdType::Stream
-				|| read_fd_type[last_fd as usize] == FdType::PausedStream)
-			&& ret_kev.filter == EVFILT_WRITE
-		{
-			kevs.push(kevent::new(
-				last_fd,
-				EventFilter::EVFILT_WRITE,
-				EventFlag::EV_DELETE,
-				FilterFlag::empty(),
-			));
+			// check that we didn't already receive the handler event for this kev
+			// TODO: could be perf issue O(n X m)
+			let mut found_collision = false;
+			for handler_event in &handler_events {
+				if handler_event.fd == kev.ident.try_into().unwrap()
+					&& ((handler_event.etype == HandlerEventType::ResumeWrite
+						&& kev.filter == EVFILT_WRITE)
+						|| (handler_event.etype == HandlerEventType::ResumeRead
+							&& kev.filter == EVFILT_READ))
+				{
+					found_collision = true;
+					break;
+				}
+			}
+
+			// since there's a collision, we don't need to delete the event
+			if found_collision {
+				continue;
+			}
+
+			if read_fd_type[kev.ident] == FdType::Stream
+				|| read_fd_type[kev.ident] == FdType::PausedStream
+			{
+				match kev.filter {
+					EVFILT_READ => kevs.push(kevent::new(
+						kev.ident,
+						EventFilter::EVFILT_READ,
+						EventFlag::EV_DELETE,
+						FilterFlag::empty(),
+					)),
+					EVFILT_WRITE => kevs.push(kevent::new(
+						kev.ident,
+						EventFilter::EVFILT_WRITE,
+						EventFlag::EV_DELETE,
+						FilterFlag::empty(),
+					)),
+					_ => {
+						log!("Unexpected event type: {:?}", kev);
+					}
+				}
+			}
 		}
 
 		// handle write_pending
@@ -716,12 +751,15 @@ where
 			write_buffers.push(Arc::new(Mutex::new(LinkedList::new())));
 		}
 
-		let mut ret_kev = kevent::new(
-			0,
-			EventFilter::EVFILT_SYSCOUNT,
-			EventFlag::empty(),
-			FilterFlag::empty(),
-		);
+		let mut ret_kevs = vec![];
+		for _ in 0..10 {
+			ret_kevs.push(kevent::new(
+				0,
+				EventFilter::EVFILT_SYSCOUNT,
+				EventFlag::empty(),
+				FilterFlag::empty(),
+			));
+		}
 
 		// add the wakeup pipe rx here
 		let mut kevs: Vec<kevent> = Vec::new();
@@ -738,12 +776,13 @@ where
 				queue,
 				kevs.as_ptr(),
 				kevs.len() as i32,
-				&mut ret_kev,
-				1,
+				ret_kevs.as_mut_ptr(),
+				10,
 				&duration_to_timespec(Duration::from_millis(1)),
 			)
 		};
 
+		let mut ret_count = 0;
 		loop {
 			let to_process;
 			let handler_events;
@@ -869,71 +908,88 @@ where
 			}
 
 			// check if we accepted a connection
-			let last_fd = ret_kev.ident as uintptr_t;
 			Self::process_handler_events(
-				last_fd,
 				handler_events,
 				write_pending,
 				&mut kevs,
-				ret_kev,
+				&ret_kevs,
+				ret_count,
 				&mut read_fd_type,
 				&mut use_on_client_read,
 				write_buffers,
 			)?;
 
-			ret_kev = kevent::new(
-				0,
-				EventFilter::EVFILT_SYSCOUNT,
-				EventFlag::empty(),
-				FilterFlag::empty(),
-			);
-
-			let ret = unsafe {
+			ret_count = unsafe {
 				kevent(
 					queue,
 					kevs.as_ptr(),
 					kevs.len() as i32,
-					&mut ret_kev,
-					1, // TODO: can we process more than one event?
+					ret_kevs.as_mut_ptr(),
+					10,
 					&duration_to_timespec(Duration::from_millis(100)),
 				)
 			};
 
-			if ret == 0 || ret_kev.flags.contains(EventFlag::EV_DELETE) {
+			// handle error here
+			if ret_count < 0 {
+				match Self::process_error() {
+					Ok(_) => {}
+					Err(e) => {
+						log!("Unexpected error in poll loop: {}", e.to_string());
+					}
+				}
 				continue;
 			}
 
-			let res = match ret {
-				-1 => Self::process_error(ret_kev, &read_fd_type),
-				_ => Self::process_event(
-					ret_kev,
+			// if no events are returned (on timeout), just bypass following logic and wait
+			if ret_count == 0 {
+				continue;
+			}
+			// check if we have all delete events which can be ignored
+			let mut has_non_delete = false;
+			let mut i = 0;
+			for k in &ret_kevs {
+				if !k.flags.contains(EventFlag::EV_DELETE) {
+					has_non_delete = true;
+					break;
+				}
+				i += 1;
+				if i >= ret_count {
+					break;
+				}
+			}
+			if !has_non_delete {
+				continue;
+			}
+
+			for i in 0..ret_count {
+				let res = Self::process_event(
+					ret_kevs[i as usize],
 					&read_fd_type,
 					&thread_pool,
 					guarded_data,
 					write_buffers,
-					on_read,
-					on_accept,
-					on_close,
-					on_write_success,
-					on_write_fail,
-					on_client_read,
-					use_on_client_read[ret_kev.ident as usize],
-				),
-			};
+					on_read.clone(),
+					on_accept.clone(),
+					on_close.clone(),
+					on_write_success.clone(),
+					on_write_fail.clone(),
+					on_client_read.clone(),
+					use_on_client_read[ret_kevs[i as usize].ident as usize],
+				);
 
-			match res {
-				Ok(_) => {}
-				Err(e) => {
-					println!("Unexpected error in poll loop: {}", e.to_string());
+				match res {
+					Ok(_) => {}
+					Err(e) => {
+						log!("Unexpected error in poll loop: {}", e.to_string());
+					}
 				}
 			}
 		}
 	}
 
-	fn process_error(kev: kevent, read_fd_type: &Vec<FdType>) -> Result<(), Error> {
-		let fd = kev.ident as RawFd;
-		let fd_type = &read_fd_type[fd as usize];
-		println!("Error on fd = {}, type = {:?}", fd, fd_type);
+	fn process_error() -> Result<(), Error> {
+		log!("Error in event queue");
 		Ok(())
 	}
 
@@ -951,7 +1007,7 @@ where
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
 	) -> Result<(), Error> {
-		if kev.filter == EVFILT_WRITE {
+		if kev.filter == EVFILT_WRITE && !kev.flags.contains(EventFlag::EV_DELETE) {
 			Self::process_event_write(kev, thread_pool, write_buffers, guarded_data)?;
 		}
 		if kev.filter == EVFILT_READ {
@@ -998,10 +1054,10 @@ where
 				error
 			})?;
 
-			while !guarded_data.write_buffers[fd as usize].is_empty() {
+			loop {
 				match guarded_data.write_buffers[fd as usize].pop_front() {
 					Some(buffer) => linked_list.push_back(buffer),
-					None => println!("unexpected none!"),
+					None => break,
 				}
 			}
 		}
@@ -1037,14 +1093,14 @@ where
 															);
 															match hres {
 																Ok(_) => {},
-																Err(e) => println!("on_write_success callback resulted in: {}", e.to_string()),
+																Err(e) => log!("on_write_success callback resulted in: {}", e.to_string()),
 															}
 														}
 														None => {}
 													}
 												}
 												None => {
-													println!("unexpected error couldn't pop");
+													log!("unexpected error couldn't pop");
 												}
 											}
 											if !(*linked_list).is_empty() {
@@ -1057,7 +1113,7 @@ where
 												match res {
 													Ok(_) => {}
 													Err(e) => {
-														println!(
+														log!(
 															"handler push err: {}",
 															e.to_string()
 														)
@@ -1075,13 +1131,13 @@ where
 											match res {
 												Ok(_) => {}
 												Err(e) => {
-													println!("handler push err: {}", e.to_string())
+													log!("handler push err: {}", e.to_string())
 												}
 											}
 										}
 									}
 									Err(e) => {
-										println!("write error: {}", e.to_string());
+										log!("write error: {}", e.to_string());
 										loop {
 											if (*linked_list).is_empty() {
 												break;
@@ -1095,7 +1151,7 @@ where
 														);
 														match hres {
                                                                                                                 	Ok(_) => {},
-                                                                                                                	Err(e) => println!("on_write_fail callback resulted in: {}", e.to_string()),
+                                                                                                                	Err(e) => log!("on_write_fail callback resulted in: {}", e.to_string()),
                                                                                                                 }
 													}
 													None => {}
@@ -1108,11 +1164,11 @@ where
 								}
 							}
 							None => {
-								println!("unepxected none");
+								log!("unepxected none");
 							}
 						}
 					}
-					Err(e) => println!(
+					Err(e) => log!(
 						"unexpected error with locking write_buffer: {}",
 						e.to_string()
 					),
@@ -1159,7 +1215,7 @@ where
 						let accept_res = (on_accept)(res as u128);
 						match accept_res {
 							Ok(_) => {}
-							Err(e) => println!("on_accept callback resulted in: {}", e.to_string()),
+							Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
 						}
 						Self::process_accept_result(fd, res, guarded_data)
 					}
@@ -1203,7 +1259,7 @@ where
 					})?;
 			}
 			FdType::Unknown => {
-				println!("unexpected fd_type (unknown) for fd: {}", fd);
+				log!("unexpected fd_type (unknown) for fd: {}", fd);
 			}
 			FdType::Wakeup => {
 				read(fd, &mut [0u8; 1]).map_err(|e| {
@@ -1241,7 +1297,7 @@ where
 	) -> Result<(), Error> {
 		if len > 0 {
 			if fd_type == FdType::PausedStream {
-				println!("unexpected read on paused stream: {}", fd);
+				log!("unexpected read on paused stream: {}", fd);
 			}
 			let msg_id: u128 = thread_rng().gen::<u128>();
 			let result = match use_on_client_read {
@@ -1272,7 +1328,7 @@ where
 					}
 				}
 				Err(e) => {
-					println!("Client callback resulted in error: {}", e.to_string());
+					log!("Client callback resulted in error: {}", e.to_string());
 				}
 			}
 		} else {
@@ -1284,7 +1340,7 @@ where
 				let close_res = (on_close)(fd.try_into().unwrap_or(0));
 				match close_res {
 					Ok(_) => {}
-					Err(e) => println!("on close callback resulted in error: {}", e.to_string()),
+					Err(e) => log!("on close callback resulted in error: {}", e.to_string()),
 				}
 			}
 		}
@@ -1307,11 +1363,12 @@ where
 				let is_dup =
 					Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
 				if !is_dup {
+					log!("++++++++++++close {}", fd);
 					let _ = close(fd);
 					let res = (on_close)(fd.try_into().unwrap_or(0));
 					match res {
 						Ok(_) => {}
-						Err(e) => println!("on_close callback resulted in: {}", e.to_string()),
+						Err(e) => log!("on_close callback resulted in: {}", e.to_string()),
 					}
 				}
 			}
@@ -1338,7 +1395,7 @@ where
 	}
 
 	fn process_accept_err(_acceptor: RawFd, error: Errno) -> Result<(), Error> {
-		println!("error on acceptor: {}", error);
+		log!("error on acceptor: {}", error);
 		Ok(())
 	}
 
@@ -1400,7 +1457,7 @@ where
 					}
 				}
 				Err(e) => {
-					println!("Unexpected handler error: {}", e.to_string());
+					log!("Unexpected handler error: {}", e.to_string());
 				}
 			}
 			if wakeup && !wakeup_scheduled {
