@@ -25,6 +25,18 @@ args:
         long: itt
         value_name: itt
         takes_value: true
+    - max:
+        help: Max bytes per request
+        short: m
+        long: max
+        value_name: max
+        takes_value: true
+    - min:
+        help: Min bytes per request
+        short: q
+        long: min
+        value_name: min
+        takes_value: true
     - debug:
         help: Whether to print debugging information
         short: d

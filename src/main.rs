@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use byte_tools::copy;
+use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
 use nioruntime_evh::eventhandler::EventHandler;
 use nioruntime_util::*;
 use nix::unistd::close;
 use rand::Rng;
+use std::collections::HashMap;
+use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -25,6 +29,19 @@ use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
+
+struct Buffer {
+	data: [u8; 100_000],
+	len: usize,
+}
+
+impl Buffer {
+	fn new() -> Self {
+		let data = [0u8; 100_000];
+		let len = 0;
+		Buffer { data, len }
+	}
+}
 
 // include build information
 pub mod built_info {
@@ -44,11 +61,14 @@ fn client_thread(
 	id: usize,
 	tlat_sum: Arc<Mutex<f64>>,
 	tlat_max: Arc<Mutex<u128>>,
+	min: u32,
+	max: u32,
 ) -> Result<(), Error> {
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
 	let mut stream = TcpStream::connect("127.0.0.1:9999")?;
-	let buf = &mut [0u8; 128];
+	let buf = &mut [0u8; 100_000];
+	let buf2 = &mut [0u8; 100_000];
 	let start_itt = std::time::SystemTime::now();
 	for i in 0..count {
 		if i != 0 && i % 10000 == 0 {
@@ -57,31 +77,46 @@ fn client_thread(
 			log!("Request {} on thread {}, qps={}", i, id, qps);
 		}
 		let start_query = std::time::SystemTime::now();
-		let num: u8 = rand::thread_rng().gen_range(0..100);
-		buf[0] = num;
+		let num: u32 = rand::thread_rng().gen_range(min..max);
+		let num_buf = num.to_le_bytes();
+		copy(&num_buf[0..4], &mut buf[0..4]);
+
 		for i in 0..num {
-			buf[i as usize + 1] = i;
+			buf[i as usize + 4] = (i % 128) as u8;
 		}
 
-		let res = stream.write(&buf[0..(num as usize + 1)]);
-		let len = stream.read(buf)?;
+		let res = stream.write(&buf[0..(num as usize + 4)]);
+
+		match res {
+			Ok(_x) => {}
+			Err(e) => {
+				println!("Error: {}", e.to_string());
+				std::thread::sleep(std::time::Duration::from_millis(1));
+			}
+		}
+
+		let mut len_sum = 0;
+		loop {
+			let len = stream.read(&mut buf2[len_sum..])?;
+			len_sum += len;
+			if len_sum == num as usize + 4 {
+				break;
+			}
+		}
+
 		let elapsed = start_query.elapsed().unwrap().as_nanos();
 		lat_sum += elapsed as f64;
 		if elapsed > lat_max {
 			lat_max = elapsed;
 		}
 
-		assert_eq!(len, num as usize + 1);
+		assert_eq!(len_sum, num as usize + 4);
+		assert_eq!(Cursor::new(&buf2[0..4]).read_u32::<LittleEndian>()?, num);
 		for i in 0..num {
-			assert_eq!(buf[i as usize + 1], i);
-		}
-
-		match res {
-			Ok(_) => {}
-			Err(e) => {
-				println!("Error: {}", e.to_string());
-				std::thread::sleep(std::time::Duration::from_millis(1));
+			if buf2[i as usize + 4] != (i % 128) as u8 {
+				log!("assertion at {} fails", i);
 			}
+			assert_eq!(buf2[i as usize + 4], (i % 128) as u8);
 		}
 	}
 
@@ -112,6 +147,8 @@ fn real_main() -> Result<(), Error> {
 	let threads = args.is_present("threads");
 	let count = args.is_present("count");
 	let itt = args.is_present("itt");
+	let max = args.is_present("max");
+	let min = args.is_present("min");
 
 	let threads = match threads {
 		true => args.value_of("threads").unwrap().parse().unwrap(),
@@ -128,11 +165,22 @@ fn real_main() -> Result<(), Error> {
 		false => 1,
 	};
 
+	let max = match max {
+		true => args.value_of("max").unwrap().parse().unwrap(),
+		false => 100,
+	};
+
+	let min = match min {
+		true => args.value_of("min").unwrap().parse().unwrap(),
+		false => 1,
+	};
+
 	if client {
 		log!("Running client");
 		log!("Threads={}", threads);
 		log!("Iterations={}", itt);
 		log!("Requests per thread per iteration={}", count);
+		log!("Request length: Max={},Min={}", max, min);
 		log_no_ts!(
 			"--------------------------------------------------------------------------------"
 		);
@@ -148,7 +196,8 @@ fn real_main() -> Result<(), Error> {
 				let tlat_sum = tlat_sum.clone();
 				let tlat_max = tlat_max.clone();
 				jhs.push(std::thread::spawn(move || {
-					let res = client_thread(count, id, tlat_sum.clone(), tlat_max.clone());
+					let res =
+						client_thread(count, id, tlat_sum.clone(), tlat_max.clone(), min, max);
 					match res {
 						Ok(_) => {}
 						Err(e) => println!("Error in client thread: {}", e.to_string()),
@@ -178,14 +227,59 @@ fn real_main() -> Result<(), Error> {
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
 		log!("Listener Started");
 		let mut eh = EventHandler::new();
-		eh.set_on_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
+
+		let process_buffer = Arc::new(Mutex::new([0u8; 100_000]));
+		let buffers: Arc<Mutex<HashMap<u128, Buffer>>> = Arc::new(Mutex::new(HashMap::new()));
+		let buffers_clone = buffers.clone();
+		let buffers_clone2 = buffers.clone();
+		eh.set_on_read(move |connection_id, _message_id, buf, len| {
+			/*
+						let mut buffers = buffers_clone2.lock().unwrap();
+
+						let held_buf = &mut buffers.get_mut(&connection_id).unwrap();
+						let exp_len = Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
+						let data = &mut held_buf.data[0..len];
+						if held_buf.len == 0 {
+							copy(&buf[0..len], data);
+							held_buf.len += len;
+							// return nothing yet
+							Ok((buf, 0, 0))
+						} else {
+							if held_buf.len < 4 {
+								copy(&buf[0..len], &mut data[held_buf.len..]);
+								held_buf.len += len;
+								// still nothing
+								Ok((buf, 0, 0))
+							} else {
+								copy(&buf[0..len], &mut data[held_buf.len..]);
+								held_buf.len += len;
+
+								if exp_len + 4 == held_buf.len as u32 {
+									let ret_buf = [0u8; 100_000];
+							//		Ok((&held_buf.data, 0, held_buf.len))
+			//Ok((buf, 0, 0))
+									let process_buffer = process_buffer.lock().unwrap();
+									Ok((&*process_buffer, 0, 0))
+								} else {
+									Ok((buf, 0, 0))
+								}
+							}
+						}
+			*/
+			Ok((buf, 0, len))
+		})?;
 		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
-		eh.set_on_accept(move |_connection_id| {
-			log!("=====================accept {}", _connection_id);
+		eh.set_on_accept(move |connection_id| {
+			log!("accept {}", connection_id);
+			let mut buffers = buffers.lock().unwrap();
+			buffers.insert(connection_id, Buffer::new());
 			Ok(())
 		})?;
+
 		eh.set_on_close(move |connection_id| {
-			log!("=====================close {}", connection_id);
+			log!("close {}", connection_id);
+			let mut buffers = buffers_clone.lock().unwrap();
+			buffers.remove(&connection_id);
 			Ok(())
 		})?;
 		eh.set_on_write_success(move |_connection_id, _message_id| Ok(()))?;

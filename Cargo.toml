@@ -21,6 +21,8 @@ nioruntime_evh = { path = "./eventhandler" }
 nioruntime_libnio = { path = "./libnio" }
 nix = "0.22.0"
 rand = "0.8.4"
+byte-tools = "0.3.1"
+byteorder = "1.4.2"
 
 clap = { version = "2.33", features = ["yaml"] }
 lazy_static = "1.4.0"

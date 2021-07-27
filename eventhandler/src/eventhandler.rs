@@ -915,8 +915,13 @@ where
 			for i in 0..ret_count {
 				let kev = ret_kevs[i as usize];
 				if kev.filter == EVFILT_WRITE && !kev.flags.contains(EventFlag::EV_DELETE) {
-					let res =
-						Self::process_event_write(kev.ident as RawFd, &thread_pool, write_buffers);
+					let res = Self::process_event_write(
+						kev.ident as RawFd,
+						&thread_pool,
+						write_buffers,
+						guarded_data,
+						on_close.clone(),
+					);
 					match res {
 						Ok(_) => {}
 						Err(e) => {
@@ -977,7 +982,6 @@ where
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 				error
 			})?;
-
 			loop {
 				match guarded_data.write_buffers[fd as usize].pop_front() {
 					Some(buffer) => linked_list.push_back(buffer),
@@ -1038,6 +1042,8 @@ where
 	fn write_until_block(
 		fd: RawFd,
 		linked_list: &mut LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		on_close: Pin<Box<H>>,
 	) -> Result<(), Error> {
 		loop {
 			match (*linked_list).front_mut() {
@@ -1071,10 +1077,23 @@ where
 								break;
 							}
 						}
-						Err(e) => {
-							// an error occurred. We just report and let
-							// the reader handle this.
-
+						Err(_e) => {
+							let is_dup = Self::push_handler_event(
+								fd,
+								HandlerEventType::Close,
+								guarded_data,
+								false,
+							)?;
+							if !is_dup {
+								let _ = close(fd);
+								let res = (on_close)(fd.try_into().unwrap_or(0));
+								match res {
+									Ok(_) => {}
+									Err(e) => {
+										log!("on_close callback resulted in: {}", e.to_string())
+									}
+								}
+							}
 							match &front.on_write_fail {
 								Some(h) => {
 									let hres = (h)(fd.try_into().unwrap_or(0), front.msg_id);
@@ -1089,22 +1108,9 @@ where
 								None => {}
 							}
 
-							log!("Error occurred on write: {}", e);
+							break;
 						}
 					}
-					/*
-										loop {
-											let res = write(
-												fd,
-												&front.buffer
-												[(front.offset as usize)..(front.len as usize)],
-											);
-
-											match res {
-
-											}
-										}
-					*/
 				}
 				None => {
 					break;
@@ -1119,15 +1125,18 @@ where
 		fd: RawFd,
 		thread_pool: &ThreadPool,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		on_close: Pin<Box<H>>,
 	) -> Result<(), Error> {
 		let write_buffer_clone = write_buffers[fd as usize].clone();
-
+		let guarded_data = guarded_data.clone();
 		thread_pool
 			.execute(async move {
 				let write_buffer = write_buffer_clone.lock();
 				match write_buffer {
 					Ok(mut linked_list) => {
-						let res = Self::write_until_block(fd, &mut linked_list);
+						let res =
+							Self::write_until_block(fd, &mut linked_list, &guarded_data, on_close);
 
 						match res {
 							Ok(_) => {}
