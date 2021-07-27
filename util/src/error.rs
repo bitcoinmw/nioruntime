@@ -52,6 +52,9 @@ pub enum ErrorKind {
 	/// Poison error multiple locks
 	#[fail(display = "Poison Error: {}", _0)]
 	PoisonError(String),
+	/// Connection close
+	#[fail(display = "Connection Close Error: {}", _0)]
+	ConnectionCloseError(String),
 }
 
 impl Display for Error {

@@ -42,11 +42,8 @@ fn main() {
 fn client_thread(
 	count: usize,
 	id: usize,
-	//log: &LOG,
 	tlat_sum: Arc<Mutex<f64>>,
 	tlat_max: Arc<Mutex<u128>>,
-	complete_waiter: Arc<Mutex<u64>>,
-	thread_count: u64,
 ) -> Result<(), Error> {
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
@@ -55,14 +52,8 @@ fn client_thread(
 	let start_itt = std::time::SystemTime::now();
 	for i in 0..count {
 		if i != 0 && i % 10000 == 0 {
-			/*
-			let mut log = log.lock().map_err(|e| {
-				let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
-				error
-			})?; */
 			let elapsed = start_itt.elapsed().unwrap().as_millis();
 			let qps = (i as f64 / elapsed as f64) * 1000 as f64;
-			//log.log(&format!("Request {} on thread {}, qps={}", i, id, qps))?;
 			log!("Request {} on thread {}, qps={}", i, id, qps);
 		}
 		let start_query = std::time::SystemTime::now();
@@ -93,31 +84,8 @@ fn client_thread(
 			}
 		}
 	}
-	{
-		let mut complete_waiter = complete_waiter.lock().unwrap();
-		(*complete_waiter) += 1;
-	}
 
-	loop {
-		let complete_waiter = complete_waiter.lock().unwrap();
-		if (*complete_waiter) == thread_count {
-			let fd = stream.as_raw_fd();
-			close(fd)?;
-			break;
-		}
-	}
-	std::thread::sleep(std::time::Duration::from_millis(10));
-	{
-		let mut complete_waiter = complete_waiter.lock().unwrap();
-		(*complete_waiter) -= 1;
-	}
-
-	loop {
-		let complete_waiter = complete_waiter.lock().unwrap();
-		if (*complete_waiter) == 0 {
-			break;
-		}
-	}
+	close(stream.as_raw_fd())?;
 
 	{
 		let mut tlat_sum = tlat_sum.lock().unwrap();
@@ -135,27 +103,7 @@ fn client_thread(
 
 fn real_main() -> Result<(), Error> {
 	log_config!(nioruntime_util::LogConfig::default())?;
-	{
-		//log_config!(nioruntime_util::LogConfig::default())?;
-		//log!("ok {} {} x={:?}", 1, "second str", "hi");
-	}
-	/*
-		let log = &LOG;
-		{
-			let mut log = log.lock().map_err(|e| {
-				let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
-				error
-			})?;
-			log.config(
-				None,
-				10 * 1024 * 1024, // 10mb
-				60 * 60 * 1000,   // 1hr
-				true,
-				"",
-				true,
-			)?;
-		}
-	*/
+
 	let yml = load_yaml!("nio.yml");
 	let args = App::from_yaml(yml)
 		.version(built_info::PKG_VERSION)
@@ -181,23 +129,10 @@ fn real_main() -> Result<(), Error> {
 	};
 
 	if client {
-		log!("running client");
-		log!("threads={}", threads);
-		log!("iterations={}", itt);
-		log!("count={}", count);
-		/*
-				{
-					let mut log = log.lock().map_err(|e| {
-						let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
-						error
-					})?;
-
-					log.log(&format!("running client"))?;
-					log.log(&format!("threads={}", threads))?;
-					log.log(&format!("iterations={}", itt))?;
-					log.log(&format!("count={}", count))?;
-				}
-		*/
+		log!("Running client");
+		log!("Threads={}", threads);
+		log!("Iterations={}", itt);
+		log!("Requests per thread per iteration={}", count);
 
 		let time = std::time::SystemTime::now();
 		let tlat_sum = Arc::new(Mutex::new(0.0));
@@ -205,22 +140,12 @@ fn real_main() -> Result<(), Error> {
 
 		for x in 0..itt {
 			let mut jhs = vec![];
-			let complete_waiter = Arc::new(Mutex::new(0));
 			for i in 0..threads {
 				let id = i.clone();
 				let tlat_sum = tlat_sum.clone();
 				let tlat_max = tlat_max.clone();
-				let complete_waiter = complete_waiter.clone();
 				jhs.push(std::thread::spawn(move || {
-					let res = client_thread(
-						count,
-						id,
-						/*log,*/
-						tlat_sum.clone(),
-						tlat_max.clone(),
-						complete_waiter,
-						threads as u64,
-					);
+					let res = client_thread(count, id, tlat_sum.clone(), tlat_max.clone());
 					match res {
 						Ok(_) => {}
 						Err(e) => println!("Error in client thread: {}", e.to_string()),
@@ -231,87 +156,27 @@ fn real_main() -> Result<(), Error> {
 			for jh in jhs {
 				jh.join().expect("panic in thread");
 			}
-			/*
-						{
-							let mut log = log.lock().map_err(|e| {
-												let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
-												error
-										})?;
-							log.log(&format!("Iteration {} complete. ", x+1))?;
-						}
-			*/
 			log!("Iteration {} complete. ", x + 1);
 			std::thread::sleep(std::time::Duration::from_millis(100));
 		}
-		{
-			/*
-						let mut log = log.lock().map_err(|e| {
-							let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
-							error
-						})?;
-			*/
-			let elapsed_millis = time.elapsed().unwrap().as_millis();
-			let lat_max = tlat_max.lock().unwrap();
-			//			log.log(&format!("Complete at={} ms", elapsed_millis))?;
-			log!("Complete at={} ms", elapsed_millis);
-			let total_qps = 1000 as f64
-				* (count as f64 * threads as f64 * itt as f64
-					/ (elapsed_millis - (itt as u128) * 200) as f64);
-			//log.log(&format!("Total QPS={}", total_qps))?;
-			log!("Total QPS={}", total_qps);
-			let tlat = tlat_sum.lock().unwrap();
-			log!(
-				"Average latency={}ms",
-				(*tlat) / (1_000_000 * count * threads * itt) as f64
-			);
-			log!("Max latency={}ms", (*lat_max) as f64 / (1_000_000 as f64));
-			/*
-						log.log(&format!(
-							"Average latency={}ms",
-							(*tlat) / (1_000_000 * count * threads * itt) as f64
-						))?;
-						log.log(&format!(
-							"Max latency={}ms",
-							(*lat_max) as f64 / (1_000_000 as f64),
-						))?;
-			*/
-		}
+
+		let elapsed_millis = time.elapsed().unwrap().as_millis();
+		let lat_max = tlat_max.lock().unwrap();
+		log!("Test complete in {} ms", elapsed_millis);
+		let tlat = tlat_sum.lock().unwrap();
+		let avg_lat = (*tlat) / (1_000_000 * count * threads * itt) as f64;
+		let qps_simple = (1000.0 / avg_lat) * threads as f64;
+		log!("QPS={}", qps_simple);
+		log!("Average latency={}ms", avg_lat,);
+		log!("Max latency={}ms", (*lat_max) as f64 / (1_000_000 as f64));
 	} else {
-		{
-			/*
-						let mut log = log.lock().map_err(|e| {
-							let error: Error = ErrorKind::PoisonError(format!("{}", e)).into();
-							error
-						})?;
-						log.log("Starting listener")?;
-			*/
-			log!("Starting listener{}", "");
-		}
+		log!("Starting listener{}", "");
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
 		let mut eh = EventHandler::new();
 		eh.set_on_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
 		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
 		eh.set_on_accept(move |_connection_id| {
 			log!("=====================accept {}", _connection_id);
-			/*
-									let log = log.lock();
-									let res = match log {
-											Ok(mut log) => log.log(&format!("=====================accept {}", _connection_id)),
-											Err(e) => Err(ErrorKind::PoisonError(format!(
-													"Logging gerneated poison error: {}",
-													e.to_string()
-											))
-											.into()),
-									};
-									match res {
-											Ok(_) => {}
-											Err(e) => println!(
-													"Logging generated error: {}\nAttempted Log message: {}",
-													e.to_string(),
-													format!("=====================accept {}", _connection_id),
-											),
-									}
-			*/
 			Ok(())
 		})?;
 		eh.set_on_close(move |connection_id| {

@@ -70,8 +70,6 @@ impl RawFdAction {
 enum HandlerEventType {
 	Accept,
 	Close,
-	ResumeRead,
-	ResumeWrite,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -555,28 +553,10 @@ where
 	}
 
 	#[cfg(target_os = "macos")]
-	fn contained_event_for(
-		fd: uintptr_t,
-		event_type: EventFilter,
-		ret_kevs: &Vec<kevent>,
-		ret_count: i32,
-	) -> bool {
-		for i in 0..ret_count {
-			let kev = ret_kevs[i as usize];
-			if kev.ident == fd && kev.filter == event_type {
-				return true;
-			}
-		}
-		false
-	}
-
-	#[cfg(target_os = "macos")]
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
 		write_pending: Vec<RawFd>,
 		kevs: &mut Vec<kevent>,
-		ret_kevs: &Vec<kevent>,
-		ret_count: i32,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
@@ -588,7 +568,7 @@ where
 					kevs.push(kevent::new(
 						fd,
 						EventFilter::EVFILT_READ,
-						EventFlag::EV_ADD,
+						EventFlag::EV_ADD | EventFlag::EV_CLEAR,
 						FilterFlag::empty(),
 					));
 					// make sure there's enough space
@@ -643,87 +623,6 @@ where
 						(*linked_list).clear();
 					}
 				}
-				HandlerEventType::ResumeRead => {
-					let fd = handler_event.fd as uintptr_t;
-					if !Self::contained_event_for(fd, EVFILT_READ, ret_kevs, ret_count) {
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_READ,
-							EventFlag::EV_ADD,
-							FilterFlag::empty(),
-						));
-						let len = read_fd_type.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								read_fd_type.push(FdType::Unknown);
-							}
-						}
-						read_fd_type[fd] = FdType::Stream;
-					}
-				}
-				HandlerEventType::ResumeWrite => {
-					let fd = handler_event.fd as uintptr_t;
-					if !Self::contained_event_for(fd, EVFILT_WRITE, ret_kevs, ret_count) {
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_WRITE,
-							EventFlag::EV_ADD,
-							FilterFlag::empty(),
-						));
-					}
-				}
-			}
-		}
-
-		// remove events that have already been processed (will be added back in with handler events)
-		// this ensures only a single event is being processed at a time
-		let mut i = 0;
-		for kev in ret_kevs {
-			if i >= ret_count {
-				break;
-			}
-			i += 1;
-
-			// check that we didn't already receive the handler event for this kev
-			// TODO: could be perf issue O(n X m)
-			let mut found_collision = false;
-			for handler_event in &handler_events {
-				if handler_event.fd == kev.ident.try_into().unwrap()
-					&& ((handler_event.etype == HandlerEventType::ResumeWrite
-						&& kev.filter == EVFILT_WRITE)
-						|| (handler_event.etype == HandlerEventType::ResumeRead
-							&& kev.filter == EVFILT_READ))
-				{
-					found_collision = true;
-					break;
-				}
-			}
-
-			// since there's a collision, we don't need to delete the event
-			if found_collision {
-				continue;
-			}
-
-			if read_fd_type[kev.ident] == FdType::Stream
-				|| read_fd_type[kev.ident] == FdType::PausedStream
-			{
-				match kev.filter {
-					EVFILT_READ => kevs.push(kevent::new(
-						kev.ident,
-						EventFilter::EVFILT_READ,
-						EventFlag::EV_DELETE,
-						FilterFlag::empty(),
-					)),
-					EVFILT_WRITE => kevs.push(kevent::new(
-						kev.ident,
-						EventFilter::EVFILT_WRITE,
-						EventFlag::EV_DELETE,
-						FilterFlag::empty(),
-					)),
-					_ => {
-						log!("Unexpected event type: {:?}", kev);
-					}
-				}
 			}
 		}
 
@@ -733,7 +632,7 @@ where
 			kevs.push(kevent::new(
 				pending,
 				EventFilter::EVFILT_WRITE,
-				EventFlag::EV_ADD,
+				EventFlag::EV_ADD | EventFlag::EV_CLEAR,
 				FilterFlag::empty(),
 			));
 		}
@@ -815,7 +714,7 @@ where
 			)
 		};
 
-		let mut ret_count = 0;
+		let mut ret_count;
 		loop {
 			let to_process;
 			let handler_events;
@@ -871,7 +770,7 @@ where
 						kevs.push(kevent::new(
 							fd,
 							EventFilter::EVFILT_READ,
-							EventFlag::EV_ADD,
+							EventFlag::EV_ADD | EventFlag::EV_CLEAR,
 							FilterFlag::empty(),
 						));
 
@@ -945,8 +844,6 @@ where
 				handler_events,
 				write_pending,
 				&mut kevs,
-				&ret_kevs,
-				ret_count,
 				&mut read_fd_type,
 				&mut use_on_client_read,
 				write_buffers,
@@ -1018,12 +915,8 @@ where
 			for i in 0..ret_count {
 				let kev = ret_kevs[i as usize];
 				if kev.filter == EVFILT_WRITE && !kev.flags.contains(EventFlag::EV_DELETE) {
-					let res = Self::process_event_write(
-						kev.ident as RawFd,
-						&thread_pool,
-						write_buffers,
-						guarded_data,
-					);
+					let res =
+						Self::process_event_write(kev.ident as RawFd, &thread_pool, write_buffers);
 					match res {
 						Ok(_) => {}
 						Err(e) => {
@@ -1096,115 +989,150 @@ where
 		Ok(())
 	}
 
+	fn write_loop(
+		fd: RawFd,
+		write_buffer: &mut WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>,
+	) -> Result<u16, Error> {
+		let initial_len = write_buffer.len;
+		loop {
+			let res = write(
+				fd,
+				&write_buffer.buffer[(write_buffer.offset as usize)..(write_buffer.len as usize)],
+			);
+
+			match res {
+				Ok(len) => {
+					if len == (write_buffer.len as usize - write_buffer.offset as usize) {
+						// we're done
+						write_buffer.offset += len as u16;
+						write_buffer.len -= len as u16;
+						return Ok(initial_len);
+					} else {
+						// update values and write again
+						write_buffer.offset += len as u16;
+						write_buffer.len -= len as u16;
+					}
+				}
+				Err(e) => {
+					match e {
+						Errno::EAGAIN => {
+							// break because we're edge triggered.
+							// a new event occurs.
+							return Ok(initial_len - write_buffer.len);
+						}
+						_ => {
+							// this is an actual write error.
+							// close the connection.
+							return Err(ErrorKind::ConnectionCloseError(format!(
+								"connection closed: {}",
+								e
+							))
+							.into());
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fn write_until_block(
+		fd: RawFd,
+		linked_list: &mut LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>,
+	) -> Result<(), Error> {
+		loop {
+			match (*linked_list).front_mut() {
+				Some(front) => {
+					let total_len = front.len;
+					let ret = Self::write_loop(fd, front);
+					match ret {
+						Ok(len) => {
+							if len == total_len {
+								// check if there's a write success
+								// handler and call it if so
+								match &front.on_write_success {
+									Some(h) => {
+										let hres = (h)(fd.try_into().unwrap_or(0), front.msg_id);
+										match hres {
+											Ok(_) => {}
+											Err(e) => log!(
+												"on_write_success callback resulted in: {}",
+												e.to_string()
+											),
+										}
+									}
+									None => {}
+								}
+
+								(*linked_list).pop_front();
+							} else {
+								// we didn't complete, we need to break
+								// we had to block so a new
+								// edge triggered event will occur
+								break;
+							}
+						}
+						Err(e) => {
+							// an error occurred. We just report and let
+							// the reader handle this.
+
+							match &front.on_write_fail {
+								Some(h) => {
+									let hres = (h)(fd.try_into().unwrap_or(0), front.msg_id);
+									match hres {
+										Ok(_) => {}
+										Err(e) => log!(
+											"on_write_fail callback resulted in: {}",
+											e.to_string()
+										),
+									}
+								}
+								None => {}
+							}
+
+							log!("Error occurred on write: {}", e);
+						}
+					}
+					/*
+										loop {
+											let res = write(
+												fd,
+												&front.buffer
+												[(front.offset as usize)..(front.len as usize)],
+											);
+
+											match res {
+
+											}
+										}
+					*/
+				}
+				None => {
+					break;
+				}
+			}
+		}
+
+		Ok(())
+	}
+
 	fn process_event_write(
 		fd: RawFd,
 		thread_pool: &ThreadPool,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 	) -> Result<(), Error> {
 		let write_buffer_clone = write_buffers[fd as usize].clone();
-		let guarded_data_clone = guarded_data.clone();
 
 		thread_pool
 			.execute(async move {
 				let write_buffer = write_buffer_clone.lock();
 				match write_buffer {
 					Ok(mut linked_list) => {
-						let front_mut = (*linked_list).front_mut();
-						match front_mut {
-							Some(front_mut) => {
-								let res = write(
-									fd,
-									&front_mut.buffer
-										[(front_mut.offset as usize)..(front_mut.len as usize)],
-								);
-								match res {
-									Ok(len) => {
-										if len == (front_mut.len - front_mut.offset) as usize {
-											match (*linked_list).pop_front() {
-												Some(write_buffer) => {
-													// check if there's a write success
-													// handler and call it if so
-													match write_buffer.on_write_success {
-														Some(h) => {
-															let hres = (h)(
-																fd.try_into().unwrap_or(0),
-																write_buffer.msg_id,
-															);
-															match hres {
-																Ok(_) => {},
-																Err(e) => log!("on_write_success callback resulted in: {}", e.to_string()),
-															}
-														}
-														None => {}
-													}
-												}
-												None => {
-													log!("unexpected error couldn't pop");
-												}
-											}
-											if !(*linked_list).is_empty() {
-												let res = Self::push_handler_event(
-													fd,
-													HandlerEventType::ResumeWrite,
-													&guarded_data_clone,
-													true,
-												);
-												match res {
-													Ok(_) => {}
-													Err(e) => {
-														log!(
-															"handler push err: {}",
-															e.to_string()
-														)
-													}
-												}
-											}
-										} else {
-											front_mut.offset += len as u16;
-											let res = Self::push_handler_event(
-												fd,
-												HandlerEventType::ResumeWrite,
-												&guarded_data_clone,
-												true,
-											);
-											match res {
-												Ok(_) => {}
-												Err(e) => {
-													log!("handler push err: {}", e.to_string())
-												}
-											}
-										}
-									}
-									Err(e) => {
-										log!("write error: {}", e.to_string());
-										loop {
-											if (*linked_list).is_empty() {
-												break;
-											}
-											match (*linked_list).pop_front() {
-												Some(item) => match item.on_write_fail {
-													Some(h) => {
-														let hres = (h)(
-															fd.try_into().unwrap_or(0),
-															item.msg_id,
-														);
-														match hres {
-                                                                                                                	Ok(_) => {},
-                                                                                                                	Err(e) => log!("on_write_fail callback resulted in: {}", e.to_string()),
-                                                                                                                }
-													}
-													None => {}
-												},
-												None => {}
-											}
-										}
-										(*linked_list).clear();
-									}
-								}
-							}
-							None => {
-								log!("unepxected none");
+						let res = Self::write_until_block(fd, &mut linked_list);
+
+						match res {
+							Ok(_) => {}
+							Err(e) => {
+								log!("unexpected error in process_event_write: {}", e.to_string());
 							}
 						}
 					}
@@ -1269,26 +1197,37 @@ where
 				thread_pool
 					.execute(async move {
 						let mut buf = [0u8; BUFFER_SIZE];
-						// in order to ensure sequence in tact, obtain the lock
-						let res = read(fd, &mut buf);
-						let _ = match res {
-							Ok(res) => Self::process_read_result(
-								fd,
-								res,
-								buf,
-								&guarded_data,
-								on_read,
-								on_close,
-								on_write_success,
-								on_write_fail,
-								on_client_read,
-								use_on_client_read,
-								fd_type,
-							),
-							Err(e) => {
-								Self::process_read_err(fd, e, &guarded_data, on_close, fd_type)
-							}
-						};
+
+						loop {
+							let res = read(fd, &mut buf);
+							match res {
+								Ok(res) => {
+									let _ = Self::process_read_result(
+										fd,
+										res,
+										buf,
+										&guarded_data,
+										on_read.clone(),
+										on_close.clone(),
+										on_write_success.clone(),
+										on_write_fail.clone(),
+										on_client_read.clone(),
+										use_on_client_read,
+										fd_type.clone(),
+									);
+								}
+								Err(e) => {
+									let _ = Self::process_read_err(
+										fd,
+										e,
+										&guarded_data,
+										on_close,
+										fd_type,
+									);
+									break;
+								}
+							};
+						}
 					})
 					.map_err(|e| {
 						let error: Error =
@@ -1358,12 +1297,6 @@ where
 							on_write_success,
 							on_write_fail,
 						)?;
-						Self::push_handler_event(
-							fd,
-							HandlerEventType::ResumeRead,
-							guarded_data,
-							true,
-						)?;
 					}
 				}
 				Err(e) => {
@@ -1396,7 +1329,9 @@ where
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
 			Errno::EAGAIN => {
-				Self::push_handler_event(fd, HandlerEventType::ResumeRead, guarded_data, false)?;
+				// we do nothing here.
+				// the edge triggered event will occur again and
+				// we'll read from the main loop
 			}
 			_ => {
 				let is_dup =
