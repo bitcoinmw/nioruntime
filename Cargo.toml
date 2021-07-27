@@ -12,12 +12,12 @@ build = "src/build/build.rs"
 edition = "2018"
 
 [workspace]
-members = ["libnio", "kqueues", "util"]
+members = ["libnio", "eventhandler", "util"]
 
 [dependencies]
 
 nioruntime_util = { path = "./util" }
-nioruntime_kqueues = { path = "./kqueues" }
+nioruntime_evh = { path = "./eventhandler" }
 nioruntime_libnio = { path = "./libnio" }
 nix = "0.22.0"
 

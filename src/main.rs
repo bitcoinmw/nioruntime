@@ -14,7 +14,7 @@
 
 use clap::load_yaml;
 use clap::App;
-use nioruntime_kqueues::kqueues::KqueueEventHandler;
+use nioruntime_evh::eventhandler::EventHandler;
 use nioruntime_util::*;
 use nix::unistd::close;
 use std::io::Read;
@@ -283,10 +283,10 @@ fn real_main() -> Result<(), Error> {
 			log!("Starting listener{}", "");
 		}
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
-		let mut kqe = KqueueEventHandler::new();
-		kqe.set_on_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
-		kqe.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
-		kqe.set_on_accept(move |_connection_id| {
+		let mut eh = EventHandler::new();
+		eh.set_on_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
+		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
+		eh.set_on_accept(move |_connection_id| {
 			log!("=====================accept {}", _connection_id);
 			/*
 									let log = log.lock();
@@ -309,58 +309,17 @@ fn real_main() -> Result<(), Error> {
 			*/
 			Ok(())
 		})?;
-		kqe.set_on_close(move |connection_id| {
+		eh.set_on_close(move |connection_id| {
 			log!("=====================close {}", connection_id);
-			/*
-						let log = log.lock();
-						let res = match log {
-							Ok(mut log) => log.log(&format!("=====================close {}", connection_id)),
-							Err(e) => Err(ErrorKind::PoisonError(format!(
-								"Logging gerneated poison error: {}",
-								e.to_string()
-							))
-							.into()),
-						};
-						match res {
-							Ok(_) => {}
-							Err(e) => println!(
-								"Logging generated error: {}\nAttempted Log message: {}",
-								e.to_string(),
-								format!("=====================close {}", connection_id),
-							),
-						}
-			*/
 			Ok(())
 		})?;
-		kqe.set_on_write_success(move |_connection_id, _message_id| Ok(()))?;
-		kqe.set_on_write_fail(move |connection_id, message_id| {
+		eh.set_on_write_success(move |_connection_id, _message_id| Ok(()))?;
+		eh.set_on_write_fail(move |connection_id, message_id| {
 			log!("message fail for cid={},mid={}", connection_id, message_id);
-			/*
-						let log = log.lock();
-						let res = match log {
-							Ok(mut log) => log.log(&format!(
-								"message fail for cid={},mid={}",
-								connection_id, message_id
-							)),
-							Err(e) => Err(ErrorKind::PoisonError(format!(
-								"Logging gerneated poison error: {}",
-								e.to_string()
-							))
-							.into()),
-						};
-						match res {
-							Ok(_) => {}
-							Err(e) => println!(
-								"Logging generated error: {}\nAttempted Log message: {}",
-								e.to_string(),
-								&format!("message fail for cid={},mid={}", connection_id, message_id)
-							),
-						}
-			*/
 			Ok(())
 		})?;
-		kqe.start()?;
-		kqe.add_tcp_listener(&listener)?;
+		eh.start()?;
+		eh.add_tcp_listener(&listener)?;
 		std::thread::park();
 	}
 	Ok(())
