@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// macos deps
+
+#[cfg(target_os = "macos")]
+use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
+#[cfg(target_os = "macos")]
+use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
+
 use crate::duration_to_timespec;
 use crate::util::threadpool::ThreadPool;
 use crate::util::{Error, ErrorKind};
-use kqueue_sys::EventFilter;
-use kqueue_sys::EventFilter::EVFILT_READ;
-use kqueue_sys::EventFilter::EVFILT_WRITE;
-use kqueue_sys::EventFlag;
-use kqueue_sys::FilterFlag;
-use kqueue_sys::{kevent, kqueue};
 use libc::uintptr_t;
 use nioruntime_libnio::ActionType;
 use nioruntime_util::log;
@@ -505,6 +506,12 @@ where
 		KqueueEventHandler { data: guarded_data }
 	}
 
+	#[cfg(target_os = "linux")]
+	pub fn start(&self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	#[cfg(target_os = "macos")]
 	pub fn start(&self) -> Result<(), Error> {
 		// create the kqueue
 		let queue = unsafe { kqueue() };
@@ -534,6 +541,7 @@ where
 		Ok(())
 	}
 
+	#[cfg(target_os = "macos")]
 	fn contained_event_for(
 		fd: uintptr_t,
 		event_type: EventFilter,
@@ -549,6 +557,7 @@ where
 		false
 	}
 
+	#[cfg(target_os = "macos")]
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
 		write_pending: Vec<RawFd>,
@@ -718,6 +727,7 @@ where
 		Ok(())
 	}
 
+	#[cfg(target_os = "macos")]
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
