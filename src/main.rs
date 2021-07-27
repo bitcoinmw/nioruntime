@@ -133,6 +133,9 @@ fn real_main() -> Result<(), Error> {
 		log!("Threads={}", threads);
 		log!("Iterations={}", itt);
 		log!("Requests per thread per iteration={}", count);
+		log_no_ts!(
+			"--------------------------------------------------------------------------------"
+		);
 
 		let time = std::time::SystemTime::now();
 		let tlat_sum = Arc::new(Mutex::new(0.0));
@@ -162,6 +165,9 @@ fn real_main() -> Result<(), Error> {
 
 		let elapsed_millis = time.elapsed().unwrap().as_millis();
 		let lat_max = tlat_max.lock().unwrap();
+		log_no_ts!(
+			"--------------------------------------------------------------------------------"
+		);
 		log!("Test complete in {} ms", elapsed_millis);
 		let tlat = tlat_sum.lock().unwrap();
 		let avg_lat = (*tlat) / (1_000_000 * count * threads * itt) as f64;
@@ -170,8 +176,8 @@ fn real_main() -> Result<(), Error> {
 		log!("Average latency={}ms", avg_lat,);
 		log!("Max latency={}ms", (*lat_max) as f64 / (1_000_000 as f64));
 	} else {
-		log!("Starting listener{}", "");
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
+		log!("Listener Started");
 		let mut eh = EventHandler::new();
 		eh.set_on_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
 		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;

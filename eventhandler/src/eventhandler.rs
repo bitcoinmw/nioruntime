@@ -27,7 +27,7 @@ use crate::util::threadpool::ThreadPool;
 use crate::util::{Error, ErrorKind};
 use libc::uintptr_t;
 use nioruntime_libnio::ActionType;
-use nioruntime_util::log;
+use nioruntime_util::*;
 use nix::errno::Errno;
 use nix::fcntl::fcntl;
 use nix::fcntl::OFlag;
