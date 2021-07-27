@@ -17,6 +17,7 @@ use clap::App;
 use nioruntime_evh::eventhandler::EventHandler;
 use nioruntime_util::*;
 use nix::unistd::close;
+use rand::Rng;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -50,7 +51,7 @@ fn client_thread(
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
 	let mut stream = TcpStream::connect("127.0.0.1:9999")?;
-	let buf = &mut [0; 128];
+	let buf = &mut [0u8; 128];
 	let start_itt = std::time::SystemTime::now();
 	for i in 0..count {
 		if i != 0 && i % 10000 == 0 {
@@ -65,7 +66,13 @@ fn client_thread(
 			log!("Request {} on thread {}, qps={}", i, id, qps);
 		}
 		let start_query = std::time::SystemTime::now();
-		let res = stream.write(&[1, 2, 3, 4, 5]);
+		let num: u8 = rand::thread_rng().gen_range(0..100);
+		buf[0] = num;
+		for i in 0..num {
+			buf[i as usize + 1] = i;
+		}
+
+		let res = stream.write(&buf[0..(num as usize + 1)]);
 		let len = stream.read(buf)?;
 		let elapsed = start_query.elapsed().unwrap().as_nanos();
 		lat_sum += elapsed as f64;
@@ -73,12 +80,10 @@ fn client_thread(
 			lat_max = elapsed;
 		}
 
-		assert_eq!(len, 5);
-		assert_eq!(buf[0], 1);
-		assert_eq!(buf[1], 2);
-		assert_eq!(buf[2], 3);
-		assert_eq!(buf[3], 4);
-		assert_eq!(buf[4], 5);
+		assert_eq!(len, num as usize + 1);
+		for i in 0..num {
+			assert_eq!(buf[i as usize + 1], i);
+		}
 
 		match res {
 			Ok(_) => {}
