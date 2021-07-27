@@ -13,11 +13,14 @@
 // limitations under the License.
 
 // macos deps
-
 #[cfg(target_os = "macos")]
 use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
 #[cfg(target_os = "macos")]
 use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
+
+// linux deps
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{epoll_create1, epoll_ctl};
 
 use crate::duration_to_timespec;
 use crate::util::threadpool::ThreadPool;
@@ -131,7 +134,7 @@ struct GuardedData<F, G, H, I, J, K> {
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
 	write_buffers: Vec<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>,
-	queue: Option<RawFd>,
+	selector: Option<RawFd>,
 	callbacks: Callbacks<F, G, H, I, J, K>,
 }
 
@@ -203,8 +206,10 @@ where
 			error
 		})?;
 
-		if data.queue.is_none() {
-			return Err(ErrorKind::SetupError("queue must be started first".to_string()).into());
+		if data.selector.is_none() {
+			return Err(
+				ErrorKind::SetupError("EventHandler must be started first".to_string()).into(),
+			);
 		}
 
 		let fd_actions = &mut data.fd_actions;
@@ -498,7 +503,7 @@ where
 			handler_events: vec![],
 			write_pending: vec![],
 			write_buffers: vec![LinkedList::new()],
-			queue: None,
+			selector: None,
 			callbacks,
 		};
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
@@ -508,26 +513,34 @@ where
 
 	#[cfg(target_os = "linux")]
 	pub fn start(&self) -> Result<(), Error> {
+		// create poll fd
+		let selector = epoll_create1(EpollCreateFlags::empty())?;
+		self.start_generic(selector)?;
 		Ok(())
 	}
 
 	#[cfg(target_os = "macos")]
 	pub fn start(&self) -> Result<(), Error> {
 		// create the kqueue
-		let queue = unsafe { kqueue() };
+		let selector = unsafe { kqueue() };
+		self.start_generic(selector)?;
+		Ok(())
+	}
+
+	pub fn start_generic(&self, selector: RawFd) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 				error
 			})?;
-			guarded_data.queue = Some(queue);
+			guarded_data.selector = Some(selector);
 		}
 
 		let mut write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
 		let cloned_guarded_data = self.data.clone();
 
 		spawn(move || {
-			let res = Self::poll_loop(&cloned_guarded_data, &mut write_buffers, queue);
+			let res = Self::poll_loop(&cloned_guarded_data, &mut write_buffers, selector);
 			match res {
 				Ok(_) => {
 					log!("poll_loop exited normally");
@@ -724,6 +737,15 @@ where
 				FilterFlag::empty(),
 			));
 		}
+		Ok(())
+	}
+
+	#[cfg(target_os = "linux")]
+	fn poll_loop(
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		pollfd: RawFd,
+	) -> Result<(), Error> {
 		Ok(())
 	}
 
