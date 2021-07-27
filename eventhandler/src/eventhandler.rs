@@ -20,7 +20,7 @@ use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 
 // linux deps
 #[cfg(target_os = "linux")]
-use nix::sys::epoll::{epoll_create1, epoll_ctl};
+use nix::sys::epoll::{epoll_create1, epoll_ctl, EpollCreateFlags};
 
 use crate::duration_to_timespec;
 use crate::util::threadpool::ThreadPool;
