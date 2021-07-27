@@ -160,7 +160,6 @@ fn real_main() -> Result<(), Error> {
 				jh.join().expect("panic in thread");
 			}
 			log!("Iteration {} complete. ", x + 1);
-			std::thread::sleep(std::time::Duration::from_millis(100));
 		}
 
 		let elapsed_millis = time.elapsed().unwrap().as_millis();
