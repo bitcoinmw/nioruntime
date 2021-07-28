@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::thread;
 
 lazy_static! {
-	pub static ref STATIC_THREAD_POOL: Arc<Mutex<HashMap<u128, ThreadPool>>> =
+	pub static ref STATIC_THREAD_POOL: Arc<Mutex<HashMap<u128, ThreadPoolImpl>>> =
 		Arc::new(Mutex::new(HashMap::new()));
 }
 
@@ -35,7 +35,7 @@ pub struct StaticThreadPool {
 
 impl StaticThreadPool {
 	pub fn new() -> Result<Self, Error> {
-		let tp = ThreadPool::new();
+		let tp = ThreadPoolImpl::new();
 		let id: u128 = rand::random::<u128>();
 		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
@@ -107,18 +107,18 @@ pub struct FuturesHolder {
 	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
 
-pub struct ThreadPool {
+pub struct ThreadPoolImpl {
 	tx: Arc<Mutex<mpsc::Sender<FuturesHolder>>>,
 	rx: Arc<Mutex<mpsc::Receiver<FuturesHolder>>>,
 }
 
-impl ThreadPool {
+impl ThreadPoolImpl {
 	pub fn new() -> Self {
 		let (tx, rx): (mpsc::Sender<FuturesHolder>, mpsc::Receiver<FuturesHolder>) =
 			mpsc::channel();
 		let rx = Arc::new(Mutex::new(rx));
 		let tx = Arc::new(Mutex::new(tx));
-		ThreadPool { tx, rx }
+		ThreadPoolImpl { tx, rx }
 	}
 
 	pub fn start(&self, size: usize) -> Result<(), Error> {
