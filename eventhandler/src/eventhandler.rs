@@ -26,7 +26,7 @@ use crate::duration_to_timespec;
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use futures::channel::oneshot;
-use futures::FutureExt;
+use futures::executor::block_on;
 use libc::uintptr_t;
 use log::*;
 use nioruntime_libnio::ActionType;
@@ -1211,8 +1211,8 @@ where
 							let _ = p.send(());
 						})?;
 
-						let _ = c.map(|_| {
-							log!("got notification");
+						block_on(async {
+							c.await.ok();
 						});
 
 						Ok(())
