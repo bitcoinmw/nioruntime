@@ -87,7 +87,6 @@ fn client_thread(
 		for i in 0..num {
 			buf[i as usize + 4] = (i % 128) as u8;
 		}
-
 		let res = stream.write(&buf[0..(num as usize + 4)]);
 
 		match res {
@@ -105,6 +104,16 @@ fn client_thread(
 			if len_sum == num as usize + 4 {
 				break;
 			}
+		}
+
+		if num == 99990 {
+			// we expect a close here. Try one more read
+			let len = stream.read(&mut buf2[0..])?;
+			// len should be 0
+			assert_eq!(len, 0);
+			// not that only a single request is currently supported in this mode.
+			// TODO: support reconnect
+			log!("Successful disconnect");
 		}
 
 		let elapsed = start_query.elapsed().unwrap().as_nanos();
@@ -241,7 +250,6 @@ fn real_main() -> Result<(), Error> {
 		eh.set_on_read(move |connection_id, _message_id, buf, len| {
 			let mut buffers = buffers_clone2.lock().unwrap();
 			let held_buf = &mut buffers.get_mut(&connection_id);
-
 			match held_buf {
 				Some(held_buf) => {
 					copy(
@@ -251,7 +259,7 @@ fn real_main() -> Result<(), Error> {
 					held_buf.len += len;
 					if held_buf.len < 4 {
 						// not enough data
-						Ok((buf.to_vec(), 0, 0))
+						Ok((buf.to_vec(), 0, 0, false))
 					} else {
 						let exp_len =
 							Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
@@ -267,20 +275,22 @@ fn real_main() -> Result<(), Error> {
 								assert_eq!(held_buf.data[i as usize + 4], (i % 128) as u8);
 							}
 
-							Ok((held_buf.data.to_vec(), 0, ret_len))
+							// special case, we disconnect at this len for testing.
+							// client is aware and should do an assertion on disconnect.
+							Ok((held_buf.data.to_vec(), 0, ret_len, exp_len == 99990))
 						} else {
-							Ok((buf.to_vec(), 0, 0))
+							Ok((buf.to_vec(), 0, 0, false))
 						}
 					}
 				}
 				None => {
 					log!("unexpected none: {}, len = {}", connection_id, len);
-					Ok((buf.to_vec(), 0, len))
+					Ok((buf.to_vec(), 0, len, false))
 				}
 			}
 		})?;
 		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| {
-			Ok((buf.to_vec(), 0, len))
+			Ok((buf.to_vec(), 0, len, false))
 		})?;
 		eh.set_on_accept(move |connection_id| {
 			let mut buffers = buffers.lock().unwrap();

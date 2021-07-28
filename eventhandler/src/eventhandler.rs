@@ -101,6 +101,7 @@ struct WriteBuffer<I, J> {
 	msg_id: u128,
 	on_write_success: Option<I>,
 	on_write_fail: Option<J>,
+	close: bool,
 }
 
 struct Callbacks<F, G, H, I, J, K> {
@@ -143,7 +144,7 @@ pub struct EventHandler<F, G, H, I, J, K> {
 
 impl<F, G, H, I, J, K> EventHandler<F, G, H, I, J, K>
 where
-	F: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize), Error>
+	F: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize, bool), Error>
 		+ Send
 		+ 'static
 		+ Clone
@@ -153,7 +154,7 @@ where
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	I: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	J: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
-	K: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize), Error>
+	K: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize, bool), Error>
 		+ Send
 		+ 'static
 		+ Clone
@@ -345,6 +346,7 @@ where
 		msg_id: u128,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
+		close: bool,
 	) -> Result<(), Error> {
 		if len + offset > data.len() {
 			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
@@ -382,6 +384,10 @@ where
 					on_write_fail: match rem <= BUFFER_SIZE {
 						true => Some(on_write_fail.clone()),
 						false => None,
+					},
+					close: match rem <= BUFFER_SIZE {
+						true => close,
+						false => false,
 					},
 				};
 
@@ -976,11 +982,6 @@ where
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 	) -> Result<(), Error> {
-		let mut guarded_data = guarded_data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
 		for fd in fds {
 			let cur_len = write_buffers.len();
 			if cur_len <= fd as usize {
@@ -994,6 +995,11 @@ where
 				error
 			})?;
 			loop {
+				let mut guarded_data = guarded_data.lock().map_err(|e| {
+					let error: Error =
+						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+					error
+				})?;
 				match guarded_data.write_buffers[fd as usize].pop_front() {
 					Some(buffer) => linked_list.push_back(buffer),
 					None => break,
@@ -1080,6 +1086,27 @@ where
 									None => {}
 								}
 
+								if front.close {
+									let is_dup = Self::push_handler_event(
+										fd,
+										HandlerEventType::Close,
+										guarded_data,
+										false,
+									)?;
+									if !is_dup {
+										let _ = close(fd);
+										let res = (on_close)(fd.try_into().unwrap_or(0));
+										match res {
+											Ok(_) => {}
+											Err(e) => {
+												log!(
+													"on_close callback resulted in: {}",
+													e.to_string()
+												)
+											}
+										}
+									}
+								}
 								(*linked_list).pop_front();
 							} else {
 								// we didn't complete, we need to break
@@ -1328,7 +1355,7 @@ where
 			};
 
 			match result {
-				Ok((resp, offset, len)) => {
+				Ok((resp, offset, len, close)) => {
 					if len > 0 {
 						Self::write(
 							fd,
@@ -1339,6 +1366,7 @@ where
 							msg_id,
 							on_write_success,
 							on_write_fail,
+							close,
 						)?;
 					}
 				}
