@@ -236,21 +236,33 @@ fn real_main() -> Result<(), Error> {
 		let buffers_clone2 = buffers.clone();
 		eh.set_on_read(move |connection_id, _message_id, buf, len| {
 			let mut buffers = buffers_clone2.lock().unwrap();
-			let held_buf = &mut buffers.get_mut(&connection_id).unwrap();
-			copy(
-				&buf[0..len],
-				&mut held_buf.data[held_buf.len..held_buf.len + len],
-			);
-			held_buf.len += len;
-			if held_buf.len < 4 {
-				// not enough data
-				Ok((buf.to_vec(), 0, 0))
-			} else {
-				let exp_len = Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
-				if exp_len + 4 == held_buf.len as u32 {
-					Ok((held_buf.data.to_vec(), 0, held_buf.len))
-				} else {
-					Ok((buf.to_vec(), 0, 0))
+			let held_buf = &mut buffers.get_mut(&connection_id);
+
+			match held_buf {
+				Some(held_buf) => {
+					copy(
+						&buf[0..len],
+						&mut held_buf.data[held_buf.len..held_buf.len + len],
+					);
+					held_buf.len += len;
+					if held_buf.len < 4 {
+						// not enough data
+						Ok((buf.to_vec(), 0, 0))
+					} else {
+						let exp_len =
+							Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
+						if exp_len + 4 == held_buf.len as u32 {
+							let ret_len = held_buf.len;
+							held_buf.len = 0;
+							Ok((held_buf.data.to_vec(), 0, ret_len))
+						} else {
+							Ok((buf.to_vec(), 0, 0))
+						}
+					}
+				}
+				None => {
+					log!("unexpected none: {}, len = {}", connection_id, len);
+					Ok((buf.to_vec(), 0, len))
 				}
 			}
 		})?;
@@ -258,9 +270,9 @@ fn real_main() -> Result<(), Error> {
 			Ok((buf.to_vec(), 0, len))
 		})?;
 		eh.set_on_accept(move |connection_id| {
+			let mut buffers = buffers.lock().unwrap();
 			log!("accept {}", connection_id);
 
-			let mut buffers = buffers.lock().unwrap();
 			buffers.insert(connection_id, Buffer::new());
 
 			Ok(())

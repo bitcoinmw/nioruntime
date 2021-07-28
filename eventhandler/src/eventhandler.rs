@@ -25,6 +25,8 @@ use nix::sys::epoll::{epoll_create1, epoll_ctl, EpollCreateFlags};
 use crate::duration_to_timespec;
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
+use futures::channel::oneshot;
+use futures::FutureExt;
 use libc::uintptr_t;
 use log::*;
 use nioruntime_libnio::ActionType;
@@ -1190,6 +1192,8 @@ where
 							},
 						)?;
 						let guarded_data = guarded_data.clone();
+
+						let (p, c) = oneshot::channel::<()>();
 						thread_pool.execute(async move {
 							let accept_res = Self::process_accept_result(fd, res, &guarded_data);
 							match accept_res {
@@ -1203,7 +1207,14 @@ where
 								Ok(_) => {}
 								Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
 							}
+
+							let _ = p.send(());
 						})?;
+
+						let _ = c.map(|_| {
+							log!("got notification");
+						});
+
 						Ok(())
 					}
 					Err(e) => Self::process_accept_err(fd, e),
