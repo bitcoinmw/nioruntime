@@ -537,10 +537,16 @@ where
 		}
 
 		let mut write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
+		let mut read_locks = vec![Arc::new(Mutex::new(true))];
 		let cloned_guarded_data = self.data.clone();
 
 		spawn(move || {
-			let res = Self::poll_loop(&cloned_guarded_data, &mut write_buffers, selector);
+			let res = Self::poll_loop(
+				&cloned_guarded_data,
+				&mut write_buffers,
+				&mut read_locks,
+				selector,
+			);
 			match res {
 				Ok(_) => {
 					log!("poll_loop exited normally");
@@ -645,6 +651,7 @@ where
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		read_locks: &mut Vec<Arc<Mutex<bool>>>,
 		pollfd: RawFd,
 	) -> Result<(), Error> {
 		Ok(())
@@ -654,6 +661,7 @@ where
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		read_locks: &mut Vec<Arc<Mutex<bool>>>,
 		queue: RawFd,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
@@ -945,6 +953,7 @@ where
 						on_write_fail.clone(),
 						on_client_read.clone(),
 						use_on_client_read[kev.ident as usize],
+						read_locks,
 					);
 
 					match res {
@@ -1175,6 +1184,7 @@ where
 		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
+		read_locks: &mut Vec<Arc<Mutex<bool>>>,
 	) -> Result<(), Error> {
 		let fd_type = &read_fd_type[fd as usize];
 		match fd_type {
@@ -1225,11 +1235,21 @@ where
 				// so we process it
 				let guarded_data = guarded_data.clone();
 				let fd_type = fd_type.clone();
+				if read_locks.len() <= fd as usize {
+					Self::check_and_set(read_locks, fd as usize, Arc::new(Mutex::new(true)));
+				}
+				let read_lock = read_locks[fd as usize].clone();
 				thread_pool
 					.execute(async move {
 						let mut buf = [0u8; BUFFER_SIZE];
-
 						loop {
+							let lock = read_lock.lock();
+							match lock {
+								Ok(_) => {}
+								Err(e) => {
+									log!("Error obtaining read lock: {}", e.to_string());
+								}
+							}
 							let res = read(fd, &mut buf);
 							match res {
 								Ok(res) => {

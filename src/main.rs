@@ -258,6 +258,15 @@ fn real_main() -> Result<(), Error> {
 						if exp_len + 4 == held_buf.len as u32 {
 							let ret_len = held_buf.len;
 							held_buf.len = 0;
+
+							// do assertion for our test
+							for i in 0..ret_len - 4 {
+								if held_buf.data[i as usize + 4] != (i % 128) as u8 {
+									log!("invalid data at index = {}", i + 4);
+								}
+								assert_eq!(held_buf.data[i as usize + 4], (i % 128) as u8);
+							}
+
 							Ok((held_buf.data.to_vec(), 0, ret_len))
 						} else {
 							Ok((buf.to_vec(), 0, 0))
