@@ -91,7 +91,6 @@ enum FdType {
 	Wakeup,
 	Listener,
 	Stream,
-	PausedStream,
 	Unknown,
 }
 
@@ -1230,9 +1229,7 @@ where
 					Err(e) => Self::process_accept_err(fd, e),
 				}?;
 			}
-			FdType::Stream | FdType::PausedStream => {
-				// note that a PausedStream may still get a read event to close,
-				// so we process it
+			FdType::Stream => {
 				let guarded_data = guarded_data.clone();
 				let fd_type = fd_type.clone();
 				if read_locks.len() <= fd as usize {
@@ -1264,7 +1261,6 @@ where
 										on_write_fail.clone(),
 										on_client_read.clone(),
 										use_on_client_read,
-										fd_type.clone(),
 									);
 								}
 								Err(e) => {
@@ -1322,12 +1318,8 @@ where
 		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
-		fd_type: FdType,
 	) -> Result<(), Error> {
 		if len > 0 {
-			if fd_type == FdType::PausedStream {
-				log!("unexpected read on paused stream: {}", fd);
-			}
 			let msg_id: u128 = thread_rng().gen::<u128>();
 			let result = match use_on_client_read {
 				//let (resp, offset, len) = match use_on_client_read {
