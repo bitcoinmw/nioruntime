@@ -12,10 +12,11 @@ build = "src/build/build.rs"
 edition = "2018"
 
 [workspace]
-members = ["libnio", "eventhandler", "util"]
+members = ["libnio", "log", "eventhandler", "util"]
 
 [dependencies]
 
+log = { path = "./log" }
 nioruntime_util = { path = "./util" }
 nioruntime_evh = { path = "./eventhandler" }
 nioruntime_libnio = { path = "./libnio" }

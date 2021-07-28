@@ -14,9 +14,9 @@
 
 #![macro_use]
 
-use crate::{Error, ErrorKind};
 use chrono::{DateTime, Local, Utc};
 use lazy_static::lazy_static;
+use nioruntime_util::{Error, ErrorKind};
 use std::fs::{canonicalize, metadata, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -39,16 +39,14 @@ lazy_static! {
 macro_rules! log {
 	($a:expr)=>{
 		{
-                        use nioruntime_util::LogConfig;
-                        let log = &nioruntime_util::LOG;
+                        let log = &LOG;
                         let log = log.lock();
 			do_log!(true, log, $a)
 		}
     	};
 	($a:expr,$($b:tt)*)=>{
 		{
-			use nioruntime_util::LogConfig;
-			let log = &nioruntime_util::LOG;
+			let log = &LOG;
 			let log = log.lock();
 			do_log!(true, log, $a, $($b)*)
 		}
@@ -60,16 +58,14 @@ macro_rules! log {
 macro_rules! log_no_ts {
 	($a:expr)=>{
                 {
-                        use nioruntime_util::LogConfig;
-                        let log = &nioruntime_util::LOG;
+                        let log = &LOG;
                         let log = log.lock();
                         { do_log!(false, log, $a) }
                 }
 	};
 	($a:expr,$($b:tt)*)=>{
 		{
-                        use nioruntime_util::LogConfig;
-                        let log = &nioruntime_util::LOG;
+                        let log = &LOG;
                         let log = log.lock();
                         { do_log!(false, log, $a, $($b)*) }
 		}
@@ -105,7 +101,7 @@ macro_rules! do_log {
                                 },
                                 Err(e) => {
                                         println!(
-                                                "Error: could not use logger to log '{}' due to PoisonError: {}",
+                                                "Error: could not log '{}' due to PoisonError: {}",
                                                 format!($a),
                                                 e.to_string()
                                         );
@@ -134,7 +130,7 @@ macro_rules! do_log {
                                 },
                                 Err(e) => {
                                         println!(
-                                                "Error: could not use logger to log '{}' due to PoisonError: {}",
+                                                "Error: could not log '{}' due to PoisonError: {}",
                                                 format!($a, $($b)*),
                                                 e.to_string()
                                         );
@@ -146,8 +142,7 @@ macro_rules! do_log {
 #[macro_export]
 macro_rules! log_config {
 	($a:expr) => {{
-		use nioruntime_util::LogConfig;
-		let log = &nioruntime_util::LOG;
+		let log = &LOG;
 		let log = log.lock();
 
 		match log {
@@ -303,7 +298,7 @@ impl Log {
 		Ok(())
 	}
 
-	/// configure the logger
+	/// configure the log
 	pub fn config(
 		&mut self,
 		file_path: Option<String>,
@@ -382,7 +377,7 @@ impl Log {
 		}
 	}
 
-	/// Update the show_timestamp parameter for this logger
+	/// Update the show_timestamp parameter for this log
 	pub fn update_show_timestamp(&mut self, show: bool) -> Result<(), Error> {
 		match self.params.as_mut() {
 			Some(params) => {
@@ -393,7 +388,7 @@ impl Log {
 		}
 	}
 
-	/// Update the show_stdout parameter for this logger
+	/// Update the show_stdout parameter for this log
 	pub fn update_show_stdout(&mut self, show: bool) -> Result<(), Error> {
 		match self.params.as_mut() {
 			Some(params) => {

@@ -1,0 +1,21 @@
+[package]
+name = "log"
+version = "0.0.1"
+authors = ["BMW Developers"]
+description = "utilities for nioruntime"
+license = "Apache-2.0"
+repository = "https://github.com/bitcoinmw/nioruntime"
+keywords = [ "crypto", "nioruntime", "mimblewimble" ]
+exclude = ["**/*.nio"]
+edition = "2018"
+
+[dependencies]
+
+nioruntime_util = { path = "../util" }
+failure = "0.1"
+failure_derive = "0.1"
+futures = "0.3.0"
+lazy_static = "1.4.0"
+nix = "0.22.0"
+chrono = "0.4"
+rand = "0.8.4"

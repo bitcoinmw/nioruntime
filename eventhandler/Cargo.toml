@@ -20,5 +20,6 @@ rand = "0.8.4"
 
 nioruntime_libnio = { path = "../libnio" }
 nioruntime_util = { path = "../util" }
+log = { path = "../log" }
 
 
