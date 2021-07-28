@@ -30,14 +30,16 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+const MAX_BUF: usize = 100_000;
+
 struct Buffer {
-	data: [u8; 100_000],
+	data: [u8; MAX_BUF],
 	len: usize,
 }
 
 impl Buffer {
 	fn new() -> Self {
-		let data = [0u8; 100_000];
+		let data = [0u8; MAX_BUF];
 		let len = 0;
 		Buffer { data, len }
 	}
@@ -67,8 +69,8 @@ fn client_thread(
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
 	let mut stream = TcpStream::connect("127.0.0.1:9999")?;
-	let buf = &mut [0u8; 100_000];
-	let buf2 = &mut [0u8; 100_000];
+	let buf = &mut [0u8; MAX_BUF];
+	let buf2 = &mut [0u8; MAX_BUF];
 	let start_itt = std::time::SystemTime::now();
 	for i in 0..count {
 		if i != 0 && i % 10000 == 0 {
@@ -228,51 +230,38 @@ fn real_main() -> Result<(), Error> {
 		log!("Listener Started");
 		let mut eh = EventHandler::new();
 
-		let process_buffer = Arc::new(Mutex::new([0u8; 100_000]));
 		let buffers: Arc<Mutex<HashMap<u128, Buffer>>> = Arc::new(Mutex::new(HashMap::new()));
 		let buffers_clone = buffers.clone();
 		let buffers_clone2 = buffers.clone();
 		eh.set_on_read(move |connection_id, _message_id, buf, len| {
-			/*
-						let mut buffers = buffers_clone2.lock().unwrap();
-
-						let held_buf = &mut buffers.get_mut(&connection_id).unwrap();
-						let exp_len = Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
-						let data = &mut held_buf.data[0..len];
-						if held_buf.len == 0 {
-							copy(&buf[0..len], data);
-							held_buf.len += len;
-							// return nothing yet
-							Ok((buf, 0, 0))
-						} else {
-							if held_buf.len < 4 {
-								copy(&buf[0..len], &mut data[held_buf.len..]);
-								held_buf.len += len;
-								// still nothing
-								Ok((buf, 0, 0))
-							} else {
-								copy(&buf[0..len], &mut data[held_buf.len..]);
-								held_buf.len += len;
-
-								if exp_len + 4 == held_buf.len as u32 {
-									let ret_buf = [0u8; 100_000];
-							//		Ok((&held_buf.data, 0, held_buf.len))
-			//Ok((buf, 0, 0))
-									let process_buffer = process_buffer.lock().unwrap();
-									Ok((&*process_buffer, 0, 0))
-								} else {
-									Ok((buf, 0, 0))
-								}
-							}
-						}
-			*/
-			Ok((buf, 0, len))
+			let mut buffers = buffers_clone2.lock().unwrap();
+			let held_buf = &mut buffers.get_mut(&connection_id).unwrap();
+			copy(
+				&buf[0..len],
+				&mut held_buf.data[held_buf.len..held_buf.len + len],
+			);
+			held_buf.len += len;
+			if held_buf.len < 4 {
+				// not enough data
+				Ok((buf.to_vec(), 0, 0))
+			} else {
+				let exp_len = Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
+				if exp_len + 4 == held_buf.len as u32 {
+					Ok((held_buf.data.to_vec(), 0, held_buf.len))
+				} else {
+					Ok((buf.to_vec(), 0, 0))
+				}
+			}
 		})?;
-		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| Ok((buf, 0, len)))?;
+		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| {
+			Ok((buf.to_vec(), 0, len))
+		})?;
 		eh.set_on_accept(move |connection_id| {
 			log!("accept {}", connection_id);
+
 			let mut buffers = buffers.lock().unwrap();
 			buffers.insert(connection_id, Buffer::new());
+
 			Ok(())
 		})?;
 

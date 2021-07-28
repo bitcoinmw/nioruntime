@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
 use futures::executor::block_on;
+use lazy_static::lazy_static;
+use rand;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc;
@@ -21,47 +24,135 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
 
+lazy_static! {
+	pub static ref STATIC_THREAD_POOL: Arc<Mutex<HashMap<u128, ThreadPool>>> =
+		Arc::new(Mutex::new(HashMap::new()));
+}
+
+pub struct StaticThreadPool {
+	id: u128,
+}
+
+impl StaticThreadPool {
+	pub fn new() -> Result<Self, Error> {
+		let tp = ThreadPool::new();
+		let id: u128 = rand::random::<u128>();
+		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!(
+				"static thread pool lock error: {}",
+				e.to_string()
+			))
+			.into();
+			error
+		})?;
+		stp.insert(id, tp);
+
+		Ok(StaticThreadPool { id })
+	}
+
+	pub fn start(&self, size: usize) -> Result<(), Error> {
+		let stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!(
+				"static thread pool lock error: {}",
+				e.to_string()
+			))
+			.into();
+			error
+		})?;
+
+		let tp = stp.get(&self.id);
+		match tp {
+			Some(tp) => tp.start(size)?,
+			None => {
+				return Err(ErrorKind::InternalError(format!(
+					"static thread pool id = {} doesn't exist error",
+					self.id
+				))
+				.into())
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn execute<F>(&self, f: F) -> Result<(), Error>
+	where
+		F: Future<Output = ()> + Send + Sync + 'static,
+	{
+		let stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!(
+				"static thread pool lock error: {}",
+				e.to_string()
+			))
+			.into();
+			error
+		})?;
+
+		let tp = stp.get(&self.id);
+		match tp {
+			Some(tp) => tp.execute(f)?,
+			None => {
+				return Err(ErrorKind::InternalError(format!(
+					"static thread pool id = {} doesn't exist error",
+					self.id
+				))
+				.into())
+			}
+		}
+		Ok(())
+	}
+}
+
 pub struct FuturesHolder {
 	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
 
 pub struct ThreadPool {
 	tx: Arc<Mutex<mpsc::Sender<FuturesHolder>>>,
+	rx: Arc<Mutex<mpsc::Receiver<FuturesHolder>>>,
 }
 
 impl ThreadPool {
-	pub fn new(size: usize) -> Result<Self, Error> {
+	pub fn new() -> Self {
 		let (tx, rx): (mpsc::Sender<FuturesHolder>, mpsc::Receiver<FuturesHolder>) =
 			mpsc::channel();
 		let rx = Arc::new(Mutex::new(rx));
+		let tx = Arc::new(Mutex::new(tx));
+		ThreadPool { tx, rx }
+	}
 
-		for _ in 0..size {
-			let rx = rx.clone();
+	pub fn start(&self, size: usize) -> Result<(), Error> {
+		for _id in 0..size {
+			let rx = self.rx.clone();
 			thread::spawn(move || loop {
-				let task = {
-					let rx = rx.lock();
-					match rx {
-						Ok(rx) => match (*rx).recv() {
-							Ok(task) => task,
+				let rx = rx.clone();
+				let jh = thread::spawn(move || loop {
+					let task = {
+						let rx = rx.lock();
+
+						match rx {
+							Ok(rx) => match (*rx).recv() {
+								Ok(task) => task,
+								Err(e) => {
+									println!("unexpected error in threadpool: {}", e.to_string());
+									std::thread::sleep(std::time::Duration::from_millis(1000));
+									break;
+								}
+							},
 							Err(e) => {
 								println!("unexpected error in threadpool: {}", e.to_string());
 								std::thread::sleep(std::time::Duration::from_millis(1000));
-								continue;
+								break;
 							}
-						},
-						Err(e) => {
-							println!("unexpected error in threadpool: {}", e.to_string());
-							std::thread::sleep(std::time::Duration::from_millis(1000));
-							continue;
 						}
-					}
-				};
-
-				block_on(task.inner);
+					};
+					block_on(task.inner);
+				});
+				let _ = jh.join();
 			});
 		}
-		let tx = Arc::new(Mutex::new(tx));
-		Ok(ThreadPool { tx })
+
+		Ok(())
 	}
 
 	pub fn execute<F>(&self, f: F) -> Result<(), Error>
@@ -79,7 +170,8 @@ impl ThreadPool {
 
 #[test]
 fn test_thread_pool() -> Result<(), Error> {
-	let tp = ThreadPool::new(10).unwrap();
+	let tp = StaticThreadPool::new()?;
+	tp.start(10)?;
 	let tp = Arc::new(Mutex::new(tp));
 	let x = Arc::new(Mutex::new(0));
 	let x1 = x.clone();

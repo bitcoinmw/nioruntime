@@ -23,7 +23,7 @@ use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 use nix::sys::epoll::{epoll_create1, epoll_ctl, EpollCreateFlags};
 
 use crate::duration_to_timespec;
-use crate::util::threadpool::ThreadPool;
+use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use libc::uintptr_t;
 use nioruntime_libnio::ActionType;
@@ -142,7 +142,7 @@ pub struct EventHandler<F, G, H, I, J, K> {
 
 impl<F, G, H, I, J, K> EventHandler<F, G, H, I, J, K>
 where
-	F: Fn(u128, u128, &[u8], usize) -> Result<(&[u8], usize, usize), Error>
+	F: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize), Error>
 		+ Send
 		+ 'static
 		+ Clone
@@ -152,7 +152,7 @@ where
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	I: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	J: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
-	K: Fn(u128, u128, &[u8], usize) -> Result<(&[u8], usize, usize), Error>
+	K: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize), Error>
 		+ Send
 		+ 'static
 		+ Clone
@@ -654,7 +654,8 @@ where
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		queue: RawFd,
 	) -> Result<(), Error> {
-		let thread_pool = ThreadPool::new(4)?;
+		let thread_pool = StaticThreadPool::new()?;
+		thread_pool.start(4)?;
 
 		let rx = {
 			let guarded_data = guarded_data.lock().map_err(|e| {
@@ -1123,7 +1124,7 @@ where
 
 	fn process_event_write(
 		fd: RawFd,
-		thread_pool: &ThreadPool,
+		thread_pool: &StaticThreadPool,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_close: Pin<Box<H>>,
@@ -1163,7 +1164,7 @@ where
 	fn process_event_read(
 		fd: RawFd,
 		read_fd_type: &Vec<FdType>,
-		thread_pool: &ThreadPool,
+		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_read: Pin<Box<F>>,
 		on_accept: Pin<Box<G>>,
@@ -1188,12 +1189,22 @@ where
 								error
 							},
 						)?;
-						let accept_res = (on_accept)(res as u128);
-						match accept_res {
-							Ok(_) => {}
-							Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
-						}
-						Self::process_accept_result(fd, res, guarded_data)
+						let guarded_data = guarded_data.clone();
+						thread_pool.execute(async move {
+							let accept_res = Self::process_accept_result(fd, res, &guarded_data);
+							match accept_res {
+								Ok(_) => {}
+								Err(e) => {
+									log!("process_accept_result resulted in: {}", e.to_string())
+								}
+							}
+							let accept_res = (on_accept)(res as u128);
+							match accept_res {
+								Ok(_) => {}
+								Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
+							}
+						})?;
+						Ok(())
 					}
 					Err(e) => Self::process_accept_err(fd, e),
 				}?;
@@ -1298,7 +1309,7 @@ where
 					if len > 0 {
 						Self::write(
 							fd,
-							resp,
+							&resp,
 							offset,
 							len,
 							guarded_data,
@@ -1465,7 +1476,7 @@ fn test_echo() -> Result<(), Error> {
 	let mut eh = EventHandler::new();
 
 	// echo
-	eh.set_on_read(|_, _, buf: &[u8], len| Ok((buf, 0, len)))?;
+	eh.set_on_read(|_, _, buf: &[u8], len| Ok((buf.to_vec(), 0, len)))?;
 
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
@@ -1480,7 +1491,7 @@ fn test_echo() -> Result<(), Error> {
 		assert_eq!(buf[4], 5);
 		let mut x = x.lock().unwrap();
 		(*x) += 5;
-		Ok((buf, 0, 0))
+		Ok((buf.to_vec(), 0, 0))
 	})?;
 
 	eh.start()?;
