@@ -121,6 +121,10 @@ fn client_thread(
 			}
 			assert_eq!(buf2[i as usize + 4], (i % 128) as u8);
 		}
+		// clear buf2
+		for i in 0..len_sum {
+			buf2[i] = 0;
+		}
 	}
 
 	close(stream.as_raw_fd())?;
