@@ -1475,11 +1475,14 @@ fn test_echo() -> Result<(), Error> {
 	let mut eh = EventHandler::new();
 
 	// echo
-	eh.set_on_read(|_, _, buf: &[u8], len| Ok((buf.to_vec(), 0, len, false)))?;
+	eh.set_on_read(|buf, len, wh| {
+		let _ = wh.write(buf, 0, len, false);
+		Ok(())
+	})?;
 
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
-	eh.set_on_client_read(move |_connection_id, _message_id, buf: &[u8], len| {
+	eh.set_on_client_read(move |buf, len, _wh| {
 		assert_eq!(len, 5);
 		assert_eq!(buf[0], 1);
 		assert_eq!(buf[1], 2);
@@ -1488,7 +1491,7 @@ fn test_echo() -> Result<(), Error> {
 		assert_eq!(buf[4], 5);
 		let mut x = x.lock().unwrap();
 		(*x) += 5;
-		Ok((buf.to_vec(), 0, 0, false))
+		Ok(())
 	})?;
 
 	eh.start()?;
