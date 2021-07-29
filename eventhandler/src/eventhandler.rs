@@ -52,6 +52,46 @@ const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
 const MAX_EVENTS_KQUEUE: i32 = 100;
 
+#[derive(PartialEq)]
+enum GenericEventType {
+	AddReadET,
+	AddReadLT,
+	DelRead,
+	AddWriteET,
+	DelWrite,
+}
+
+struct GenericEvent {
+	fd: RawFd,
+	etype: GenericEventType,
+}
+
+impl GenericEvent {
+	fn new(fd: RawFd, etype: GenericEventType) -> Self {
+		GenericEvent { fd, etype }
+	}
+	fn to_kev(&self) -> kevent {
+		kevent::new(
+			self.fd as uintptr_t,
+			match &self.etype {
+				GenericEventType::AddReadET => EventFilter::EVFILT_READ,
+				GenericEventType::AddReadLT => EventFilter::EVFILT_READ,
+				GenericEventType::DelRead => EventFilter::EVFILT_READ,
+				GenericEventType::AddWriteET => EventFilter::EVFILT_WRITE,
+				GenericEventType::DelWrite => EventFilter::EVFILT_WRITE,
+			},
+			match &self.etype {
+				GenericEventType::AddReadET => EventFlag::EV_ADD | EventFlag::EV_CLEAR,
+				GenericEventType::AddReadLT => EventFlag::EV_ADD,
+				GenericEventType::DelRead => EventFlag::EV_DELETE,
+				GenericEventType::AddWriteET => EventFlag::EV_ADD | EventFlag::EV_CLEAR,
+				GenericEventType::DelWrite => EventFlag::EV_DELETE,
+			},
+			FilterFlag::empty(),
+		)
+	}
+}
+
 #[derive(Clone)]
 pub struct WriteHandle {
 	fd: i32,
@@ -494,11 +534,10 @@ where
 		Ok(())
 	}
 
-	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
 		write_pending: Vec<RawFd>,
-		kevs: &mut Vec<kevent>,
+		evs: &mut Vec<GenericEvent>,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
@@ -510,11 +549,9 @@ where
 			match handler_event.etype {
 				HandlerEventType::Accept => {
 					let fd = handler_event.fd as uintptr_t;
-					kevs.push(kevent::new(
-						fd,
-						EventFilter::EVFILT_READ,
-						EventFlag::EV_ADD | EventFlag::EV_CLEAR,
-						FilterFlag::empty(),
+					evs.push(GenericEvent::new(
+						handler_event.fd,
+						GenericEventType::AddReadET,
 					));
 					// make sure there's enough space
 					let len = read_fd_type.len();
@@ -550,19 +587,10 @@ where
 					};
 					match fd {
 						Some(fd) => {
+							evs.push(GenericEvent::new(fd, GenericEventType::DelRead));
+							evs.push(GenericEvent::new(fd, GenericEventType::DelWrite));
 							let fd = fd as uintptr_t;
-							kevs.push(kevent::new(
-								fd,
-								EventFilter::EVFILT_READ,
-								EventFlag::EV_DELETE,
-								FilterFlag::empty(),
-							));
-							kevs.push(kevent::new(
-								fd,
-								EventFilter::EVFILT_WRITE,
-								EventFlag::EV_DELETE,
-								FilterFlag::empty(),
-							));
+
 							read_fd_type[handler_event.fd as usize] = FdType::Unknown;
 							use_on_client_read[handler_event.fd as usize] = false;
 
@@ -606,15 +634,77 @@ where
 
 		// handle write_pending
 		for pending in write_pending {
-			let pending = pending as uintptr_t;
-			kevs.push(kevent::new(
-				pending,
-				EventFilter::EVFILT_WRITE,
-				EventFlag::EV_ADD | EventFlag::EV_CLEAR,
+			evs.push(GenericEvent::new(pending, GenericEventType::AddWriteET));
+		}
+		Ok(())
+	}
+
+	#[cfg(target_os = "linux")]
+	fn get_events(
+		queue: RawFd,
+		input: Vec<GenericEvent>,
+		output: Vec<GenericEvent>,
+	) -> Result<(usize), Error> {
+		Ok(())
+	}
+
+	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+	fn get_events(
+		queue: RawFd,
+		input_events: Vec<GenericEvent>,
+		output_events: &mut Vec<GenericEvent>,
+	) -> Result<i32, Error> {
+		let mut kevs = vec![];
+		for ev in input_events {
+			kevs.push(ev.to_kev());
+		}
+
+		let mut ret_kevs = vec![];
+		for _ in 0..MAX_EVENTS_KQUEUE {
+			ret_kevs.push(kevent::new(
+				0,
+				EventFilter::EVFILT_SYSCOUNT,
+				EventFlag::empty(),
 				FilterFlag::empty(),
 			));
 		}
-		Ok(())
+
+		let ret_count = unsafe {
+			kevent(
+				queue,
+				kevs.as_ptr(),
+				kevs.len() as i32,
+				ret_kevs.as_mut_ptr(),
+				MAX_EVENTS_KQUEUE,
+				&duration_to_timespec(Duration::from_millis(1)),
+			)
+		};
+
+		if ret_count < 0 {
+			log!("Error in kevent: {:?}", std::io::Error::last_os_error());
+		}
+
+		let mut ret_count_adjusted = 0;
+		for i in 0..ret_count {
+			let kev = ret_kevs[i as usize];
+			if !kev.flags.contains(EventFlag::EV_DELETE) {
+				ret_count_adjusted += 1;
+				if kev.filter == EVFILT_WRITE {
+					output_events.push(GenericEvent::new(
+						kev.ident as RawFd,
+						GenericEventType::AddWriteET,
+					));
+				}
+				if kev.filter == EVFILT_READ {
+					output_events.push(GenericEvent::new(
+						kev.ident as RawFd,
+						GenericEventType::AddReadET,
+					));
+				}
+			}
+		}
+
+		Ok(ret_count_adjusted)
 	}
 
 	#[cfg(target_os = "linux")]
@@ -670,36 +760,11 @@ where
 			write_buffers.push(Arc::new(Mutex::new(LinkedList::new())));
 		}
 
-		let mut ret_kevs = vec![];
-		for _ in 0..MAX_EVENTS_KQUEUE {
-			ret_kevs.push(kevent::new(
-				0,
-				EventFilter::EVFILT_SYSCOUNT,
-				EventFlag::empty(),
-				FilterFlag::empty(),
-			));
-		}
-
 		// add the wakeup pipe rx here
-		let mut kevs: Vec<kevent> = Vec::new();
-		let rx = rx as uintptr_t;
-		kevs.push(kevent::new(
-			rx,
-			EventFilter::EVFILT_READ,
-			EventFlag::EV_ADD,
-			FilterFlag::empty(),
-		));
-
-		unsafe {
-			kevent(
-				queue,
-				kevs.as_ptr(),
-				kevs.len() as i32,
-				ret_kevs.as_mut_ptr(),
-				MAX_EVENTS_KQUEUE,
-				&duration_to_timespec(Duration::from_millis(1)),
-			)
-		};
+		let mut output_events = vec![];
+		let mut input_events = vec![];
+		input_events.push(GenericEvent::new(rx, GenericEventType::AddReadLT));
+		Self::get_events(queue, input_events, &mut output_events)?;
 
 		let mut ret_count;
 		loop {
@@ -736,19 +801,14 @@ where
 				on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
 			}
 
-			let mut kevs: Vec<kevent> = Vec::new();
+			let mut evs: Vec<GenericEvent> = Vec::new();
 
 			for proc in to_process {
 				match proc.atype {
 					ActionType::AddStream => {
-						let fd = proc.fd as uintptr_t;
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_READ,
-							EventFlag::EV_ADD | EventFlag::EV_CLEAR,
-							FilterFlag::empty(),
-						));
+						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadET));
 
+						let fd = proc.fd as uintptr_t;
 						// make sure there's enough space
 						let len = read_fd_type.len();
 						if fd >= len {
@@ -768,13 +828,8 @@ where
 						use_on_client_read[fd] = true;
 					}
 					ActionType::AddListener => {
+						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadLT));
 						let fd = proc.fd as uintptr_t;
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_READ,
-							EventFlag::EV_ADD,
-							FilterFlag::empty(),
-						));
 
 						// make sure there's enough space
 						let len = read_fd_type.len();
@@ -794,13 +849,8 @@ where
 						use_on_client_read[fd] = false;
 					}
 					ActionType::Remove => {
+						evs.push(GenericEvent::new(proc.fd, GenericEventType::DelRead));
 						let fd = proc.fd as uintptr_t;
-						kevs.push(kevent::new(
-							fd,
-							EventFilter::EVFILT_READ,
-							EventFlag::EV_DELETE,
-							FilterFlag::empty(),
-						));
 
 						// make sure there's enough space
 						let len = read_fd_type.len();
@@ -818,7 +868,7 @@ where
 			Self::process_handler_events(
 				handler_events,
 				write_pending,
-				&mut kevs,
+				&mut evs,
 				&mut read_fd_type,
 				&mut use_on_client_read,
 				write_buffers,
@@ -827,57 +877,25 @@ where
 				&thread_pool,
 			)?;
 
-			ret_count = unsafe {
-				kevent(
-					queue,
-					kevs.as_ptr(),
-					kevs.len() as i32,
-					ret_kevs.as_mut_ptr(),
-					MAX_EVENTS_KQUEUE,
-					&duration_to_timespec(Duration::from_millis(100)),
-				)
-			};
-
-			// handle error here
-			if ret_count < 0 {
-				match Self::process_error() {
-					Ok(_) => {}
-					Err(e) => {
-						log!("Unexpected error in poll loop: {}", e.to_string());
-					}
-				}
-				continue;
-			}
+			let mut output_events = vec![];
+			ret_count = Self::get_events(queue, evs, &mut output_events)?;
 
 			// if no events are returned (on timeout), just bypass following logic and wait
 			if ret_count == 0 {
 				continue;
 			}
-			// check if we have all delete events which can be ignored
-			let mut has_non_delete = false;
-			let mut i = 0;
-			for k in &ret_kevs {
-				if !k.flags.contains(EventFlag::EV_DELETE) {
-					has_non_delete = true;
-					break;
-				}
-				i += 1;
-				if i >= ret_count {
-					break;
-				}
-			}
-			if !has_non_delete {
-				continue;
-			}
 
 			// first process write buffers in a single batch
 			let mut fds = vec![];
-			for i in 0..ret_count {
-				let kev = ret_kevs[i as usize];
-				if kev.filter == EVFILT_WRITE {
-					fds.push(kev.ident as RawFd);
+			for event in &output_events {
+				match event.etype {
+					GenericEventType::AddWriteET => {
+						fds.push(event.fd);
+					}
+					_ => {}
 				}
 			}
+
 			let res = Self::process_write_buffers(fds, guarded_data, write_buffers);
 
 			match res {
@@ -890,11 +908,10 @@ where
 				}
 			}
 
-			for i in 0..ret_count {
-				let kev = ret_kevs[i as usize];
-				if kev.filter == EVFILT_WRITE && !kev.flags.contains(EventFlag::EV_DELETE) {
+			for event in output_events {
+				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
-						kev.ident as RawFd,
+						event.fd as RawFd,
 						&thread_pool,
 						write_buffers,
 						guarded_data,
@@ -906,16 +923,18 @@ where
 						}
 					}
 				}
-				if kev.filter == EVFILT_READ {
+				if event.etype == GenericEventType::AddReadET
+					|| event.etype == GenericEventType::AddReadLT
+				{
 					let res = Self::process_event_read(
-						kev.ident as RawFd,
+						event.fd as RawFd,
 						&read_fd_type,
 						&thread_pool,
 						guarded_data,
 						on_read.clone(),
 						on_accept.clone(),
 						on_client_read.clone(),
-						use_on_client_read[kev.ident as usize],
+						use_on_client_read[event.fd as usize],
 						read_locks,
 						write_buffers,
 						seqno,
@@ -931,11 +950,6 @@ where
 				}
 			}
 		}
-	}
-
-	fn process_error() -> Result<(), Error> {
-		log!("Error in event queue, {}", std::io::Error::last_os_error());
-		Ok(())
 	}
 
 	fn process_write_buffers(
