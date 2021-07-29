@@ -21,6 +21,9 @@ use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
 use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 
 // linux deps
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{epoll_create1, EpollCreateFlags};
+
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use libc::uintptr_t;
@@ -30,8 +33,6 @@ use nix::errno::Errno;
 use nix::fcntl::fcntl;
 use nix::fcntl::OFlag;
 use nix::fcntl::F_SETFL;
-#[cfg(target_os = "linux")]
-use nix::sys::epoll::{epoll_create1, EpollCreateFlags};
 use nix::sys::socket::accept;
 use nix::unistd::close;
 use nix::unistd::pipe;
@@ -658,9 +659,11 @@ where
 	#[cfg(target_os = "linux")]
 	fn get_events(
 		_epollfd: RawFd,
-		_input: Vec<GenericEvent>,
+		input_events: Vec<GenericEvent>,
 		_output: &mut Vec<GenericEvent>,
 	) -> Result<i32, Error> {
+		for input in input_events {}
+
 		Ok(0)
 	}
 
