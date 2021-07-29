@@ -657,7 +657,7 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		_queue: RawFd,
+		_epollfd: RawFd,
 		_input: Vec<GenericEvent>,
 		_output: &mut Vec<GenericEvent>,
 	) -> Result<i32, Error> {
@@ -728,7 +728,7 @@ where
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
 		read_locks: &mut Vec<Arc<Mutex<u128>>>,
-		queue: RawFd,
+		selector: RawFd,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(4)?;
@@ -769,7 +769,7 @@ where
 		let mut output_events = vec![];
 		let mut input_events = vec![];
 		input_events.push(GenericEvent::new(rx, GenericEventType::AddReadLT));
-		Self::get_events(queue, input_events, &mut output_events)?;
+		Self::get_events(selector, input_events, &mut output_events)?;
 
 		let mut ret_count;
 		loop {
@@ -883,7 +883,7 @@ where
 			)?;
 
 			let mut output_events = vec![];
-			ret_count = Self::get_events(queue, evs, &mut output_events)?;
+			ret_count = Self::get_events(selector, evs, &mut output_events)?;
 
 			// if no events are returned (on timeout), just bypass following logic and wait
 			if ret_count == 0 {
