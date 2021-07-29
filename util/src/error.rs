@@ -37,6 +37,9 @@ pub enum ErrorKind {
 	/// Internal Error
 	#[fail(display = "Internal Error: {}", _0)]
 	InternalError(String),
+	/// Stale Fd
+	#[fail(display = "Stale Fd Error: {}", _0)]
+	StaleFdError(String),
 	/// Array Index out of bounds
 	#[fail(display = "ArrayIndexOutofBounds: {}", _0)]
 	ArrayIndexOutofBounds(String),

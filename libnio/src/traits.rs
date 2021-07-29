@@ -19,7 +19,7 @@ use std::net::TcpStream;
 #[cfg(target_os = "windows")]
 use async_std::os::windows::io::AsRawSocket;
 
-#[cfg(any(unix, macos))]
+#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 use std::os::unix::io::{AsRawFd, RawFd};
 
 #[derive(Debug, Clone)]
@@ -41,7 +41,7 @@ pub trait EventHandler {
 	) -> Result<i32, Error>;
 
 	/// Add a file desciptor for kqueues or epoll (linux, macos)
-	#[cfg(any(unix, macos))]
+	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error>;
 
 	/// Remove the given id from the event handler
@@ -49,7 +49,7 @@ pub trait EventHandler {
 
 	fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<i32, Error> {
 		stream.set_nonblocking(true)?;
-		#[cfg(any(unix, macos))]
+		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
@@ -59,7 +59,7 @@ pub trait EventHandler {
 	fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
-		#[cfg(any(unix, macos))]
+		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
@@ -67,7 +67,7 @@ pub trait EventHandler {
 	}
 
 	fn remove_tcp_stream(&mut self, stream: TcpStream) -> Result<(), Error> {
-		#[cfg(any(unix, macos))]
+		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 		self.remove_fd(stream.as_raw_fd())?;
 		#[cfg(target_os = "windows")]
 		self.remove_socket(stream.as_raw_socket())?;
@@ -75,7 +75,7 @@ pub trait EventHandler {
 	}
 
 	fn remove_tcp_listener(&mut self, listener: TcpListener) -> Result<(), Error> {
-		#[cfg(any(unix, macos))]
+		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 		self.remove_fd(listener.as_raw_fd())?;
 		#[cfg(target_os = "windows")]
 		self.remove_socket(listener.as_raw_socket())?;

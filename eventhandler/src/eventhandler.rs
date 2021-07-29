@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// macos deps
-#[cfg(target_os = "macos")]
+// macos/bsd deps
+#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
-#[cfg(target_os = "macos")]
+#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 
 // linux deps
@@ -25,8 +25,6 @@ use nix::sys::epoll::{epoll_create1, epoll_ctl, EpollCreateFlags};
 use crate::duration_to_timespec;
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
-use futures::channel::oneshot;
-use futures::executor::block_on;
 use libc::uintptr_t;
 use log::*;
 use nioruntime_libnio::ActionType;
@@ -41,6 +39,7 @@ use nix::unistd::read;
 use nix::unistd::write;
 use rand::thread_rng;
 use rand::Rng;
+use std::collections::HashMap;
 use std::collections::LinkedList;
 use std::convert::TryInto;
 use std::net::TcpListener;
@@ -48,7 +47,7 @@ use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::spawn;
 use std::time::Duration;
 
@@ -78,11 +77,12 @@ enum HandlerEventType {
 struct HandlerEvent {
 	etype: HandlerEventType,
 	fd: RawFd,
+	seqno: u128,
 }
 
 impl HandlerEvent {
-	fn new(fd: RawFd, etype: HandlerEventType) -> Self {
-		HandlerEvent { fd, etype }
+	fn new(fd: RawFd, etype: HandlerEventType, seqno: u128) -> Self {
+		HandlerEvent { fd, etype, seqno }
 	}
 }
 
@@ -102,6 +102,7 @@ struct WriteBuffer<I, J> {
 	on_write_success: Option<I>,
 	on_write_fail: Option<J>,
 	close: bool,
+	connection_seqno: u128,
 }
 
 struct Callbacks<F, G, H, I, J, K> {
@@ -113,29 +114,17 @@ struct Callbacks<F, G, H, I, J, K> {
 	on_client_read: Option<Pin<Box<K>>>,
 }
 
-#[derive(PartialEq, Debug)]
-enum ConnectionState {
-	Ok,
-	Closing,
-}
-
-impl Default for ConnectionState {
-	fn default() -> Self {
-		ConnectionState::Ok
-	}
-}
-
 struct GuardedData<F, G, H, I, J, K> {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
 	wakeup_rx: RawFd,
 	wakeup_scheduled: bool,
-	connection_state: Vec<ConnectionState>,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
 	write_buffers: Vec<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>,
 	selector: Option<RawFd>,
 	callbacks: Callbacks<F, G, H, I, J, K>,
+	seqno_map: HashMap<u128, RawFd>,
 }
 
 pub struct EventHandler<F, G, H, I, J, K> {
@@ -181,7 +170,7 @@ where
 		}
 
 		stream.set_nonblocking(true)?;
-		#[cfg(any(unix, macos))]
+		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
@@ -191,7 +180,7 @@ where
 	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
-		#[cfg(any(unix, macos))]
+		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
@@ -309,16 +298,6 @@ where
 		Ok(())
 	}
 
-	fn value_of<T>(vec: &Vec<T>, i: usize) -> Option<&T>
-	where
-		T: Default,
-	{
-		match vec.len() > i {
-			true => Some(&vec[i]),
-			false => None,
-		}
-	}
-
 	fn check_and_set<T>(vec: &mut Vec<T>, i: usize, value: T)
 	where
 		T: Default,
@@ -347,6 +326,7 @@ where
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
 		close: bool,
+		connection_seqno: u128,
 	) -> Result<(), Error> {
 		if len + offset > data.len() {
 			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
@@ -389,6 +369,7 @@ where
 						true => close,
 						false => false,
 					},
+					connection_seqno,
 				};
 
 				let start = offset + count * BUFFER_SIZE;
@@ -504,12 +485,12 @@ where
 			wakeup_fd: tx,
 			wakeup_rx: rx,
 			wakeup_scheduled: false,
-			connection_state: vec![],
 			handler_events: vec![],
 			write_pending: vec![],
 			write_buffers: vec![LinkedList::new()],
 			selector: None,
 			callbacks,
+			seqno_map: HashMap::new(),
 		};
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
 
@@ -524,7 +505,7 @@ where
 		Ok(())
 	}
 
-	#[cfg(target_os = "macos")]
+	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	pub fn start(&self) -> Result<(), Error> {
 		// create the kqueue
 		let selector = unsafe { kqueue() };
@@ -542,7 +523,7 @@ where
 		}
 
 		let mut write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
-		let mut read_locks = vec![Arc::new(Mutex::new(true))];
+		let mut read_locks = vec![Arc::new(Mutex::new(0u128))];
 		let cloned_guarded_data = self.data.clone();
 
 		spawn(move || {
@@ -565,7 +546,7 @@ where
 		Ok(())
 	}
 
-	#[cfg(target_os = "macos")]
+	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
 		write_pending: Vec<RawFd>,
@@ -573,6 +554,9 @@ where
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		on_close: Pin<Box<H>>,
+		thread_pool: &StaticThreadPool,
 	) -> Result<(), Error> {
 		for handler_event in &handler_events {
 			match handler_event.etype {
@@ -602,38 +586,71 @@ where
 					use_on_client_read[fd] = false;
 				}
 				HandlerEventType::Close => {
-					let fd = handler_event.fd as uintptr_t;
-					kevs.push(kevent::new(
-						fd,
-						EventFilter::EVFILT_READ,
-						EventFlag::EV_DELETE,
-						FilterFlag::empty(),
-					));
-					kevs.push(kevent::new(
-						fd,
-						EventFilter::EVFILT_WRITE,
-						EventFlag::EV_DELETE,
-						FilterFlag::empty(),
-					));
-					read_fd_type[handler_event.fd as usize] = FdType::Unknown;
-					use_on_client_read[handler_event.fd as usize] = false;
-
-					// delete any unwritten buffers
-					if fd < write_buffers.len() {
-						let mut linked_list = write_buffers[fd as usize].lock().map_err(|e| {
-							let error: Error =
-								ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-							error
-						})?;
-
-						let mut iter = (*linked_list).iter();
-						loop {
-							match iter.next() {
-								Some(item) => drop(item),
-								None => break,
+					let seqno = handler_event.seqno;
+					let fd: Option<RawFd> = {
+						let guarded_data = guarded_data.lock();
+						match guarded_data {
+							Ok(mut guarded_data) => guarded_data.seqno_map.remove(&seqno),
+							Err(e) => {
+								log!(
+									"Unexpected error getting guarded data lock: {}",
+									e.to_string()
+								);
+								None
 							}
 						}
-						(*linked_list).clear();
+					};
+					match fd {
+						Some(fd) => {
+							let fd = fd as uintptr_t;
+							kevs.push(kevent::new(
+								fd,
+								EventFilter::EVFILT_READ,
+								EventFlag::EV_DELETE,
+								FilterFlag::empty(),
+							));
+							kevs.push(kevent::new(
+								fd,
+								EventFilter::EVFILT_WRITE,
+								EventFlag::EV_DELETE,
+								FilterFlag::empty(),
+							));
+							read_fd_type[handler_event.fd as usize] = FdType::Unknown;
+							use_on_client_read[handler_event.fd as usize] = false;
+
+							// delete any unwritten buffers
+							if fd < write_buffers.len() {
+								let mut linked_list =
+									write_buffers[fd as usize].lock().map_err(|e| {
+										let error: Error = ErrorKind::InternalError(format!(
+											"Poison Error: {}",
+											e
+										))
+										.into();
+										error
+									})?;
+
+								let mut iter = (*linked_list).iter();
+								loop {
+									match iter.next() {
+										Some(item) => drop(item),
+										None => break,
+									}
+								}
+								(*linked_list).clear();
+							}
+
+							let on_close = on_close.clone();
+							thread_pool.execute(async move {
+								match (on_close)(seqno) {
+									Ok(_) => {}
+									Err(e) => {
+										log!("on close handler generated error: {}", e.to_string());
+									}
+								}
+							})?;
+						}
+						None => {} // already deleted
 					}
 				}
 			}
@@ -656,21 +673,25 @@ where
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		read_locks: &mut Vec<Arc<Mutex<bool>>>,
+		read_locks: &mut Vec<Arc<Mutex<u128>>>,
 		pollfd: RawFd,
 	) -> Result<(), Error> {
 		Ok(())
 	}
 
-	#[cfg(target_os = "macos")]
+	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		read_locks: &mut Vec<Arc<Mutex<bool>>>,
+		read_locks: &mut Vec<Arc<Mutex<u128>>>,
 		queue: RawFd,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(4)?;
+
+		let accept_read_lock = Arc::new(RwLock::new(true));
+
+		let mut seqno = 0u128;
 
 		let rx = {
 			let guarded_data = guarded_data.lock().map_err(|e| {
@@ -680,6 +701,7 @@ where
 			guarded_data.wakeup_rx
 		};
 		let mut read_fd_type = Vec::new();
+
 		// preallocate some
 		read_fd_type.reserve(INITIAL_MAX_FDS);
 		for _ in 0..INITIAL_MAX_FDS {
@@ -732,6 +754,7 @@ where
 
 		let mut ret_count;
 		loop {
+			seqno += 1;
 			let to_process;
 			let handler_events;
 			let write_pending;
@@ -863,6 +886,9 @@ where
 				&mut read_fd_type,
 				&mut use_on_client_read,
 				write_buffers,
+				guarded_data,
+				on_close.clone(),
+				&thread_pool,
 			)?;
 
 			ret_count = unsafe {
@@ -936,7 +962,6 @@ where
 						&thread_pool,
 						write_buffers,
 						guarded_data,
-						on_close.clone(),
 					);
 					match res {
 						Ok(_) => {}
@@ -953,12 +978,14 @@ where
 						guarded_data,
 						on_read.clone(),
 						on_accept.clone(),
-						on_close.clone(),
 						on_write_success.clone(),
 						on_write_fail.clone(),
 						on_client_read.clone(),
 						use_on_client_read[kev.ident as usize],
 						read_locks,
+						write_buffers,
+						seqno,
+						&accept_read_lock,
 					);
 
 					match res {
@@ -1013,13 +1040,65 @@ where
 	fn write_loop(
 		fd: RawFd,
 		write_buffer: &mut WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>,
+		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 	) -> Result<u16, Error> {
 		let initial_len = write_buffer.len;
 		loop {
-			let res = write(
-				fd,
-				&write_buffer.buffer[(write_buffer.offset as usize)..(write_buffer.len as usize)],
-			);
+			let res = {
+				let res = match guarded_data.lock() {
+					Ok(data) => {
+						let seqno = data.seqno_map.get(&write_buffer.connection_seqno);
+						let res = match seqno {
+							Some(resfd) => {
+								if resfd != &fd {
+									log!(
+										"seqno = '{:?}' expected fd = '{}', found fd = '{}'",
+										seqno,
+										fd,
+										resfd
+									);
+									return Err(ErrorKind::StaleFdError(format!(
+										"write to closed fd: {}",
+										fd
+									))
+									.into());
+								}
+
+								let res = write(
+									fd,
+									&write_buffer.buffer[(write_buffer.offset as usize)
+										..(write_buffer.len as usize)],
+								);
+								res
+							}
+							None => {
+								log!(
+									"lookup seqno = {} expected fd = '{}', found fd = None",
+									write_buffer.connection_seqno,
+									fd
+								);
+								log!(
+									"write_buffer.len = {}, write_buffer.offset = {}",
+									write_buffer.len,
+									write_buffer.offset
+								);
+								return Err(ErrorKind::StaleFdError(format!(
+									"write to closed fd: {}",
+									fd
+								))
+								.into());
+							}
+						};
+						res
+					}
+					Err(e) => {
+						log!("Unexpected error locking guarded_data {}", e.to_string());
+						return Err(ErrorKind::InternalError(format!("poison error: {}", e)).into());
+					}
+				};
+
+				res
+			};
 
 			match res {
 				Ok(len) => {
@@ -1060,13 +1139,12 @@ where
 		fd: RawFd,
 		linked_list: &mut LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		on_close: Pin<Box<H>>,
 	) -> Result<(), Error> {
 		loop {
 			match (*linked_list).front_mut() {
 				Some(front) => {
 					let total_len = front.len;
-					let ret = Self::write_loop(fd, front);
+					let ret = Self::write_loop(fd, front, guarded_data);
 					match ret {
 						Ok(len) => {
 							if len == total_len {
@@ -1087,25 +1165,14 @@ where
 								}
 
 								if front.close {
-									let is_dup = Self::push_handler_event(
+									Self::push_handler_event(
 										fd,
 										HandlerEventType::Close,
 										guarded_data,
 										false,
+										front.connection_seqno,
 									)?;
-									if !is_dup {
-										let _ = close(fd);
-										let res = (on_close)(fd.try_into().unwrap_or(0));
-										match res {
-											Ok(_) => {}
-											Err(e) => {
-												log!(
-													"on_close callback resulted in: {}",
-													e.to_string()
-												)
-											}
-										}
-									}
+									let _ = close(fd);
 								}
 								(*linked_list).pop_front();
 							} else {
@@ -1115,23 +1182,16 @@ where
 								break;
 							}
 						}
-						Err(_e) => {
-							let is_dup = Self::push_handler_event(
+						Err(e) => {
+							log!("Error occurred: {}", e.to_string());
+							Self::push_handler_event(
 								fd,
 								HandlerEventType::Close,
 								guarded_data,
 								false,
+								front.connection_seqno,
 							)?;
-							if !is_dup {
-								let _ = close(fd);
-								let res = (on_close)(fd.try_into().unwrap_or(0));
-								match res {
-									Ok(_) => {}
-									Err(e) => {
-										log!("on_close callback resulted in: {}", e.to_string())
-									}
-								}
-							}
+							let _ = close(fd);
 							match &front.on_write_fail {
 								Some(h) => {
 									let hres = (h)(fd.try_into().unwrap_or(0), front.msg_id);
@@ -1164,7 +1224,6 @@ where
 		thread_pool: &StaticThreadPool,
 		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		on_close: Pin<Box<H>>,
 	) -> Result<(), Error> {
 		let write_buffer_clone = write_buffers[fd as usize].clone();
 		let guarded_data = guarded_data.clone();
@@ -1173,8 +1232,7 @@ where
 				let write_buffer = write_buffer_clone.lock();
 				match write_buffer {
 					Ok(mut linked_list) => {
-						let res =
-							Self::write_until_block(fd, &mut linked_list, &guarded_data, on_close);
+						let res = Self::write_until_block(fd, &mut linked_list, &guarded_data);
 
 						match res {
 							Ok(_) => {}
@@ -1205,20 +1263,79 @@ where
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_read: Pin<Box<F>>,
 		on_accept: Pin<Box<G>>,
-		on_close: Pin<Box<H>>,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
-		read_locks: &mut Vec<Arc<Mutex<bool>>>,
+		read_locks: &mut Vec<Arc<Mutex<u128>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		seqno: u128,
+		accept_read_lock: &Arc<RwLock<bool>>,
 	) -> Result<(), Error> {
 		let fd_type = &read_fd_type[fd as usize];
 		match fd_type {
 			FdType::Listener => {
-				// one at a time per fd
+				let lock = accept_read_lock.write();
+				match lock {
+					Ok(_) => {}
+					Err(e) => log!("Unexpected error obtaining read lock, {}", e),
+				}
 				let res = accept(fd);
 				match res {
 					Ok(res) => {
+						if write_buffers.len() > res as usize {
+							// if it's not, it will be allocated on write
+							// and there's nothing to delete here
+							match write_buffers[res as usize].lock() {
+								Ok(mut list) => {
+									list.clear();
+								}
+								Err(e) => {
+									log!(
+										"unexpected error retreiving linkedlist, {}",
+										e.to_string(),
+									);
+								}
+							}
+						}
+
+						if read_locks.len() <= res as usize {
+							Self::check_and_set(
+								read_locks,
+								res as usize,
+								Arc::new(Mutex::new(seqno)),
+							);
+						}
+
+						{
+							let current_seqno = read_locks[res as usize].lock();
+							match current_seqno {
+								Ok(mut current_seqno) => {
+									*current_seqno = seqno;
+								}
+								Err(e) => {
+									log!("Error getting seqno: {}", e.to_string());
+									return Err(ErrorKind::InternalError(
+										"unexpected error obtaining seqno".to_string(),
+									)
+									.into());
+								}
+							}
+						}
+
+						// insert the seqno into the hashmap
+						{
+							let guarded_data = guarded_data.lock();
+							match guarded_data {
+								Ok(mut guarded_data) => {
+									guarded_data.seqno_map.insert(seqno, res);
+								}
+								Err(e) => {
+									log!("Error getting guarded data: {}", e.to_string());
+								}
+							}
+						}
+
 						// set non-blocking
 						fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap())).map_err(
 							|e| {
@@ -1229,28 +1346,18 @@ where
 						)?;
 						let guarded_data = guarded_data.clone();
 
-						let (p, c) = oneshot::channel::<()>();
-						thread_pool.execute(async move {
-							let accept_res = Self::process_accept_result(fd, res, &guarded_data);
-							match accept_res {
-								Ok(_) => {}
-								Err(e) => {
-									log!("process_accept_result resulted in: {}", e.to_string())
-								}
+						let accept_res = Self::process_accept_result(fd, res, &guarded_data);
+						match accept_res {
+							Ok(_) => {}
+							Err(e) => {
+								log!("process_accept_result resulted in: {}", e.to_string())
 							}
-							let accept_res = (on_accept)(res as u128);
-							match accept_res {
-								Ok(_) => {}
-								Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
-							}
-
-							let _ = p.send(());
-						})?;
-
-						block_on(async {
-							c.await.ok();
-						});
-
+						}
+						let accept_res = (on_accept)(seqno as u128);
+						match accept_res {
+							Ok(_) => {}
+							Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
+						}
 						Ok(())
 					}
 					Err(e) => Self::process_accept_err(fd, e),
@@ -1258,22 +1365,25 @@ where
 			}
 			FdType::Stream => {
 				let guarded_data = guarded_data.clone();
-				let fd_type = fd_type.clone();
-				if read_locks.len() <= fd as usize {
-					Self::check_and_set(read_locks, fd as usize, Arc::new(Mutex::new(true)));
-				}
 				let read_lock = read_locks[fd as usize].clone();
+				let accept_read_lock = accept_read_lock.clone();
 				thread_pool
 					.execute(async move {
+						let lock = accept_read_lock.read();
+						match lock {
+							Ok(_) => {}
+							Err(e) => log!("Unexpected error obtaining read lock: {}", e),
+						}
 						let mut buf = [0u8; BUFFER_SIZE];
 						loop {
 							let lock = read_lock.lock();
-							match lock {
-								Ok(_) => {}
+							let seqno = match lock {
+								Ok(seqno) => seqno,
 								Err(e) => {
-									log!("Error obtaining read lock: {}", e.to_string());
+									log!("Unexpected Error obtaining read lock: {}", e.to_string());
+									break;
 								}
-							}
+							};
 							let res = read(fd, &mut buf);
 							match res {
 								Ok(res) => {
@@ -1283,21 +1393,15 @@ where
 										buf,
 										&guarded_data,
 										on_read.clone(),
-										on_close.clone(),
 										on_write_success.clone(),
 										on_write_fail.clone(),
 										on_client_read.clone(),
 										use_on_client_read,
+										*seqno,
 									);
 								}
 								Err(e) => {
-									let _ = Self::process_read_err(
-										fd,
-										e,
-										&guarded_data,
-										on_close,
-										fd_type,
-									);
+									let _ = Self::process_read_err(fd, e, &guarded_data, *seqno);
 									break;
 								}
 							};
@@ -1340,18 +1444,18 @@ where
 		buf: [u8; BUFFER_SIZE],
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		on_read: Pin<Box<F>>,
-		on_close: Pin<Box<H>>,
 		on_write_success: Pin<Box<I>>,
 		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
+		connection_seqno: u128,
 	) -> Result<(), Error> {
 		if len > 0 {
 			let msg_id: u128 = thread_rng().gen::<u128>();
 			let result = match use_on_client_read {
 				//let (resp, offset, len) = match use_on_client_read {
-				true => (on_client_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
-				false => (on_read)(fd.try_into().unwrap_or(0), msg_id, &buf, len),
+				true => (on_client_read)(connection_seqno, msg_id, &buf, len),
+				false => (on_read)(connection_seqno, msg_id, &buf, len),
 			};
 
 			match result {
@@ -1367,6 +1471,7 @@ where
 							on_write_success,
 							on_write_fail,
 							close,
+							connection_seqno,
 						)?;
 					}
 				}
@@ -1376,16 +1481,14 @@ where
 			}
 		} else {
 			// close
-			let is_dup =
-				Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
-			if !is_dup {
-				let _ = close(fd);
-				let close_res = (on_close)(fd.try_into().unwrap_or(0));
-				match close_res {
-					Ok(_) => {}
-					Err(e) => log!("on close callback resulted in error: {}", e.to_string()),
-				}
-			}
+			Self::push_handler_event(
+				fd,
+				HandlerEventType::Close,
+				guarded_data,
+				false,
+				connection_seqno,
+			)?;
+			let _ = close(fd);
 		}
 		Ok(())
 	}
@@ -1394,8 +1497,7 @@ where
 		fd: RawFd,
 		error: Errno,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		on_close: Pin<Box<H>>,
-		_fd_type: FdType,
+		connection_seqno: u128,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
@@ -1405,16 +1507,14 @@ where
 				// we'll read from the main loop
 			}
 			_ => {
-				let is_dup =
-					Self::push_handler_event(fd, HandlerEventType::Close, guarded_data, false)?;
-				if !is_dup {
-					let _ = close(fd);
-					let res = (on_close)(fd.try_into().unwrap_or(0));
-					match res {
-						Ok(_) => {}
-						Err(e) => log!("on_close callback resulted in: {}", e.to_string()),
-					}
-				}
+				Self::push_handler_event(
+					fd,
+					HandlerEventType::Close,
+					guarded_data,
+					false,
+					connection_seqno,
+				)?;
+				let _ = close(fd);
 			}
 		}
 		Ok(())
@@ -1425,7 +1525,7 @@ where
 		nfd: RawFd,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 	) -> Result<(), Error> {
-		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false).map_err(
+		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false, 0).map_err(
 			|e| {
 				let error: Error = ErrorKind::InternalError(format!(
 					"push handler event error: {}",
@@ -1448,49 +1548,16 @@ where
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
 		wakeup: bool,
-	) -> Result<bool, Error> {
-		let mut is_dup = false;
+		seqno: u128,
+	) -> Result<(), Error> {
 		{
 			let guarded_data = guarded_data.lock();
 			let mut wakeup_fd = 0;
 			let mut wakeup_scheduled = false;
 			match guarded_data {
 				Ok(mut guarded_data) => {
-					// check for duplicates
-					let nevent = HandlerEvent::new(fd, event_type.clone());
-					is_dup = guarded_data
-						.handler_events
-						.iter()
-						.any(|event| event.etype == nevent.etype && event.fd == nevent.fd);
-
-					match Self::value_of(&guarded_data.connection_state, fd as usize) {
-						Some(state) => {
-							if *state == ConnectionState::Closing {
-								is_dup = true;
-							}
-						}
-						None => {}
-					}
-
-					// mark this connection for future iterations
-					match event_type {
-						HandlerEventType::Close => {
-							Self::check_and_set(
-								&mut guarded_data.connection_state,
-								fd as usize,
-								ConnectionState::Closing,
-							);
-						}
-						_ => Self::check_and_set(
-							&mut guarded_data.connection_state,
-							fd as usize,
-							ConnectionState::Ok,
-						),
-					}
-
-					if !is_dup || event_type != HandlerEventType::Close {
-						guarded_data.handler_events.push(nevent);
-					}
+					let nevent = HandlerEvent::new(fd, event_type.clone(), seqno);
+					guarded_data.handler_events.push(nevent);
 
 					if wakeup {
 						wakeup_scheduled = guarded_data.wakeup_scheduled;
@@ -1508,7 +1575,7 @@ where
 				write(wakeup_fd, &[0u8; 1])?;
 			}
 		}
-		Ok(is_dup)
+		Ok(())
 	}
 }
 
@@ -1527,7 +1594,7 @@ fn test_echo() -> Result<(), Error> {
 	let mut eh = EventHandler::new();
 
 	// echo
-	eh.set_on_read(|_, _, buf: &[u8], len| Ok((buf.to_vec(), 0, len)))?;
+	eh.set_on_read(|_, _, buf: &[u8], len| Ok((buf.to_vec(), 0, len, false)))?;
 
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
@@ -1542,7 +1609,7 @@ fn test_echo() -> Result<(), Error> {
 		assert_eq!(buf[4], 5);
 		let mut x = x.lock().unwrap();
 		(*x) += 5;
-		Ok((buf.to_vec(), 0, 0))
+		Ok((buf.to_vec(), 0, 0, false))
 	})?;
 
 	eh.start()?;
