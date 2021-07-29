@@ -286,7 +286,14 @@ where
 		}
 
 		stream.set_nonblocking(true)?;
-		#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+		#[cfg(any(
+			target_os = "linux",
+			target_os = "macos",
+			dragonfly,
+			freebsd,
+			netbsd,
+			openbsd
+		))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
@@ -296,7 +303,14 @@ where
 	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
-		#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+		#[cfg(any(
+			target_os = "linux",
+			target_os = "macos",
+			dragonfly,
+			freebsd,
+			netbsd,
+			openbsd
+		))]
 		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
