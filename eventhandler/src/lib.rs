@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use libc::timespec;
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use std::time::Duration;
 
 pub mod eventhandler;
@@ -21,7 +23,7 @@ pub use nioruntime_util as util;
 
 // Some needed timespec code
 
-#[cfg(not(all(target_os = "freebsd", target_arch = "x86")))]
+#[cfg(any(target_os = "macos", dragonfly, netbsd, openbsd))]
 pub(crate) fn duration_to_timespec(d: Duration) -> timespec {
 	let tv_sec = d.as_secs() as i64;
 	let tv_nsec = d.subsec_nanos() as i64;

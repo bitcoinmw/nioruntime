@@ -13,16 +13,14 @@
 // limitations under the License.
 
 // macos/bsd deps
-#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+use crate::duration_to_timespec;
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
-#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 
 // linux deps
-#[cfg(target_os = "linux")]
-use nix::sys::epoll::{epoll_create1, epoll_ctl, EpollCreateFlags};
-
-use crate::duration_to_timespec;
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use libc::uintptr_t;
@@ -32,6 +30,8 @@ use nix::errno::Errno;
 use nix::fcntl::fcntl;
 use nix::fcntl::OFlag;
 use nix::fcntl::F_SETFL;
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{epoll_create1, EpollCreateFlags};
 use nix::sys::socket::accept;
 use nix::unistd::close;
 use nix::unistd::pipe;
@@ -46,10 +46,10 @@ use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::spawn;
-use std::time::Duration;
 
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 const MAX_EVENTS_KQUEUE: i32 = 100;
 
 #[derive(PartialEq)]
@@ -70,6 +70,8 @@ impl GenericEvent {
 	fn new(fd: RawFd, etype: GenericEventType) -> Self {
 		GenericEvent { fd, etype }
 	}
+
+	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn to_kev(&self) -> kevent {
 		kevent::new(
 			self.fd as uintptr_t,
@@ -284,7 +286,7 @@ where
 		}
 
 		stream.set_nonblocking(true)?;
-		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+		#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
@@ -294,7 +296,7 @@ where
 	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
-		#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+		#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
@@ -491,7 +493,7 @@ where
 		Ok(())
 	}
 
-	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	pub fn start(&self) -> Result<(), Error> {
 		// create the kqueue
 		let selector = unsafe { kqueue() };
@@ -641,14 +643,14 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		queue: RawFd,
-		input: Vec<GenericEvent>,
-		output: Vec<GenericEvent>,
-	) -> Result<(usize), Error> {
-		Ok(())
+		_queue: RawFd,
+		_input: Vec<GenericEvent>,
+		_output: &mut Vec<GenericEvent>,
+	) -> Result<i32, Error> {
+		Ok(0)
 	}
 
-	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
+	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn get_events(
 		queue: RawFd,
 		input_events: Vec<GenericEvent>,
@@ -676,7 +678,7 @@ where
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
 				MAX_EVENTS_KQUEUE,
-				&duration_to_timespec(Duration::from_millis(1)),
+				&duration_to_timespec(std::time::Duration::from_millis(1)),
 			)
 		};
 
@@ -707,17 +709,6 @@ where
 		Ok(ret_count_adjusted)
 	}
 
-	#[cfg(target_os = "linux")]
-	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
-		read_locks: &mut Vec<Arc<Mutex<u128>>>,
-		pollfd: RawFd,
-	) -> Result<(), Error> {
-		Ok(())
-	}
-
-	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
