@@ -82,12 +82,14 @@ fn client_thread(
 		let start_query = std::time::SystemTime::now();
 		let num: u32 = rand::thread_rng().gen_range(min..max);
 		let num_buf = num.to_le_bytes();
+		let offt: u8 = rand::thread_rng().gen_range(0..64);
 		copy(&num_buf[0..4], &mut buf[0..4]);
-
+		buf[4] = offt;
+		let offt = offt as u32;
 		for i in 0..num {
-			buf[i as usize + 4] = (i % 128) as u8;
+			buf[i as usize + 5] = ((i + offt) % 128) as u8;
 		}
-		let res = stream.write(&buf[0..(num as usize + 4)]);
+		let res = stream.write(&buf[0..(num as usize + 5)]);
 
 		match res {
 			Ok(_x) => {}
@@ -101,7 +103,7 @@ fn client_thread(
 		loop {
 			let len = stream.read(&mut buf2[len_sum..])?;
 			len_sum += len;
-			if len_sum == num as usize + 4 {
+			if len_sum == num as usize + 5 {
 				break;
 			}
 		}
@@ -122,13 +124,14 @@ fn client_thread(
 			lat_max = elapsed;
 		}
 
-		assert_eq!(len_sum, num as usize + 4);
+		assert_eq!(len_sum, num as usize + 5);
 		assert_eq!(Cursor::new(&buf2[0..4]).read_u32::<LittleEndian>()?, num);
+		assert_eq!(buf2[4], offt as u8);
 		for i in 0..num {
-			if buf2[i as usize + 4] != (i % 128) as u8 {
+			if buf2[i as usize + 5] != ((i + offt) % 128) as u8 {
 				log!("assertion at {} fails", i);
 			}
-			assert_eq!(buf2[i as usize + 4], (i % 128) as u8);
+			assert_eq!(buf2[i as usize + 5], ((i + offt) % 128) as u8);
 		}
 		// clear buf2
 		for i in 0..len_sum {
@@ -247,9 +250,9 @@ fn real_main() -> Result<(), Error> {
 		let buffers: Arc<Mutex<HashMap<u128, Buffer>>> = Arc::new(Mutex::new(HashMap::new()));
 		let buffers_clone = buffers.clone();
 		let buffers_clone2 = buffers.clone();
-		eh.set_on_read(move |connection_id, _message_id, buf, len| {
+		eh.set_on_read(move |buf, len, wh| {
 			let mut buffers = buffers_clone2.lock().unwrap();
-			let held_buf = &mut buffers.get_mut(&connection_id);
+			let held_buf = &mut buffers.get_mut(&wh.connection_id);
 			match held_buf {
 				Some(held_buf) => {
 					copy(
@@ -257,40 +260,48 @@ fn real_main() -> Result<(), Error> {
 						&mut held_buf.data[held_buf.len..held_buf.len + len],
 					);
 					held_buf.len += len;
-					if held_buf.len < 4 {
+					if held_buf.len < 5 {
 						// not enough data
-						Ok((buf.to_vec(), 0, 0, false))
+						Ok(())
 					} else {
 						let exp_len =
 							Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
-						if exp_len + 4 == held_buf.len as u32 {
+						let offt = held_buf.data[4] as u32;
+						if exp_len + 5 == held_buf.len as u32 {
 							let ret_len = held_buf.len;
 							held_buf.len = 0;
 
 							// do assertion for our test
-							for i in 0..ret_len - 4 {
-								if held_buf.data[i as usize + 4] != (i % 128) as u8 {
-									log!("invalid data at index = {}", i + 4);
+							for i in 0..ret_len - 5 {
+								if held_buf.data[i as usize + 5]
+									!= ((i + offt as usize) % 128) as u8
+								{
+									log!("invalid data at index = {}", i + 5);
 								}
-								assert_eq!(held_buf.data[i as usize + 4], (i % 128) as u8);
+								assert_eq!(
+									held_buf.data[i as usize + 5],
+									((i + offt as usize) % 128) as u8
+								);
 							}
 
 							// special case, we disconnect at this len for testing.
 							// client is aware and should do an assertion on disconnect.
-							Ok((held_buf.data.to_vec(), 0, ret_len, exp_len == 99990))
+							wh.write(&held_buf.data.to_vec(), 0, ret_len, exp_len == 99990)?;
+							Ok(())
 						} else {
-							Ok((buf.to_vec(), 0, 0, false))
+							Ok(())
 						}
 					}
 				}
 				None => {
-					log!("unexpected none: {}, len = {}", connection_id, len);
-					Ok((buf.to_vec(), 0, len, false))
+					log!("unexpected none: {}, len = {}", wh.connection_id, len);
+					Ok(())
 				}
 			}
 		})?;
-		eh.set_on_client_read(move |_connection_id, _message_id, buf, len| {
-			Ok((buf.to_vec(), 0, len, false))
+		eh.set_on_client_read(move |buf, len, wh| {
+			wh.write(&buf.to_vec(), 0, len, false)?;
+			Ok(())
 		})?;
 		eh.set_on_accept(move |connection_id| {
 			let mut buffers = buffers.lock().unwrap();
@@ -305,11 +316,6 @@ fn real_main() -> Result<(), Error> {
 			log!("close {}", connection_id);
 			let mut buffers = buffers_clone.lock().unwrap();
 			buffers.remove(&connection_id);
-			Ok(())
-		})?;
-		eh.set_on_write_success(move |_connection_id, _message_id| Ok(()))?;
-		eh.set_on_write_fail(move |connection_id, message_id| {
-			log!("message fail for cid={},mid={}", connection_id, message_id);
 			Ok(())
 		})?;
 		eh.start()?;

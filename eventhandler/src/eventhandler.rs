@@ -37,11 +37,8 @@ use nix::unistd::close;
 use nix::unistd::pipe;
 use nix::unistd::read;
 use nix::unistd::write;
-use rand::thread_rng;
-use rand::Rng;
 use std::collections::HashMap;
 use std::collections::LinkedList;
-use std::convert::TryInto;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
@@ -54,6 +51,96 @@ use std::time::Duration;
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
 const MAX_EVENTS_KQUEUE: i32 = 100;
+
+#[derive(Clone)]
+pub struct WriteHandle {
+	fd: i32,
+	guarded_data: Arc<Mutex<GuardedData>>,
+	pub connection_id: u128,
+}
+
+impl WriteHandle {
+	pub fn new(fd: i32, guarded_data: Arc<Mutex<GuardedData>>, connection_id: u128) -> Self {
+		WriteHandle {
+			fd,
+			guarded_data,
+			connection_id,
+		}
+	}
+
+	pub fn write(&self, data: &[u8], offset: usize, len: usize, close: bool) -> Result<(), Error> {
+		if len + offset > data.len() {
+			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
+				"offset+len='{}',data.len='{}'",
+				offset + len,
+				data.len()
+			))
+			.into());
+		}
+
+		// update GuardedData with our write_buffers, notification message, and wakeup
+		let id_idx = self.fd as uintptr_t;
+		let (fd, wakeup_scheduled) = {
+			let mut guarded_data = self.guarded_data.lock().map_err(|e| {
+				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+				error
+			})?;
+
+			let mut rem = len;
+			let mut count = 0;
+			loop {
+				let len = match rem <= BUFFER_SIZE {
+					true => rem,
+					false => BUFFER_SIZE,
+				} as u16;
+				let mut write_buffer = WriteBuffer {
+					offset: 0,
+					len,
+					buffer: [0u8; BUFFER_SIZE],
+					close: match rem <= BUFFER_SIZE {
+						true => close,
+						false => false,
+					},
+					connection_seqno: self.connection_id,
+				};
+
+				let start = offset + count * BUFFER_SIZE;
+				let end = offset + count * BUFFER_SIZE + (len as usize);
+				write_buffer.buffer[0..(len as usize)].copy_from_slice(&data[start..end]);
+
+				let cur_len = guarded_data.write_buffers.len();
+				if guarded_data.write_buffers.len() <= id_idx {
+					for _ in cur_len..(id_idx + 1) {
+						guarded_data.write_buffers.push(LinkedList::new());
+					}
+				}
+				guarded_data.write_buffers[id_idx].push_back(write_buffer);
+				if rem <= BUFFER_SIZE {
+					break;
+				}
+				rem -= BUFFER_SIZE;
+				count += 1;
+			}
+
+			guarded_data.write_pending.push(self.fd.into());
+			Self::do_wakeup_with_lock(&mut *guarded_data)?
+		};
+
+		if !wakeup_scheduled {
+			write(fd, &[0u8; 1])?;
+		}
+
+		Ok(())
+	}
+
+	fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(RawFd, bool), Error> {
+		let wakeup_scheduled = data.wakeup_scheduled;
+		if !wakeup_scheduled {
+			data.wakeup_scheduled = true;
+		}
+		Ok((data.wakeup_fd, wakeup_scheduled))
+	}
+}
 
 #[derive(Debug, Clone)]
 struct RawFdAction {
@@ -94,71 +181,54 @@ enum FdType {
 	Unknown,
 }
 
-struct WriteBuffer<I, J> {
+struct WriteBuffer {
 	offset: u16,
 	len: u16,
 	buffer: [u8; BUFFER_SIZE],
-	msg_id: u128,
-	on_write_success: Option<I>,
-	on_write_fail: Option<J>,
 	close: bool,
 	connection_seqno: u128,
 }
 
-struct Callbacks<F, G, H, I, J, K> {
+struct Callbacks<F, G, H, K> {
 	on_read: Option<Pin<Box<F>>>,
 	on_accept: Option<Pin<Box<G>>>,
 	on_close: Option<Pin<Box<H>>>,
-	on_write_success: Option<Pin<Box<I>>>,
-	on_write_fail: Option<Pin<Box<J>>>,
 	on_client_read: Option<Pin<Box<K>>>,
 }
 
-struct GuardedData<F, G, H, I, J, K> {
+pub struct GuardedData {
 	fd_actions: Vec<RawFdAction>,
 	wakeup_fd: RawFd,
 	wakeup_rx: RawFd,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
-	write_buffers: Vec<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>,
+	write_buffers: Vec<LinkedList<WriteBuffer>>,
 	selector: Option<RawFd>,
-	callbacks: Callbacks<F, G, H, I, J, K>,
 	seqno_map: HashMap<u128, RawFd>,
 }
 
-pub struct EventHandler<F, G, H, I, J, K> {
-	data: Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+pub struct EventHandler<F, G, H, K> {
+	data: Arc<Mutex<GuardedData>>,
+	callbacks: Arc<Mutex<Callbacks<F, G, H, K>>>,
 }
 
-impl<F, G, H, I, J, K> EventHandler<F, G, H, I, J, K>
+impl<F, G, H, K> EventHandler<F, G, H, K>
 where
-	F: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize, bool), Error>
-		+ Send
-		+ 'static
-		+ Clone
-		+ Sync
-		+ Unpin,
+	F: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 	G: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
-	I: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
-	J: Fn(u128, u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
-	K: Fn(u128, u128, &[u8], usize) -> Result<(Vec<u8>, usize, usize, bool), Error>
-		+ Send
-		+ 'static
-		+ Clone
-		+ Sync
-		+ Unpin,
+	K: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 {
 	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<i32, Error> {
 		// make sure we have a client on_read handler configured
 		{
-			let data = self.data.lock().map_err(|e| {
+			let callbacks = self.callbacks.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 				error
 			})?;
 
-			match data.callbacks.on_read {
+			match callbacks.on_read {
 				Some(_) => {}
 				None => {
 					return Err(ErrorKind::SetupError(
@@ -217,12 +287,12 @@ where
 	}
 
 	fn ensure_handlers(&self) -> Result<(), Error> {
-		let data = self.data.lock().map_err(|e| {
+		let callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
 
-		match data.callbacks.on_read {
+		match callbacks.on_read {
 			Some(_) => {}
 			None => {
 				return Err(ErrorKind::SetupError(
@@ -232,7 +302,7 @@ where
 			}
 		}
 
-		match data.callbacks.on_accept {
+		match callbacks.on_accept {
 			Some(_) => {}
 			None => {
 				return Err(ErrorKind::SetupError(
@@ -242,7 +312,7 @@ where
 			}
 		}
 
-		match data.callbacks.on_close {
+		match callbacks.on_close {
 			Some(_) => {}
 			None => {
 				return Err(ErrorKind::SetupError(
@@ -252,32 +322,10 @@ where
 			}
 		}
 
-		match data.callbacks.on_write_fail {
-			Some(_) => {}
-			None => {
-				return Err(ErrorKind::SetupError(
-					"on_write_fail callback must be registered first".to_string(),
-				)
-				.into());
-			}
-		}
-
-		match data.callbacks.on_write_success {
-			Some(_) => {}
-			None => {
-				return Err(ErrorKind::SetupError(
-					"on_write_success callback must be registered first".to_string(),
-				)
-				.into());
-			}
-		}
-
 		Ok(())
 	}
 
-	fn do_wakeup_with_lock(
-		data: &mut GuardedData<F, G, H, I, J, K>,
-	) -> Result<(RawFd, bool), Error> {
+	fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(RawFd, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
 		if !wakeup_scheduled {
 			data.wakeup_scheduled = true;
@@ -285,7 +333,7 @@ where
 		Ok((data.wakeup_fd, wakeup_scheduled))
 	}
 
-	fn do_wakeup(data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>) -> Result<(), Error> {
+	fn do_wakeup(data: &Arc<Mutex<GuardedData>>) -> Result<(), Error> {
 		let mut data = data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
@@ -316,153 +364,46 @@ where
 		Ok(())
 	}
 
-	fn write(
-		id: i32,
-		data: &[u8],
-		offset: usize,
-		len: usize,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		msg_id: u128,
-		on_write_success: Pin<Box<I>>,
-		on_write_fail: Pin<Box<J>>,
-		close: bool,
-		connection_seqno: u128,
-	) -> Result<(), Error> {
-		if len + offset > data.len() {
-			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
-				"offset+len='{}',data.len='{}'",
-				offset + len,
-				data.len()
-			))
-			.into());
-		}
-
-		// update GuardedData with our write_buffers, notification message, and wakeup
-		let id_idx = id as uintptr_t;
-		let (fd, wakeup_scheduled) = {
-			let mut guarded_data = guarded_data.lock().map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?;
-
-			let mut rem = len;
-			let mut count = 0;
-			loop {
-				let len = match rem <= BUFFER_SIZE {
-					true => rem,
-					false => BUFFER_SIZE,
-				} as u16;
-				let mut write_buffer = WriteBuffer {
-					offset: 0,
-					len,
-					buffer: [0u8; BUFFER_SIZE],
-					msg_id,
-					on_write_success: match rem <= BUFFER_SIZE {
-						true => Some(on_write_success.clone()),
-						false => None,
-					},
-					on_write_fail: match rem <= BUFFER_SIZE {
-						true => Some(on_write_fail.clone()),
-						false => None,
-					},
-					close: match rem <= BUFFER_SIZE {
-						true => close,
-						false => false,
-					},
-					connection_seqno,
-				};
-
-				let start = offset + count * BUFFER_SIZE;
-				let end = offset + count * BUFFER_SIZE + (len as usize);
-				write_buffer.buffer[0..(len as usize)].copy_from_slice(&data[start..end]);
-
-				let cur_len = guarded_data.write_buffers.len();
-				if guarded_data.write_buffers.len() <= id_idx {
-					for _ in cur_len..(id_idx + 1) {
-						guarded_data.write_buffers.push(LinkedList::new());
-					}
-				}
-				guarded_data.write_buffers[id_idx].push_back(write_buffer);
-				if rem <= BUFFER_SIZE {
-					break;
-				}
-				rem -= BUFFER_SIZE;
-				count += 1;
-			}
-
-			guarded_data.write_pending.push(id.into());
-			Self::do_wakeup_with_lock(&mut *guarded_data)?
-		};
-
-		if !wakeup_scheduled {
-			write(fd, &[0u8; 1])?;
-		}
-
-		Ok(())
-	}
-
 	pub fn set_on_read(&mut self, on_read: F) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
+		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
 
-		guarded_data.callbacks.on_read = Some(Box::pin(on_read));
+		callbacks.on_read = Some(Box::pin(on_read));
 
 		Ok(())
 	}
 
 	pub fn set_on_accept(&mut self, on_accept: G) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
+		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
 
-		guarded_data.callbacks.on_accept = Some(Box::pin(on_accept));
+		callbacks.on_accept = Some(Box::pin(on_accept));
 
 		Ok(())
 	}
 
 	pub fn set_on_close(&mut self, on_close: H) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
+		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
 
-		guarded_data.callbacks.on_close = Some(Box::pin(on_close));
-
-		Ok(())
-	}
-
-	pub fn set_on_write_success(&mut self, on_write_success: I) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
-		guarded_data.callbacks.on_write_success = Some(Box::pin(on_write_success));
-
-		Ok(())
-	}
-
-	pub fn set_on_write_fail(&mut self, on_write_fail: J) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
-		guarded_data.callbacks.on_write_fail = Some(Box::pin(on_write_fail));
+		callbacks.on_close = Some(Box::pin(on_close));
 
 		Ok(())
 	}
 
 	pub fn set_on_client_read(&mut self, on_client_read: K) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
+		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
 
-		guarded_data.callbacks.on_client_read = Some(Box::pin(on_client_read));
+		callbacks.on_client_read = Some(Box::pin(on_client_read));
 
 		Ok(())
 	}
@@ -475,10 +416,9 @@ where
 			on_read: None,
 			on_accept: None,
 			on_close: None,
-			on_write_success: None,
-			on_write_fail: None,
 			on_client_read: None,
 		};
+		let callbacks = Arc::new(Mutex::new(callbacks));
 
 		let guarded_data = GuardedData {
 			fd_actions: vec![],
@@ -489,12 +429,14 @@ where
 			write_pending: vec![],
 			write_buffers: vec![LinkedList::new()],
 			selector: None,
-			callbacks,
 			seqno_map: HashMap::new(),
 		};
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
 
-		EventHandler { data: guarded_data }
+		EventHandler {
+			data: guarded_data,
+			callbacks,
+		}
 	}
 
 	#[cfg(target_os = "linux")]
@@ -525,10 +467,12 @@ where
 		let mut write_buffers = vec![Arc::new(Mutex::new(LinkedList::new()))];
 		let mut read_locks = vec![Arc::new(Mutex::new(0u128))];
 		let cloned_guarded_data = self.data.clone();
+		let cloned_callbacks = self.callbacks.clone();
 
 		spawn(move || {
 			let res = Self::poll_loop(
 				&cloned_guarded_data,
+				&cloned_callbacks,
 				&mut write_buffers,
 				&mut read_locks,
 				selector,
@@ -553,8 +497,8 @@ where
 		kevs: &mut Vec<kevent>,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 		on_close: Pin<Box<H>>,
 		thread_pool: &StaticThreadPool,
 	) -> Result<(), Error> {
@@ -671,8 +615,8 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
 		read_locks: &mut Vec<Arc<Mutex<u128>>>,
 		pollfd: RawFd,
 	) -> Result<(), Error> {
@@ -681,8 +625,9 @@ where
 
 	#[cfg(any(unix, macos, dragonfly, freebsd, netbsd, openbsd))]
 	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
+		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
 		read_locks: &mut Vec<Arc<Mutex<u128>>>,
 		queue: RawFd,
 	) -> Result<(), Error> {
@@ -761,8 +706,6 @@ where
 			let on_read;
 			let on_accept;
 			let on_close;
-			let on_write_success;
-			let on_write_fail;
 			let on_client_read;
 			{
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
@@ -773,31 +716,20 @@ where
 				to_process = guarded_data.fd_actions.clone();
 				handler_events = guarded_data.handler_events.clone();
 				write_pending = guarded_data.write_pending.clone();
-				on_read = guarded_data.callbacks.on_read.as_ref().unwrap().clone();
-				on_accept = guarded_data.callbacks.on_accept.as_ref().unwrap().clone();
-				on_close = guarded_data.callbacks.on_close.as_ref().unwrap().clone();
-				on_write_success = guarded_data
-					.callbacks
-					.on_write_success
-					.as_ref()
-					.unwrap()
-					.clone();
-				on_write_fail = guarded_data
-					.callbacks
-					.on_write_fail
-					.as_ref()
-					.unwrap()
-					.clone();
-				on_client_read = guarded_data
-					.callbacks
-					.on_client_read
-					.as_ref()
-					.unwrap()
-					.clone();
-
 				guarded_data.fd_actions.clear();
 				guarded_data.handler_events.clear();
 				guarded_data.write_pending.clear();
+			}
+			{
+				let callbacks = callbacks.lock().map_err(|e| {
+					let error: Error =
+						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+					error
+				})?;
+				on_read = callbacks.on_read.as_ref().unwrap().clone();
+				on_accept = callbacks.on_accept.as_ref().unwrap().clone();
+				on_close = callbacks.on_close.as_ref().unwrap().clone();
+				on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
 			}
 
 			let mut kevs: Vec<kevent> = Vec::new();
@@ -978,8 +910,6 @@ where
 						guarded_data,
 						on_read.clone(),
 						on_accept.clone(),
-						on_write_success.clone(),
-						on_write_fail.clone(),
 						on_client_read.clone(),
 						use_on_client_read[kev.ident as usize],
 						read_locks,
@@ -1006,8 +936,8 @@ where
 
 	fn process_write_buffers(
 		fds: Vec<RawFd>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
 	) -> Result<(), Error> {
 		for fd in fds {
 			let cur_len = write_buffers.len();
@@ -1039,8 +969,8 @@ where
 
 	fn write_loop(
 		fd: RawFd,
-		write_buffer: &mut WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		write_buffer: &mut WriteBuffer,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<u16, Error> {
 		let initial_len = write_buffer.len;
 		loop {
@@ -1137,8 +1067,8 @@ where
 
 	fn write_until_block(
 		fd: RawFd,
-		linked_list: &mut LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		linked_list: &mut LinkedList<WriteBuffer>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<(), Error> {
 		loop {
 			match (*linked_list).front_mut() {
@@ -1148,22 +1078,6 @@ where
 					match ret {
 						Ok(len) => {
 							if len == total_len {
-								// check if there's a write success
-								// handler and call it if so
-								match &front.on_write_success {
-									Some(h) => {
-										let hres = (h)(fd.try_into().unwrap_or(0), front.msg_id);
-										match hres {
-											Ok(_) => {}
-											Err(e) => log!(
-												"on_write_success callback resulted in: {}",
-												e.to_string()
-											),
-										}
-									}
-									None => {}
-								}
-
 								if front.close {
 									Self::push_handler_event(
 										fd,
@@ -1192,19 +1106,6 @@ where
 								front.connection_seqno,
 							)?;
 							let _ = close(fd);
-							match &front.on_write_fail {
-								Some(h) => {
-									let hres = (h)(fd.try_into().unwrap_or(0), front.msg_id);
-									match hres {
-										Ok(_) => {}
-										Err(e) => log!(
-											"on_write_fail callback resulted in: {}",
-											e.to_string()
-										),
-									}
-								}
-								None => {}
-							}
 
 							break;
 						}
@@ -1222,8 +1123,8 @@ where
 	fn process_event_write(
 		fd: RawFd,
 		thread_pool: &StaticThreadPool,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<(), Error> {
 		let write_buffer_clone = write_buffers[fd as usize].clone();
 		let guarded_data = guarded_data.clone();
@@ -1260,15 +1161,13 @@ where
 		fd: RawFd,
 		read_fd_type: &Vec<FdType>,
 		thread_pool: &StaticThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 		on_read: Pin<Box<F>>,
 		on_accept: Pin<Box<G>>,
-		on_write_success: Pin<Box<I>>,
-		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
 		read_locks: &mut Vec<Arc<Mutex<u128>>>,
-		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer<Pin<Box<I>>, Pin<Box<J>>>>>>>,
+		write_buffers: &mut Vec<Arc<Mutex<LinkedList<WriteBuffer>>>>,
 		seqno: u128,
 		accept_read_lock: &Arc<RwLock<bool>>,
 	) -> Result<(), Error> {
@@ -1393,8 +1292,6 @@ where
 										buf,
 										&guarded_data,
 										on_read.clone(),
-										on_write_success.clone(),
-										on_write_fail.clone(),
 										on_client_read.clone(),
 										use_on_client_read,
 										*seqno,
@@ -1442,39 +1339,23 @@ where
 		fd: RawFd,
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 		on_read: Pin<Box<F>>,
-		on_write_success: Pin<Box<I>>,
-		on_write_fail: Pin<Box<J>>,
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
 		connection_seqno: u128,
 	) -> Result<(), Error> {
 		if len > 0 {
-			let msg_id: u128 = thread_rng().gen::<u128>();
+			// build write handle
+			let wh = WriteHandle::new(fd, guarded_data.clone(), connection_seqno);
+
 			let result = match use_on_client_read {
-				//let (resp, offset, len) = match use_on_client_read {
-				true => (on_client_read)(connection_seqno, msg_id, &buf, len),
-				false => (on_read)(connection_seqno, msg_id, &buf, len),
+				true => (on_client_read)(&buf, len, wh),
+				false => (on_read)(&buf, len, wh),
 			};
 
 			match result {
-				Ok((resp, offset, len, close)) => {
-					if len > 0 {
-						Self::write(
-							fd,
-							&resp,
-							offset,
-							len,
-							guarded_data,
-							msg_id,
-							on_write_success,
-							on_write_fail,
-							close,
-							connection_seqno,
-						)?;
-					}
-				}
+				Ok(_) => {}
 				Err(e) => {
 					log!("Client callback resulted in error: {}", e.to_string());
 				}
@@ -1496,7 +1377,7 @@ where
 	fn process_read_err(
 		fd: RawFd,
 		error: Errno,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 		connection_seqno: u128,
 	) -> Result<(), Error> {
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
@@ -1523,7 +1404,7 @@ where
 	fn process_accept_result(
 		_acceptor: RawFd,
 		nfd: RawFd,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<(), Error> {
 		Self::push_handler_event(nfd, HandlerEventType::Accept, guarded_data, false, 0).map_err(
 			|e| {
@@ -1546,7 +1427,7 @@ where
 	fn push_handler_event(
 		fd: RawFd,
 		event_type: HandlerEventType,
-		guarded_data: &Arc<Mutex<GuardedData<F, G, H, I, J, K>>>,
+		guarded_data: &Arc<Mutex<GuardedData>>,
 		wakeup: bool,
 		seqno: u128,
 	) -> Result<(), Error> {
@@ -1598,8 +1479,6 @@ fn test_echo() -> Result<(), Error> {
 
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
-	eh.set_on_write_success(|_, _| Ok(()))?;
-	eh.set_on_write_fail(|_, _| Ok(()))?;
 	eh.set_on_client_read(move |_connection_id, _message_id, buf: &[u8], len| {
 		assert_eq!(len, 5);
 		assert_eq!(buf[0], 1);
