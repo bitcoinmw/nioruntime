@@ -214,6 +214,7 @@ fn real_main() -> Result<(), Error> {
 				let id = i.clone();
 				let tlat_sum = tlat_sum.clone();
 				let tlat_max = tlat_max.clone();
+				std::thread::sleep(std::time::Duration::from_millis(10));
 				jhs.push(std::thread::spawn(move || {
 					let res =
 						client_thread(count, id, tlat_sum.clone(), tlat_max.clone(), min, max);
