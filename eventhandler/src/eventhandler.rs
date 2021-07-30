@@ -1632,7 +1632,7 @@ fn test_echo() -> Result<(), Error> {
 
 	eh.add_tcp_listener(&listener)?;
 	eh.add_tcp_stream(&stream)?;
-
+	std::thread::sleep(std::time::Duration::from_millis(1000));
 	stream.write(&[1, 2, 3, 4, 5])?;
 	// wait long enough to make sure the client got the message
 	std::thread::sleep(std::time::Duration::from_millis(100));
