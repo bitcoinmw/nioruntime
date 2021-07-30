@@ -239,8 +239,9 @@ fn real_main() -> Result<(), Error> {
 		log!("Test complete in {} ms", elapsed_millis);
 		let tlat = tlat_sum.lock().unwrap();
 		let avg_lat = (*tlat) / (1_000_000 * count * threads * itt) as f64;
-		let qps_simple = (1000.0 / avg_lat) * threads as f64;
-		log!("QPS={}", qps_simple);
+		//let qps_simple = (1000.0 / avg_lat) * threads as f64;
+		let qps = (threads * count * itt * 1000) as f64 / elapsed_millis as f64;
+		log!("QPS={}", qps);
 		log!("Average latency={}ms", avg_lat,);
 		log!("Max latency={}ms", (*lat_max) as f64 / (1_000_000 as f64));
 	} else {
