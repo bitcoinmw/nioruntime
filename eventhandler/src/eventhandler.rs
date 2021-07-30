@@ -22,7 +22,9 @@ use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 
 // linux deps
 #[cfg(target_os = "linux")]
-use nix::sys::epoll::{epoll_create1, EpollCreateFlags};
+use nix::sys::epoll::{
+	epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
+};
 
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
@@ -39,6 +41,7 @@ use nix::unistd::pipe;
 use nix::unistd::read;
 use nix::unistd::write;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::LinkedList;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -50,10 +53,9 @@ use std::thread::spawn;
 
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
-#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
-const MAX_EVENTS_KQUEUE: i32 = 100;
+const MAX_EVENTS: i32 = 100;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum GenericEventType {
 	AddReadET,
 	AddReadLT,
@@ -62,6 +64,7 @@ enum GenericEventType {
 	DelWrite,
 }
 
+#[derive(Debug)]
 struct GenericEvent {
 	fd: RawFd,
 	etype: GenericEventType,
@@ -658,13 +661,105 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		_epollfd: RawFd,
+		epollfd: RawFd,
 		input_events: Vec<GenericEvent>,
-		_output: &mut Vec<GenericEvent>,
+		output_events: &mut Vec<GenericEvent>,
+		filter_set: &mut HashSet<RawFd>,
 	) -> Result<i32, Error> {
-		for input in input_events {}
+		if input_events.len() > 0 {
+			log!("get_events called with {:?}", input_events);
+		}
+		for evt in input_events {
+			let mut interest = EpollFlags::empty();
+			let op;
 
-		Ok(0)
+			if evt.etype == GenericEventType::AddReadET || evt.etype == GenericEventType::AddReadLT
+			{
+				let fd = evt.fd;
+				interest |= EpollFlags::EPOLLIN;
+				interest |= EpollFlags::EPOLLET;
+				interest |= EpollFlags::EPOLLRDHUP;
+
+				let op = if filter_set.remove(&fd) {
+					EpollOp::EpollCtlMod
+				} else {
+					EpollOp::EpollCtlAdd
+				};
+				filter_set.insert(fd);
+
+				let mut event = EpollEvent::new(interest, evt.fd as u64);
+				epoll_ctl(epollfd, op, evt.fd, &mut event)?;
+				log!(
+					"added event = {:?}, op={:?}, evt.etype={:?}",
+					event,
+					op,
+					evt.etype
+				);
+			} else if evt.etype == GenericEventType::AddWriteET {
+				let fd = evt.fd;
+				interest |= EpollFlags::EPOLLOUT;
+				interest |= EpollFlags::EPOLLIN;
+				interest |= EpollFlags::EPOLLRDHUP;
+				interest |= EpollFlags::EPOLLET;
+
+				let op = if filter_set.remove(&fd) {
+					EpollOp::EpollCtlMod
+				} else {
+					EpollOp::EpollCtlAdd
+				};
+				filter_set.insert(fd);
+
+				let mut event = EpollEvent::new(interest, evt.fd as u64);
+				epoll_ctl(epollfd, op, evt.fd, &mut event)?;
+				log!(
+					"added event = {:?}, op={:?}, evt.etype={:?}",
+					event,
+					op,
+					evt.etype
+				);
+			} else if evt.etype == GenericEventType::DelRead {
+				interest |= EpollFlags::EPOLLIN;
+				op = EpollOp::EpollCtlDel;
+				filter_set.remove(&evt.fd);
+				log!("del read event op={:?}, evt.etype={:?}", op, evt.etype);
+			} else if evt.etype == GenericEventType::DelWrite {
+				interest |= EpollFlags::EPOLLOUT;
+				op = EpollOp::EpollCtlDel;
+				log!("del write event op={:?}, evt.etype={:?}", op, evt.etype);
+			} else {
+				return Err(
+					ErrorKind::InternalError(format!("unexpected etype: {:?}", evt.etype)).into(),
+				);
+			}
+		}
+
+		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
+		let mut events = [empty_event; MAX_EVENTS as usize];
+		let results = epoll_wait(epollfd, &mut events, 1000)?;
+
+		let mut ret_count_adjusted = 0;
+		if results > 0 {
+			for i in 0..results {
+				if !(events[i].events() & EpollFlags::EPOLLOUT).is_empty() {
+					ret_count_adjusted += 1;
+					output_events.push(GenericEvent::new(
+						events[i].data() as RawFd,
+						GenericEventType::AddWriteET,
+					));
+				}
+				if !(events[i].events() & EpollFlags::EPOLLIN).is_empty() {
+					ret_count_adjusted += 1;
+					output_events.push(GenericEvent::new(
+						events[i].data() as RawFd,
+						GenericEventType::AddReadET,
+					));
+				}
+			}
+
+			log!("results of epoll = {:?}", output_events);
+		}
+
+		Ok(ret_count_adjusted)
 	}
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
@@ -672,6 +767,7 @@ where
 		queue: RawFd,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
+		_filter_set: &HashSet<RawFd>,
 	) -> Result<i32, Error> {
 		let mut kevs = vec![];
 		for ev in input_events {
@@ -679,7 +775,7 @@ where
 		}
 
 		let mut ret_kevs = vec![];
-		for _ in 0..MAX_EVENTS_KQUEUE {
+		for _ in 0..MAX_EVENTS {
 			ret_kevs.push(kevent::new(
 				0,
 				EventFilter::EVFILT_SYSCOUNT,
@@ -694,7 +790,7 @@ where
 				kevs.as_ptr(),
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
-				MAX_EVENTS_KQUEUE,
+				MAX_EVENTS,
 				&duration_to_timespec(std::time::Duration::from_millis(1)),
 			)
 		};
@@ -707,14 +803,15 @@ where
 		for i in 0..ret_count {
 			let kev = ret_kevs[i as usize];
 			if !kev.flags.contains(EventFlag::EV_DELETE) {
-				ret_count_adjusted += 1;
 				if kev.filter == EVFILT_WRITE {
+					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
 						kev.ident as RawFd,
 						GenericEventType::AddWriteET,
 					));
 				}
 				if kev.filter == EVFILT_READ {
+					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
 						kev.ident as RawFd,
 						GenericEventType::AddReadET,
@@ -771,8 +868,9 @@ where
 		// add the wakeup pipe rx here
 		let mut output_events = vec![];
 		let mut input_events = vec![];
+		let mut filter_set = HashSet::new();
 		input_events.push(GenericEvent::new(rx, GenericEventType::AddReadLT));
-		Self::get_events(selector, input_events, &mut output_events)?;
+		Self::get_events(selector, input_events, &mut output_events, &mut filter_set)?;
 
 		let mut ret_count;
 		loop {
@@ -886,7 +984,7 @@ where
 			)?;
 
 			let mut output_events = vec![];
-			ret_count = Self::get_events(selector, evs, &mut output_events)?;
+			ret_count = Self::get_events(selector, evs, &mut output_events, &mut filter_set)?;
 
 			// if no events are returned (on timeout), just bypass following logic and wait
 			if ret_count == 0 {
@@ -1409,9 +1507,8 @@ where
 		// don't close if it's an EAGAIN or one of the other non-terminal errors
 		match error {
 			Errno::EAGAIN => {
-				// we do nothing here.
-				// the edge triggered event will occur again and
-				// we'll read from the main loop
+				// no required action
+				// edge triggered event will automatically be re-enabled.
 			}
 			_ => {
 				Self::push_handler_event(
