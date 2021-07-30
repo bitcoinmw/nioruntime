@@ -666,12 +666,8 @@ where
 		output_events: &mut Vec<GenericEvent>,
 		filter_set: &mut HashSet<RawFd>,
 	) -> Result<i32, Error> {
-		if input_events.len() > 0 {
-			log!("get_events called with {:?}", input_events);
-		}
 		for evt in input_events {
 			let mut interest = EpollFlags::empty();
-			let op;
 
 			if evt.etype == GenericEventType::AddReadLT {
 				let fd = evt.fd;
@@ -688,12 +684,7 @@ where
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
-					Ok(_) => log!(
-						"listener event = {:?}, op={:?}, evt.etype={:?}",
-						event,
-						op,
-						evt.etype
-					),
+					Ok(_) => {}
 					Err(e) => log!("Error epoll_ctl1: {}", e),
 				}
 			} else if evt.etype == GenericEventType::AddReadET {
@@ -712,12 +703,7 @@ where
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
-					Ok(_) => log!(
-						"added event = {:?}, op={:?}, evt.etype={:?}",
-						event,
-						op,
-						evt.etype
-					),
+					Ok(_) => {}
 					Err(e) => log!("Error epoll_ctl1: {}", e),
 				}
 			} else if evt.etype == GenericEventType::AddWriteET {
@@ -737,23 +723,14 @@ where
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
-					Ok(_) => log!(
-						"added event = {:?}, op={:?}, evt.etype={:?}",
-						event,
-						op,
-						evt.etype
-					),
+					Ok(_) => {}
 					Err(e) => log!("Error epoll_ctl2: {}", e),
 				}
 			} else if evt.etype == GenericEventType::DelRead {
 				interest |= EpollFlags::EPOLLIN;
-				op = EpollOp::EpollCtlDel;
 				filter_set.remove(&evt.fd);
-				log!("del read event op={:?}, evt.etype={:?}", op, evt.etype);
 			} else if evt.etype == GenericEventType::DelWrite {
 				interest |= EpollFlags::EPOLLOUT;
-				op = EpollOp::EpollCtlDel;
-				log!("del write event op={:?}, evt.etype={:?}", op, evt.etype);
 			} else {
 				return Err(
 					ErrorKind::InternalError(format!("unexpected etype: {:?}", evt.etype)).into(),
@@ -763,7 +740,7 @@ where
 
 		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
 		let mut events = [empty_event; MAX_EVENTS as usize];
-		let results = epoll_wait(epollfd, &mut events, 100);
+		let results = epoll_wait(epollfd, &mut events, 1000);
 
 		let mut ret_count_adjusted = 0;
 
@@ -786,8 +763,6 @@ where
 							));
 						}
 					}
-
-					log!("results of epoll = {:?}", output_events);
 				}
 			}
 			Err(e) => {
