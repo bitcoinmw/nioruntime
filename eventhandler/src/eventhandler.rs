@@ -763,7 +763,7 @@ where
 
 		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
 		let mut events = [empty_event; MAX_EVENTS as usize];
-		let results = epoll_wait(epollfd, &mut events, 1000);
+		let results = epoll_wait(epollfd, &mut events, 100);
 
 		let mut ret_count_adjusted = 0;
 
