@@ -673,8 +673,30 @@ where
 			let mut interest = EpollFlags::empty();
 			let op;
 
-			if evt.etype == GenericEventType::AddReadET || evt.etype == GenericEventType::AddReadLT
-			{
+			if evt.etype == GenericEventType::AddReadLT {
+				let fd = evt.fd;
+				interest |= EpollFlags::EPOLLIN;
+				interest |= EpollFlags::EPOLLRDHUP;
+
+				let op = if filter_set.remove(&fd) {
+					EpollOp::EpollCtlMod
+				} else {
+					EpollOp::EpollCtlAdd
+				};
+				filter_set.insert(fd);
+
+				let mut event = EpollEvent::new(interest, evt.fd as u64);
+				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
+				match res {
+					Ok(_) => log!(
+						"listener event = {:?}, op={:?}, evt.etype={:?}",
+						event,
+						op,
+						evt.etype
+					),
+					Err(e) => log!("Error epoll_ctl1: {}", e),
+				}
+			} else if evt.etype == GenericEventType::AddReadET {
 				let fd = evt.fd;
 				interest |= EpollFlags::EPOLLIN;
 				interest |= EpollFlags::EPOLLET;
@@ -688,13 +710,16 @@ where
 				filter_set.insert(fd);
 
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
-				epoll_ctl(epollfd, op, evt.fd, &mut event)?;
-				log!(
-					"added event = {:?}, op={:?}, evt.etype={:?}",
-					event,
-					op,
-					evt.etype
-				);
+				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
+				match res {
+					Ok(_) => log!(
+						"added event = {:?}, op={:?}, evt.etype={:?}",
+						event,
+						op,
+						evt.etype
+					),
+					Err(e) => log!("Error epoll_ctl1: {}", e),
+				}
 			} else if evt.etype == GenericEventType::AddWriteET {
 				let fd = evt.fd;
 				interest |= EpollFlags::EPOLLOUT;
@@ -710,13 +735,16 @@ where
 				filter_set.insert(fd);
 
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
-				epoll_ctl(epollfd, op, evt.fd, &mut event)?;
-				log!(
-					"added event = {:?}, op={:?}, evt.etype={:?}",
-					event,
-					op,
-					evt.etype
-				);
+				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
+				match res {
+					Ok(_) => log!(
+						"added event = {:?}, op={:?}, evt.etype={:?}",
+						event,
+						op,
+						evt.etype
+					),
+					Err(e) => log!("Error epoll_ctl2: {}", e),
+				}
 			} else if evt.etype == GenericEventType::DelRead {
 				interest |= EpollFlags::EPOLLIN;
 				op = EpollOp::EpollCtlDel;
@@ -735,28 +763,36 @@ where
 
 		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
 		let mut events = [empty_event; MAX_EVENTS as usize];
-		let results = epoll_wait(epollfd, &mut events, 1000)?;
+		let results = epoll_wait(epollfd, &mut events, 1000);
 
 		let mut ret_count_adjusted = 0;
-		if results > 0 {
-			for i in 0..results {
-				if !(events[i].events() & EpollFlags::EPOLLOUT).is_empty() {
-					ret_count_adjusted += 1;
-					output_events.push(GenericEvent::new(
-						events[i].data() as RawFd,
-						GenericEventType::AddWriteET,
-					));
-				}
-				if !(events[i].events() & EpollFlags::EPOLLIN).is_empty() {
-					ret_count_adjusted += 1;
-					output_events.push(GenericEvent::new(
-						events[i].data() as RawFd,
-						GenericEventType::AddReadET,
-					));
+
+		match results {
+			Ok(results) => {
+				if results > 0 {
+					for i in 0..results {
+						if !(events[i].events() & EpollFlags::EPOLLOUT).is_empty() {
+							ret_count_adjusted += 1;
+							output_events.push(GenericEvent::new(
+								events[i].data() as RawFd,
+								GenericEventType::AddWriteET,
+							));
+						}
+						if !(events[i].events() & EpollFlags::EPOLLIN).is_empty() {
+							ret_count_adjusted += 1;
+							output_events.push(GenericEvent::new(
+								events[i].data() as RawFd,
+								GenericEventType::AddReadET,
+							));
+						}
+					}
+
+					log!("results of epoll = {:?}", output_events);
 				}
 			}
-
-			log!("results of epoll = {:?}", output_events);
+			Err(e) => {
+				log!("Error with epoll wait = {}", e.to_string());
+			}
 		}
 
 		Ok(ret_count_adjusted)
