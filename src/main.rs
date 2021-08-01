@@ -69,7 +69,12 @@ fn client_thread(
 ) -> Result<(), Error> {
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
-	let mut stream = TcpStream::connect("127.0.0.1:9999")?;
+	let (mut stream, fd) = {
+		let _lock = tlat_sum.lock();
+		let stream = TcpStream::connect("127.0.0.1:9999")?;
+		let fd = stream.as_raw_fd();
+		(stream, fd)
+	};
 	let buf = &mut [0u8; MAX_BUF];
 	let buf2 = &mut [0u8; MAX_BUF];
 	let start_itt = std::time::SystemTime::now();
@@ -94,14 +99,22 @@ fn client_thread(
 		match res {
 			Ok(_x) => {}
 			Err(e) => {
-				println!("Error: {}", e.to_string());
+				log!("Write Error: {}", e.to_string());
 				std::thread::sleep(std::time::Duration::from_millis(1));
 			}
 		}
 
 		let mut len_sum = 0;
 		loop {
-			let len = stream.read(&mut buf2[len_sum..])?;
+			let res = stream.read(&mut buf2[len_sum..]);
+			match res {
+				Ok(_) => {}
+				Err(ref e) => {
+					log!("Read Error: {}, fd = {}", e.to_string(), fd);
+					assert!(false);
+				}
+			}
+			let len = res.unwrap();
 			len_sum += len;
 			if len_sum == num as usize + 5 {
 				break;
@@ -139,7 +152,17 @@ fn client_thread(
 		}
 	}
 
-	close(stream.as_raw_fd())?;
+	{
+		let _lock = tlat_sum.lock();
+		let close_res = close(fd);
+		match close_res {
+			Ok(_) => {}
+			Err(e) => {
+				log!("error close {} (fd={})", e.to_string(), fd);
+			}
+		}
+		drop(stream);
+	}
 
 	{
 		let mut tlat_sum = tlat_sum.lock().unwrap();
@@ -214,13 +237,15 @@ fn real_main() -> Result<(), Error> {
 				let id = i.clone();
 				let tlat_sum = tlat_sum.clone();
 				let tlat_max = tlat_max.clone();
-				std::thread::sleep(std::time::Duration::from_millis(10));
 				jhs.push(std::thread::spawn(move || {
 					let res =
 						client_thread(count, id, tlat_sum.clone(), tlat_max.clone(), min, max);
 					match res {
 						Ok(_) => {}
-						Err(e) => println!("Error in client thread: {}", e.to_string()),
+						Err(e) => {
+							log!("Error in client thread: {}", e.to_string());
+							assert!(false);
+						}
 					}
 				}));
 			}
@@ -307,7 +332,6 @@ fn real_main() -> Result<(), Error> {
 		})?;
 		eh.set_on_accept(move |connection_id| {
 			let mut buffers = buffers.lock().unwrap();
-			log!("accept {}", connection_id);
 
 			buffers.insert(connection_id, Buffer::new());
 
@@ -315,7 +339,6 @@ fn real_main() -> Result<(), Error> {
 		})?;
 
 		eh.set_on_close(move |connection_id| {
-			log!("close {}", connection_id);
 			let mut buffers = buffers_clone.lock().unwrap();
 			buffers.remove(&connection_id);
 			Ok(())
