@@ -1030,7 +1030,7 @@ where
 				{
 					let res = Self::process_event_read(
 						event.fd as RawFd,
-						&read_fd_type,
+						&mut read_fd_type,
 						&thread_pool,
 						guarded_data,
 						on_read.clone(),
@@ -1273,7 +1273,7 @@ where
 
 	fn process_event_read(
 		fd: RawFd,
-		read_fd_type: &Vec<FdType>,
+		read_fd_type: &mut Vec<FdType>,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		on_read: Pin<Box<F>>,
@@ -1294,9 +1294,17 @@ where
 					Err(e) => log!("Unexpected error obtaining read lock, {}", e),
 				}
 				let res = accept(fd);
+
 				match res {
 					Ok(res) => {
-						if write_buffers.len() > res as usize {
+						let len = read_fd_type.len();
+						if res as usize >= len {
+							for _ in len..res as usize + 1 {
+								read_fd_type.push(FdType::Unknown);
+							}
+						}
+						let len = write_buffers.len();
+						if len > res as usize {
 							// if it's not, it will be allocated on write
 							// and there's nothing to delete here
 							match write_buffers[res as usize].lock() {
@@ -1309,6 +1317,12 @@ where
 										e.to_string(),
 									);
 								}
+							}
+						}
+
+						if res as usize >= len {
+							for _ in len..res as usize + 1 {
+								write_buffers.push(Arc::new(Mutex::new(LinkedList::new())));
 							}
 						}
 
