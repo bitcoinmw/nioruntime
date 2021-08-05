@@ -1701,3 +1701,45 @@ fn test_close() -> Result<(), Error> {
 
 	Ok(())
 }
+
+#[test]
+fn test_client() -> Result<(), Error> {
+	use std::io::Write;
+	use std::net::TcpListener;
+	use std::net::TcpStream;
+
+	let listener = TcpListener::bind("127.0.0.1:9982")?;
+	let mut stream = TcpStream::connect("127.0.0.1:9982")?;
+	let mut eh = EventHandler::new();
+
+	// echo
+	eh.set_on_read(|buf, len, wh| {
+		match len {
+			// just close the connection with no response
+			7 => {
+				let _ = wh.close();
+			}
+			// close if len == 5, otherwise keep open
+			_ => {
+				let _ = wh.write(buf, 0, len, len == 5);
+			}
+		}
+		Ok(())
+	})?;
+
+	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_close(|_| Ok(()))?;
+	eh.set_on_client_read(move |buf, len, _wh| {
+		log!("client_read={:?}", &buf[0..len]);
+		assert_eq!(&buf[0..len], [1, 2, 3, 4, 5, 6]);
+		Ok(())
+	})?;
+
+	eh.start()?;
+	eh.add_tcp_listener(&listener)?;
+	eh.add_tcp_stream(&stream)?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	stream.write(&[1, 2, 3, 4, 5, 6])?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	Ok(())
+}
