@@ -544,7 +544,7 @@ where
 		Ok(())
 	}
 
-	pub fn start_generic(&self, selector: RawFd) -> Result<(), Error> {
+	fn start_generic(&self, selector: RawFd) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -1714,8 +1714,8 @@ fn test_client() -> Result<(), Error> {
 	use std::net::TcpListener;
 	use std::net::TcpStream;
 
-	let listener = TcpListener::bind("127.0.0.1:9982")?;
-	let mut stream = TcpStream::connect("127.0.0.1:9982")?;
+	let listener = TcpListener::bind("127.0.0.1:9983")?;
+	let mut stream = TcpStream::connect("127.0.0.1:9983")?;
 	let mut eh = EventHandler::new();
 
 	// echo
