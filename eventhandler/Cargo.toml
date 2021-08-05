@@ -19,7 +19,6 @@ libc = "^0.2.17"
 rand = "0.8.4"
 futures = "0.3.0"
 
-nioruntime_libnio = { path = "../libnio" }
 nioruntime_util = { path = "../util" }
 log = { path = "../log" }
 

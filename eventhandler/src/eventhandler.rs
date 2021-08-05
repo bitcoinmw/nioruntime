@@ -30,7 +30,6 @@ use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use libc::uintptr_t;
 use log::*;
-use nioruntime_libnio::ActionType;
 use nix::errno::Errno;
 use nix::fcntl::fcntl;
 use nix::fcntl::OFlag;
@@ -53,6 +52,13 @@ use std::thread::spawn;
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
 const MAX_EVENTS: i32 = 100;
+
+#[derive(Debug, Clone)]
+pub enum ActionType {
+	AddStream,
+	AddListener,
+	Remove,
+}
 
 #[derive(Debug, PartialEq)]
 enum GenericEventType {

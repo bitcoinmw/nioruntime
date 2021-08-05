@@ -12,14 +12,14 @@ build = "src/build/build.rs"
 edition = "2018"
 
 [workspace]
-members = ["libnio", "log", "eventhandler", "util"]
+members = ["log", "eventhandler", "util"]
 
 [dependencies]
 
-log = { path = "./log" }
-nioruntime_util = { path = "./util" }
-nioruntime_evh = { path = "./eventhandler" }
-nioruntime_libnio = { path = "./libnio" }
+log             = { path = "./log"          }
+nioruntime_util = { path = "./util"         }
+nioruntime_evh  = { path = "./eventhandler" }
+
 nix = "0.22.0"
 rand = "0.8.4"
 byte-tools = "0.3.1"
