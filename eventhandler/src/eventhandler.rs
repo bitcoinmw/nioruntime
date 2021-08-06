@@ -851,7 +851,7 @@ where
 		output_events: &mut Vec<GenericEvent>,
 		filter_set: &mut HashSet<i32>,
 	) -> Result<i32, Error> {
-		Ok(())
+		Ok(0)
 	}
 
 	fn poll_loop(
