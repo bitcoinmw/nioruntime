@@ -26,25 +26,24 @@ use nix::sys::epoll::{
 	epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
 };
 
+// unix specific deps
+#[cfg(unix)]
+use nix::{
+	errno::Errno,
+	fcntl::{fcntl, OFlag, F_SETFL},
+	sys::socket::accept,
+	unistd::{close, pipe, read, write},
+};
+
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use libc::uintptr_t;
 use log::*;
-use nix::errno::Errno;
-use nix::fcntl::fcntl;
-use nix::fcntl::OFlag;
-use nix::fcntl::F_SETFL;
-use nix::sys::socket::accept;
-use nix::unistd::close;
-use nix::unistd::pipe;
-use nix::unistd::read;
-use nix::unistd::write;
 use std::collections::HashSet;
 use std::collections::LinkedList;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::spawn;
@@ -71,12 +70,12 @@ enum GenericEventType {
 
 #[derive(Debug)]
 struct GenericEvent {
-	fd: RawFd,
+	fd: i32,
 	etype: GenericEventType,
 }
 
 impl GenericEvent {
-	fn new(fd: RawFd, etype: GenericEventType) -> Self {
+	fn new(fd: i32, etype: GenericEventType) -> Self {
 		GenericEvent { fd, etype }
 	}
 
@@ -200,7 +199,7 @@ impl WriteHandle {
 		Ok(())
 	}
 
-	fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(RawFd, bool), Error> {
+	fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
 		let wakeup_scheduled = data.wakeup_scheduled;
 		if !wakeup_scheduled {
 			data.wakeup_scheduled = true;
@@ -210,14 +209,14 @@ impl WriteHandle {
 }
 
 #[derive(Debug, Clone)]
-struct RawFdAction {
-	fd: RawFd,
+struct FdAction {
+	fd: i32,
 	atype: ActionType,
 }
 
-impl RawFdAction {
-	fn new(fd: RawFd, atype: ActionType) -> RawFdAction {
-		RawFdAction { fd, atype }
+impl FdAction {
+	fn new(fd: i32, atype: ActionType) -> FdAction {
+		FdAction { fd, atype }
 	}
 }
 
@@ -230,12 +229,12 @@ enum HandlerEventType {
 #[derive(Clone, PartialEq, Debug)]
 struct HandlerEvent {
 	etype: HandlerEventType,
-	fd: RawFd,
+	fd: i32,
 	seqno: u128,
 }
 
 impl HandlerEvent {
-	fn new(fd: RawFd, etype: HandlerEventType, seqno: u128) -> Self {
+	fn new(fd: i32, etype: HandlerEventType, seqno: u128) -> Self {
 		HandlerEvent { fd, etype, seqno }
 	}
 }
@@ -273,7 +272,7 @@ enum State {
 
 #[derive(Debug)]
 pub struct StateInfo {
-	fd: RawFd,
+	fd: i32,
 	state: State,
 	seqno: u128,
 	write_buffer: LinkedList<WriteBuffer>,
@@ -291,7 +290,7 @@ impl Default for StateInfo {
 }
 
 impl StateInfo {
-	fn new(fd: RawFd, state: State, seqno: u128) -> Self {
+	fn new(fd: i32, state: State, seqno: u128) -> Self {
 		StateInfo {
 			fd,
 			state,
@@ -302,13 +301,13 @@ impl StateInfo {
 }
 
 pub struct GuardedData {
-	fd_actions: Vec<RawFdAction>,
-	wakeup_fd: RawFd,
-	wakeup_rx: RawFd,
+	fd_actions: Vec<FdAction>,
+	wakeup_fd: i32,
+	wakeup_rx: i32,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
-	write_pending: Vec<RawFd>,
-	selector: Option<RawFd>,
+	write_pending: Vec<i32>,
+	selector: Option<i32>,
 	stop: bool,
 }
 
@@ -375,7 +374,7 @@ where
 		Ok(ret)
 	}
 
-	fn add_fd(&mut self, fd: RawFd, atype: ActionType) -> Result<i32, Error> {
+	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<i32, Error> {
 		self.ensure_handlers()?;
 
 		let mut data = self.data.lock().map_err(|e| {
@@ -390,17 +389,17 @@ where
 		}
 
 		let fd_actions = &mut data.fd_actions;
-		fd_actions.push(RawFdAction::new(fd, atype));
+		fd_actions.push(FdAction::new(fd, atype));
 		Ok(fd.into())
 	}
 
-	fn _remove_fd(&mut self, fd: RawFd) -> Result<(), Error> {
+	fn _remove_fd(&mut self, fd: i32) -> Result<(), Error> {
 		let mut data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 			error
 		})?;
 		let fd_actions = &mut data.fd_actions;
-		fd_actions.push(RawFdAction::new(fd, ActionType::Remove));
+		fd_actions.push(FdAction::new(fd, ActionType::Remove));
 		Ok(())
 	}
 
@@ -557,7 +556,7 @@ where
 		Ok(())
 	}
 
-	fn start_generic(&self, selector: RawFd) -> Result<(), Error> {
+	fn start_generic(&self, selector: i32) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -590,7 +589,7 @@ where
 
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
-		write_pending: Vec<RawFd>,
+		write_pending: Vec<i32>,
 		evs: &mut Vec<GenericEvent>,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
@@ -672,10 +671,10 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		epollfd: RawFd,
+		epollfd: i32,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		filter_set: &mut HashSet<RawFd>,
+		filter_set: &mut HashSet<i32>,
 	) -> Result<i32, Error> {
 		for evt in input_events {
 			let mut interest = EpollFlags::empty();
@@ -762,14 +761,14 @@ where
 						if !(events[i].events() & EpollFlags::EPOLLOUT).is_empty() {
 							ret_count_adjusted += 1;
 							output_events.push(GenericEvent::new(
-								events[i].data() as RawFd,
+								events[i].data() as i32,
 								GenericEventType::AddWriteET,
 							));
 						}
 						if !(events[i].events() & EpollFlags::EPOLLIN).is_empty() {
 							ret_count_adjusted += 1;
 							output_events.push(GenericEvent::new(
-								events[i].data() as RawFd,
+								events[i].data() as i32,
 								GenericEventType::AddReadET,
 							));
 						}
@@ -786,10 +785,10 @@ where
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn get_events(
-		queue: RawFd,
+		queue: i32,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		_filter_set: &HashSet<RawFd>,
+		_filter_set: &HashSet<i32>,
 	) -> Result<i32, Error> {
 		let mut kevs = vec![];
 		for ev in input_events {
@@ -828,14 +827,14 @@ where
 				if kev.filter == EVFILT_WRITE {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						kev.ident as RawFd,
+						kev.ident as i32,
 						GenericEventType::AddWriteET,
 					));
 				}
 				if kev.filter == EVFILT_READ {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						kev.ident as RawFd,
+						kev.ident as i32,
 						GenericEventType::AddReadET,
 					));
 				}
@@ -849,7 +848,7 @@ where
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		selector: RawFd,
+		selector: i32,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(4)?;
@@ -1016,7 +1015,7 @@ where
 			for event in output_events {
 				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
-						event.fd as RawFd,
+						event.fd as i32,
 						&thread_pool,
 						guarded_data,
 						&global_lock,
@@ -1033,7 +1032,7 @@ where
 					|| event.etype == GenericEventType::AddReadLT
 				{
 					let res = Self::process_event_read(
-						event.fd as RawFd,
+						event.fd as i32,
 						&mut read_fd_type,
 						&thread_pool,
 						guarded_data,
@@ -1059,7 +1058,7 @@ where
 		Ok(())
 	}
 
-	fn write_loop(fd: RawFd, statefd: RawFd, write_buffer: &mut WriteBuffer) -> Result<u16, Error> {
+	fn write_loop(fd: i32, statefd: i32, write_buffer: &mut WriteBuffer) -> Result<u16, Error> {
 		let initial_len = write_buffer.len;
 		loop {
 			if statefd != fd {
@@ -1110,7 +1109,7 @@ where
 	}
 
 	fn do_close(
-		fd: RawFd,
+		fd: i32,
 		seqno: u128,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
@@ -1153,7 +1152,7 @@ where
 	}
 
 	fn write_until_block(
-		fd: RawFd,
+		fd: i32,
 		state_info: &mut StateInfo,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<(), Error> {
@@ -1213,7 +1212,7 @@ where
 	}
 
 	fn process_event_write(
-		fd: RawFd,
+		fd: i32,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		global_lock: &Arc<RwLock<bool>>,
@@ -1256,7 +1255,7 @@ where
 	}
 
 	fn process_event_read(
-		fd: RawFd,
+		fd: i32,
 		read_fd_type: &mut Vec<FdType>,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
@@ -1439,7 +1438,7 @@ where
 	}
 
 	fn process_read_result(
-		fd: RawFd,
+		fd: i32,
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
 		guarded_data: &Arc<Mutex<GuardedData>>,
@@ -1484,7 +1483,7 @@ where
 	}
 
 	fn process_read_err(
-		fd: RawFd,
+		fd: i32,
 		error: Errno,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
@@ -1511,8 +1510,8 @@ where
 	}
 
 	fn process_accept_result(
-		_acceptor: RawFd,
-		nfd: RawFd,
+		_acceptor: i32,
+		nfd: i32,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
@@ -1533,13 +1532,13 @@ where
 		Ok(())
 	}
 
-	fn process_accept_err(_acceptor: RawFd, error: Errno) -> Result<(), Error> {
+	fn process_accept_err(_acceptor: i32, error: Errno) -> Result<(), Error> {
 		log!("error on acceptor: {}", error);
 		Ok(())
 	}
 
 	fn push_handler_event_with_fd_lock(
-		fd: RawFd,
+		fd: i32,
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		state: &mut StateInfo,
@@ -1559,7 +1558,7 @@ where
 	}
 
 	fn push_handler_event(
-		fd: RawFd,
+		fd: i32,
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
@@ -1596,7 +1595,7 @@ where
 	}
 
 	fn generic_handler_complete(
-		fd: RawFd,
+		fd: i32,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		event_type: HandlerEventType,
 		seqno: u128,
