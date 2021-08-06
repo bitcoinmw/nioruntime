@@ -28,11 +28,15 @@ use nix::sys::epoll::{
 
 // unix specific deps
 #[cfg(unix)]
+use libc::fcntl;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 // windows specific deps
 #[cfg(target_os = "windows")]
 use std::os::windows::io::AsRawSocket;
+#[cfg(target_os = "windows")]
+use ws2_32::ioctlsocket;
 
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
@@ -41,7 +45,6 @@ use libc::accept;
 use libc::c_int;
 use libc::c_void;
 use libc::close;
-use libc::fcntl;
 use libc::pipe;
 use libc::read;
 use libc::uintptr_t;
@@ -570,6 +573,13 @@ where
 	pub fn start(&self) -> Result<(), Error> {
 		// create the kqueue
 		let selector = unsafe { kqueue() };
+		self.start_generic(selector)?;
+		Ok(())
+	}
+
+	#[cfg(target_os = "windows")]
+	pub fn start(&self) -> Result<(), Error> {
+		let selector = 0;
 		self.start_generic(selector)?;
 		Ok(())
 	}
@@ -1387,7 +1397,10 @@ where
 					}
 
 					// set non-blocking
+					#[cfg(unix)]
 					let fcntl_res = unsafe { fcntl(res, libc::F_SETFL, libc::O_NONBLOCK) };
+					#[cfg(target_os = "windows")]
+					let fcntl_res = unsafe { ioctlsocket(res.try_into().unwrap_or(0), 5421, &mut 1) };
 					if fcntl_res < 0 {
 						let e = errno().to_string();
 						return Err(ErrorKind::InternalError(format!("fcntl error: {}", e)).into());

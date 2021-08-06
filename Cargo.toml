@@ -20,6 +20,8 @@ log             = { path = "./log"          }
 nioruntime_util = { path = "./util"         }
 nioruntime_evh  = { path = "./eventhandler" }
 
+errno = "0.2.7"
+libc = "^0.2.17"
 nix = "0.22.0"
 rand = "0.8.4"
 byte-tools = "0.3.1"

@@ -12,22 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+// windows specific deps
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
+
 use byte_tools::copy;
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
+use errno::errno;
+use libc::close;
 use log::*;
 use nioruntime_evh::eventhandler::EventHandler;
 use nioruntime_util::{Error, ErrorKind};
-use nix::unistd::close;
 use rand::Rng;
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -72,7 +80,10 @@ fn client_thread(
 	let (mut stream, fd) = {
 		let _lock = tlat_sum.lock();
 		let stream = TcpStream::connect("127.0.0.1:9999")?;
+		#[cfg(unix)]
 		let fd = stream.as_raw_fd();
+		#[cfg(target_os = "windows")]
+		let fd = stream.as_raw_socket();
 		(stream, fd)
 	};
 	let buf = &mut [0u8; MAX_BUF];
@@ -154,12 +165,10 @@ fn client_thread(
 
 	{
 		let _lock = tlat_sum.lock();
-		let close_res = close(fd);
-		match close_res {
-			Ok(_) => {}
-			Err(e) => {
-				log!("error close {} (fd={})", e.to_string(), fd);
-			}
+		let close_res = unsafe { close(fd.try_into().unwrap_or(0)) };
+		if close_res != 0 {
+			let e = errno();
+			log!("error close {} (fd={})", e.to_string(), fd);
 		}
 		drop(stream);
 	}
