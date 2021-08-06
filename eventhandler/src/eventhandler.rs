@@ -28,17 +28,16 @@ use nix::sys::epoll::{
 
 // unix specific deps
 #[cfg(unix)]
-use nix::{
-	fcntl::{fcntl, OFlag, F_SETFL},
-	unistd::pipe,
-};
+use nix::fcntl::{fcntl, OFlag, F_SETFL};
 
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
 use errno::errno;
 use libc::accept;
+use libc::c_int;
 use libc::c_void;
 use libc::close;
+use libc::pipe;
 use libc::read;
 use libc::uintptr_t;
 use libc::write;
@@ -509,7 +508,15 @@ where
 
 	pub fn new() -> Self {
 		// create the pipe (for wakeups)
-		let (rx, tx) = pipe().unwrap();
+		//let (rx, tx) = pipe().unwrap();
+		let (rx, tx) = {
+			let mut retfds = [0i32; 2];
+			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
+			unsafe {
+				pipe(fds);
+			}
+			(retfds[0], retfds[1])
+		};
 
 		let callbacks = Callbacks {
 			on_read: None,
