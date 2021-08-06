@@ -125,8 +125,8 @@ impl From<Utf8Error> for Error {
 	}
 }
 
-impl From<std::sync::mpsc::SendError<FuturesHolder>> for Error {
-	fn from(e: std::sync::mpsc::SendError<FuturesHolder>) -> Error {
+impl From<std::sync::mpsc::SendError<(FuturesHolder, bool)>> for Error {
+	fn from(e: std::sync::mpsc::SendError<(FuturesHolder, bool)>) -> Error {
 		Error {
 			inner: Context::new(ErrorKind::IOError(format!("{}", e))),
 		}

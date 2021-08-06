@@ -309,6 +309,7 @@ pub struct GuardedData {
 	handler_events: Vec<HandlerEvent>,
 	write_pending: Vec<RawFd>,
 	selector: Option<RawFd>,
+	stop: bool,
 }
 
 pub struct EventHandler<F, G, H, K> {
@@ -519,6 +520,7 @@ where
 			handler_events: vec![],
 			write_pending: vec![],
 			selector: None,
+			stop: false,
 		};
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
 
@@ -544,6 +546,17 @@ where
 		Ok(())
 	}
 
+	pub fn stop(&self) -> Result<(), Error> {
+		let mut guarded_data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.stop = true;
+		write(guarded_data.wakeup_fd, &[0u8; 1])?;
+		Ok(())
+	}
+
 	fn start_generic(&self, selector: RawFd) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
@@ -565,9 +578,7 @@ where
 				selector,
 			);
 			match res {
-				Ok(_) => {
-					log!("poll_loop exited normally");
-				}
+				Ok(_) => {}
 				Err(e) => {
 					log!("FATAL: Unexpected error in poll loop: {}", e.to_string());
 				}
@@ -899,6 +910,14 @@ where
 				guarded_data.fd_actions.clear();
 				guarded_data.handler_events.clear();
 				guarded_data.write_pending.clear();
+
+				// check if a stop is needed
+				if guarded_data.stop {
+					thread_pool.stop()?;
+					close(selector)?;
+					close(guarded_data.wakeup_fd)?;
+					break;
+				}
 			}
 			{
 				let callbacks = callbacks.lock().map_err(|e| {
@@ -1036,6 +1055,8 @@ where
 				}
 			}
 		}
+
+		Ok(())
 	}
 
 	fn write_loop(fd: RawFd, statefd: RawFd, write_buffer: &mut WriteBuffer) -> Result<u16, Error> {
@@ -1747,5 +1768,56 @@ fn test_client() -> Result<(), Error> {
 	std::thread::sleep(std::time::Duration::from_millis(1000));
 	stream.write(&[1, 2, 3, 4, 5, 6])?;
 	std::thread::sleep(std::time::Duration::from_millis(1000));
+	Ok(())
+}
+
+#[test]
+fn test_stop() -> Result<(), Error> {
+	use std::io::Write;
+	use std::net::TcpListener;
+	use std::net::TcpStream;
+
+	let listener = TcpListener::bind("127.0.0.1:9984")?;
+	let mut stream = TcpStream::connect("127.0.0.1:9984")?;
+	let mut eh = EventHandler::new();
+	let x = Arc::new(Mutex::new(0));
+	let xclone = x.clone();
+
+	// echo
+	eh.set_on_read(move |buf, len, wh| {
+		let mut x = xclone.lock().unwrap();
+		*x += 1;
+		match len {
+			// just close the connection with no response
+			7 => {
+				let _ = wh.close();
+			}
+			// close if len == 5, otherwise keep open
+			_ => {
+				let _ = wh.write(buf, 0, len, len == 5);
+			}
+		}
+		Ok(())
+	})?;
+
+	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_close(|_| Ok(()))?;
+	eh.set_on_client_read(move |buf, len, _wh| {
+		assert_eq!(&buf[0..len], [1, 2, 3, 4, 5, 6]);
+		Ok(())
+	})?;
+
+	eh.start()?;
+	eh.add_tcp_listener(&listener)?;
+	eh.add_tcp_stream(&stream)?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	stream.write(&[1, 2, 3, 4, 5, 6])?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	eh.stop()?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	stream.write(&[1, 2, 3, 4, 5, 6, 7])?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	let x = x.lock().unwrap();
+	assert_eq!(*x, 1);
 	Ok(())
 }
