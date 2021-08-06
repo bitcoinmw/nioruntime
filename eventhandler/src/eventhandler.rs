@@ -28,8 +28,6 @@ use nix::sys::epoll::{
 
 // unix specific deps
 #[cfg(unix)]
-use nix::fcntl::{fcntl, OFlag, F_SETFL};
-#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 // windows specific deps
@@ -43,6 +41,7 @@ use libc::accept;
 use libc::c_int;
 use libc::c_void;
 use libc::close;
+use libc::fcntl;
 use libc::pipe;
 use libc::read;
 use libc::uintptr_t;
@@ -1364,13 +1363,11 @@ where
 					}
 
 					// set non-blocking
-					fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap())).map_err(
-						|e| {
-							let error: Error =
-								ErrorKind::InternalError(format!("fcntl error: {}", e)).into();
-							error
-						},
-					)?;
+					let fcntl_res = unsafe { fcntl(res, libc::F_SETFL, libc::O_NONBLOCK) };
+					if fcntl_res < 0 {
+						let e = errno().to_string();
+						return Err(ErrorKind::InternalError(format!("fcntl error: {}", e)).into());
+					}
 					let guarded_data = guarded_data.clone();
 
 					let accept_res = Self::process_accept_result(fd, res, &guarded_data, fd_locks);
