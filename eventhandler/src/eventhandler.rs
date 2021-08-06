@@ -859,7 +859,7 @@ where
 		};
 
 		if ret_count < 0 {
-			log!("Error in kevent: {:?}", std::io::Error::last_os_error());
+			log!("Error in kevent: kevs={:?}, error={}", kevs, errno());
 		}
 
 		let mut ret_count_adjusted = 0;
