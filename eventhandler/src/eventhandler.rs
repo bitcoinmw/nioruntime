@@ -29,6 +29,12 @@ use nix::sys::epoll::{
 // unix specific deps
 #[cfg(unix)]
 use nix::fcntl::{fcntl, OFlag, F_SETFL};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+
+// windows specific deps
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
 
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
@@ -47,7 +53,6 @@ use std::collections::HashSet;
 use std::collections::LinkedList;
 use std::net::TcpListener;
 use std::net::TcpStream;
-use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::spawn;
