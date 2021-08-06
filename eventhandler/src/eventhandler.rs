@@ -29,15 +29,20 @@ use nix::sys::epoll::{
 // unix specific deps
 #[cfg(unix)]
 use nix::{
-	errno::Errno,
+	//errno::Errno,
 	fcntl::{fcntl, OFlag, F_SETFL},
-	sys::socket::accept,
-	unistd::{close, pipe, read, write},
+	//sys::socket::accept,
+	unistd::{close, pipe, read},
 };
 
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
+use errno::errno;
+use libc::accept;
+use libc::c_void;
 use libc::uintptr_t;
+use libc::write;
+use libc::EAGAIN;
 use log::*;
 use std::collections::HashSet;
 use std::collections::LinkedList;
@@ -193,7 +198,10 @@ impl WriteHandle {
 		};
 
 		if !wakeup_scheduled {
-			write(fd, &[0u8; 1])?;
+			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+			unsafe {
+				write(fd, buf, 1);
+			}
 		}
 
 		Ok(())
@@ -552,7 +560,10 @@ where
 		})?;
 
 		guarded_data.stop = true;
-		write(guarded_data.wakeup_fd, &[0u8; 1])?;
+		let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+		unsafe {
+			write(guarded_data.wakeup_fd, buf, 1);
+		}
 		Ok(())
 	}
 
@@ -1078,41 +1089,33 @@ where
 				))
 				.into());
 			}
-			let res = write(
-				fd,
-				&write_buffer.buffer[(write_buffer.offset as usize)..(write_buffer.len as usize)],
-			);
+			let buf: *mut c_void = &mut write_buffer.buffer
+				[(write_buffer.offset as usize)..(write_buffer.len as usize)]
+				as *mut _ as *mut c_void;
+			let len = unsafe { write(fd, buf, (write_buffer.len - write_buffer.offset).into()) };
 
-			match res {
-				Ok(len) => {
-					if len == (write_buffer.len as usize - write_buffer.offset as usize) {
-						// we're done
-						write_buffer.offset += len as u16;
-						write_buffer.len -= len as u16;
-						return Ok(initial_len);
-					} else {
-						// update values and write again
-						write_buffer.offset += len as u16;
-						write_buffer.len -= len as u16;
-					}
+			if len >= 0 {
+				if len == (write_buffer.len as isize - write_buffer.offset as isize) {
+					// we're done
+					write_buffer.offset += len as u16;
+					write_buffer.len -= len as u16;
+					return Ok(initial_len);
+				} else {
+					// update values and write again
+					write_buffer.offset += len as u16;
+					write_buffer.len -= len as u16;
 				}
-				Err(e) => {
-					match e {
-						Errno::EAGAIN => {
-							// break because we're edge triggered.
-							// a new event occurs.
-							return Ok(initial_len - write_buffer.len);
-						}
-						_ => {
-							// this is an actual write error.
-							// close the connection.
-							return Err(ErrorKind::ConnectionCloseError(format!(
-								"connection closed: {}",
-								e
-							))
-							.into());
-						}
-					}
+			} else {
+				if errno().0 == EAGAIN {
+					// break because we're edge triggered.
+					// a new event occurs.
+					return Ok(initial_len - write_buffer.len);
+				} else {
+					// this is an actual write error.
+					// close the connection.
+					return Err(
+						ErrorKind::ConnectionCloseError(format!("connection closed",)).into(),
+					);
 				}
 			}
 		}
@@ -1285,83 +1288,90 @@ where
 					Ok(_) => {}
 					Err(e) => log!("Unexpected error obtaining read lock, {}", e),
 				}
-				let res = accept(fd);
 
-				match res {
-					Ok(res) => {
-						let len = read_fd_type.len();
-						if res as usize >= len {
-							for _ in len..res as usize + 1 {
-								read_fd_type.push(FdType::Unknown);
+				let res = unsafe {
+					accept(
+						fd,
+						&mut libc::sockaddr {
+							..std::mem::zeroed()
+						},
+						&mut (std::mem::size_of::<libc::sockaddr>() as u32),
+					)
+				};
+
+				if res > 0 {
+					let len = read_fd_type.len();
+					if res as usize >= len {
+						for _ in len..res as usize + 1 {
+							read_fd_type.push(FdType::Unknown);
+						}
+					}
+
+					if fd_locks.len() <= res as usize {
+						Self::check_and_set(
+							fd_locks,
+							res as usize,
+							Arc::new(Mutex::new(StateInfo::new(res, State::Normal, seqno))),
+						);
+					}
+
+					{
+						let current_seqno = fd_locks[res as usize].lock();
+						match current_seqno {
+							Ok(mut current_seqno) => {
+								*current_seqno = StateInfo::new(res, State::Normal, seqno);
+							}
+							Err(e) => {
+								log!("Error getting seqno: {}", e.to_string());
+								return Err(ErrorKind::InternalError(
+									"unexpected error obtaining seqno".to_string(),
+								)
+								.into());
 							}
 						}
+					}
 
-						if fd_locks.len() <= res as usize {
-							Self::check_and_set(
-								fd_locks,
-								res as usize,
-								Arc::new(Mutex::new(StateInfo::new(res, State::Normal, seqno))),
+					match fd_locks[res as usize].lock() {
+						Ok(mut state) => {
+							state.fd = res;
+							state.state = State::Normal;
+							state.seqno = seqno;
+						}
+						Err(e) => {
+							log!(
+								"unexpected error obtaining fd_lock: {}, fd={}, seqno={}",
+								e.to_string(),
+								fd,
+								seqno,
 							);
 						}
-
-						{
-							let current_seqno = fd_locks[res as usize].lock();
-							match current_seqno {
-								Ok(mut current_seqno) => {
-									*current_seqno = StateInfo::new(res, State::Normal, seqno);
-								}
-								Err(e) => {
-									log!("Error getting seqno: {}", e.to_string());
-									return Err(ErrorKind::InternalError(
-										"unexpected error obtaining seqno".to_string(),
-									)
-									.into());
-								}
-							}
-						}
-
-						match fd_locks[res as usize].lock() {
-							Ok(mut state) => {
-								state.fd = res;
-								state.state = State::Normal;
-								state.seqno = seqno;
-							}
-							Err(e) => {
-								log!(
-									"unexpected error obtaining fd_lock: {}, fd={}, seqno={}",
-									e.to_string(),
-									fd,
-									seqno,
-								);
-							}
-						}
-
-						// set non-blocking
-						fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap())).map_err(
-							|e| {
-								let error: Error =
-									ErrorKind::InternalError(format!("fcntl error: {}", e)).into();
-								error
-							},
-						)?;
-						let guarded_data = guarded_data.clone();
-
-						let accept_res =
-							Self::process_accept_result(fd, res, &guarded_data, fd_locks);
-						match accept_res {
-							Ok(_) => {}
-							Err(e) => {
-								log!("process_accept_result resulted in: {}", e.to_string())
-							}
-						}
-						let accept_res = (on_accept)(seqno as u128);
-						match accept_res {
-							Ok(_) => {}
-							Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
-						}
-						Ok(())
 					}
-					Err(e) => Self::process_accept_err(fd, e),
+
+					// set non-blocking
+					fcntl(res, F_SETFL(OFlag::from_bits(libc::O_NONBLOCK).unwrap())).map_err(
+						|e| {
+							let error: Error =
+								ErrorKind::InternalError(format!("fcntl error: {}", e)).into();
+							error
+						},
+					)?;
+					let guarded_data = guarded_data.clone();
+
+					let accept_res = Self::process_accept_result(fd, res, &guarded_data, fd_locks);
+					match accept_res {
+						Ok(_) => {}
+						Err(e) => {
+							log!("process_accept_result resulted in: {}", e.to_string())
+						}
+					}
+					let accept_res = (on_accept)(seqno as u128);
+					match accept_res {
+						Ok(_) => {}
+						Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
+					}
+					Ok(())
+				} else {
+					Self::process_accept_err(fd, "accept error".to_string())
 				}?;
 			}
 			FdType::Stream => {
@@ -1405,13 +1415,15 @@ where
 									}
 								}
 								Err(e) => {
-									let _ = Self::process_read_err(
-										fd,
-										e,
-										&guarded_data,
-										&mut fd_locks,
-										seqno,
-									);
+									if e != nix::errno::Errno::EAGAIN {
+										let _ = Self::process_read_err(
+											fd,
+											e.to_string(),
+											&guarded_data,
+											&mut fd_locks,
+											seqno,
+										);
+									}
 									break;
 								}
 							};
@@ -1494,28 +1506,19 @@ where
 
 	fn process_read_err(
 		fd: i32,
-		error: Errno,
+		_error: String,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 		connection_seqno: u128,
 	) -> Result<(), Error> {
-		// don't close if it's an EAGAIN or one of the other non-terminal errors
-		match error {
-			Errno::EAGAIN => {
-				// no required action
-				// edge triggered event will automatically be re-enabled.
-			}
-			_ => {
-				Self::push_handler_event(
-					fd,
-					HandlerEventType::Close,
-					guarded_data,
-					fd_locks,
-					false,
-					connection_seqno,
-				)?;
-			}
-		}
+		Self::push_handler_event(
+			fd,
+			HandlerEventType::Close,
+			guarded_data,
+			fd_locks,
+			false,
+			connection_seqno,
+		)?;
 		Ok(())
 	}
 
@@ -1542,7 +1545,7 @@ where
 		Ok(())
 	}
 
-	fn process_accept_err(_acceptor: i32, error: Errno) -> Result<(), Error> {
+	fn process_accept_err(_acceptor: i32, error: String) -> Result<(), Error> {
 		log!("error on acceptor: {}", error);
 		Ok(())
 	}
@@ -1633,7 +1636,10 @@ where
 				}
 			}
 			if wakeup && !wakeup_scheduled {
-				write(wakeup_fd, &[0u8; 1])?;
+				let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+				unsafe {
+					write(wakeup_fd, buf, 1);
+				}
 			}
 		}
 		Ok(())
