@@ -29,10 +29,8 @@ use nix::sys::epoll::{
 // unix specific deps
 #[cfg(unix)]
 use nix::{
-	//errno::Errno,
 	fcntl::{fcntl, OFlag, F_SETFL},
-	//sys::socket::accept,
-	unistd::{close, pipe, read},
+	unistd::pipe,
 };
 
 use crate::util::threadpool::StaticThreadPool;
@@ -40,6 +38,8 @@ use crate::util::{Error, ErrorKind};
 use errno::errno;
 use libc::accept;
 use libc::c_void;
+use libc::close;
+use libc::read;
 use libc::uintptr_t;
 use libc::write;
 use libc::EAGAIN;
@@ -934,8 +934,14 @@ where
 				// check if a stop is needed
 				if guarded_data.stop {
 					thread_pool.stop()?;
-					close(selector)?;
-					close(guarded_data.wakeup_fd)?;
+					let res = unsafe { close(selector) };
+					if res != 0 {
+						log!("Error closing selector: {}", errno().to_string());
+					}
+					let res = unsafe { close(guarded_data.wakeup_fd) };
+					if res != 0 {
+						log!("Error closing selector: {}", errno().to_string());
+					}
 					break;
 				}
 			}
@@ -1131,17 +1137,15 @@ where
 			Ok(mut state) => {
 				if state.fd == fd {
 					if state.state == State::Closing {
-						let res = close(state.fd);
-						match res {
-							Ok(_) => {
-								state.state = State::Closed;
-							}
-							Err(e) => {
-								log!("error closing socket: {}", e);
-								return Err(
-									ErrorKind::InternalError("Already closed".to_string()).into()
-								);
-							}
+						let res = unsafe { close(state.fd) };
+						if res == 0 {
+							state.state = State::Closed;
+						} else {
+							let e = errno();
+							log!("error closing socket: {}", e.to_string());
+							return Err(
+								ErrorKind::InternalError("Already closed".to_string()).into()
+							);
 						}
 					} else {
 						return Err(ErrorKind::InternalError("Already closed".to_string()).into());
@@ -1396,36 +1400,35 @@ where
 									break;
 								}
 							};
-							let res = read(fd, &mut buf);
-							match res {
-								Ok(len) => {
-									let _ = Self::process_read_result(
-										fd,
-										len,
-										buf,
-										&guarded_data,
-										&mut fd_locks,
-										on_read.clone(),
-										on_client_read.clone(),
-										use_on_client_read,
-										seqno,
-									);
-									if len == 0 {
-										break;
-									}
-								}
-								Err(e) => {
-									if e != nix::errno::Errno::EAGAIN {
-										let _ = Self::process_read_err(
-											fd,
-											e.to_string(),
-											&guarded_data,
-											&mut fd_locks,
-											seqno,
-										);
-									}
+							let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
+							let len = unsafe { read(fd, cbuf, BUFFER_SIZE) };
+							if len >= 0 {
+								let _ = Self::process_read_result(
+									fd,
+									len as usize,
+									buf,
+									&guarded_data,
+									&mut fd_locks,
+									on_read.clone(),
+									on_client_read.clone(),
+									use_on_client_read,
+									seqno,
+								);
+								if len == 0 {
 									break;
 								}
+							} else {
+								let e = errno();
+								if e.0 != EAGAIN {
+									let _ = Self::process_read_err(
+										fd,
+										e.to_string(),
+										&guarded_data,
+										&mut fd_locks,
+										seqno,
+									);
+								}
+								break;
 							};
 						}
 					})
@@ -1440,14 +1443,10 @@ where
 				log!("unexpected fd_type (unknown) for fd: {}", fd);
 			}
 			FdType::Wakeup => {
-				read(fd, &mut [0u8; 1]).map_err(|e| {
-					let error: Error = ErrorKind::InternalError(format!(
-						"Error reading from pipe, {}",
-						e.to_string()
-					))
-					.into();
-					error
-				})?;
+				let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+				unsafe {
+					read(fd, cbuf, 1);
+				}
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
 					let error: Error =
 						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
