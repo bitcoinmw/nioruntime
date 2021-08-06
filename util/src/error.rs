@@ -110,6 +110,7 @@ impl From<std::io::Error> for Error {
 	}
 }
 
+#[cfg(unix)]
 impl From<Errno> for Error {
 	fn from(e: Errno) -> Error {
 		Error {
