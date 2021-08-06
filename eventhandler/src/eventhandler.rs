@@ -520,11 +520,13 @@ where
 
 	pub fn new() -> Self {
 		// create the pipe (for wakeups)
-		//let (rx, tx) = pipe().unwrap();
 		let (rx, tx) = {
 			let mut retfds = [0i32; 2];
 			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
 			unsafe {
+				#[cfg(target_os = "windows")]
+				pipe(fds, 1024, 0);
+				#[cfg(unix)]
 				pipe(fds);
 			}
 			(retfds[0], retfds[1])
