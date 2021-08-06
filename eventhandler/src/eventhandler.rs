@@ -844,6 +844,16 @@ where
 		Ok(ret_count_adjusted)
 	}
 
+	#[cfg(target_os = "windows")]
+	fn get_events(
+		epollfd: i32,
+		input_events: Vec<GenericEvent>,
+		output_events: &mut Vec<GenericEvent>,
+		filter_set: &mut HashSet<i32>,
+	) -> Result<i32, Error> {
+		Ok(())
+	}
+
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
