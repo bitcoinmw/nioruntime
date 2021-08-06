@@ -14,6 +14,7 @@
 
 use crate::threadpool::FuturesHolder;
 use failure::{Backtrace, Context, Fail};
+#[cfg(unix)]
 use nix::errno::Errno;
 use std::ffi::OsString;
 use std::fmt;
