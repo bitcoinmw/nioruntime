@@ -50,6 +50,7 @@ use libc::EAGAIN;
 use log::*;
 use std::collections::HashSet;
 use std::collections::LinkedList;
+use std::convert::TryInto;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::pin::Pin;
@@ -383,6 +384,13 @@ where
 		#[cfg(target_os = "windows")]
 		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
 		Ok(ret)
+	}
+
+	#[cfg(target_os = "windows")]
+	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<i32, Error> {
+		let fd = socket.try_into().unwrap_or(0);
+		self.add_fd(fd, atype)?;
+		Ok(fd)
 	}
 
 	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<i32, Error> {
@@ -1112,7 +1120,11 @@ where
 			let len = unsafe { write(fd, buf, (write_buffer.len - write_buffer.offset).into()) };
 
 			if len >= 0 {
-				if len == (write_buffer.len as isize - write_buffer.offset as isize) {
+				if len
+					== (write_buffer.len as isize - write_buffer.offset as isize)
+						.try_into()
+						.unwrap_or(0)
+				{
 					// we're done
 					write_buffer.offset += len as u16;
 					write_buffer.len -= len as u16;
@@ -1306,11 +1318,13 @@ where
 
 				let res = unsafe {
 					accept(
-						fd,
+						fd.try_into().unwrap_or(0),
 						&mut libc::sockaddr {
 							..std::mem::zeroed()
 						},
-						&mut (std::mem::size_of::<libc::sockaddr>() as u32),
+						&mut (std::mem::size_of::<libc::sockaddr>() as u32)
+							.try_into()
+							.unwrap_or(0),
 					)
 				};
 
@@ -1326,7 +1340,11 @@ where
 						Self::check_and_set(
 							fd_locks,
 							res as usize,
-							Arc::new(Mutex::new(StateInfo::new(res, State::Normal, seqno))),
+							Arc::new(Mutex::new(StateInfo::new(
+								res.try_into().unwrap_or(0),
+								State::Normal,
+								seqno,
+							))),
 						);
 					}
 
@@ -1334,7 +1352,11 @@ where
 						let current_seqno = fd_locks[res as usize].lock();
 						match current_seqno {
 							Ok(mut current_seqno) => {
-								*current_seqno = StateInfo::new(res, State::Normal, seqno);
+								*current_seqno = StateInfo::new(
+									res.try_into().unwrap_or(0),
+									State::Normal,
+									seqno,
+								);
 							}
 							Err(e) => {
 								log!("Error getting seqno: {}", e.to_string());
@@ -1348,7 +1370,7 @@ where
 
 					match fd_locks[res as usize].lock() {
 						Ok(mut state) => {
-							state.fd = res;
+							state.fd = res.try_into().unwrap_or(0);
 							state.state = State::Normal;
 							state.seqno = seqno;
 						}
@@ -1370,7 +1392,12 @@ where
 					}
 					let guarded_data = guarded_data.clone();
 
-					let accept_res = Self::process_accept_result(fd, res, &guarded_data, fd_locks);
+					let accept_res = Self::process_accept_result(
+						fd,
+						res.try_into().unwrap_or(0),
+						&guarded_data,
+						fd_locks,
+					);
 					match accept_res {
 						Ok(_) => {}
 						Err(e) => {
@@ -1410,7 +1437,8 @@ where
 								}
 							};
 							let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
-							let len = unsafe { read(fd, cbuf, BUFFER_SIZE) };
+							let len =
+								unsafe { read(fd, cbuf, BUFFER_SIZE.try_into().unwrap_or(0)) };
 							if len >= 0 {
 								let _ = Self::process_read_result(
 									fd,
