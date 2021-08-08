@@ -2415,6 +2415,8 @@ fn test_large_messages() -> Result<(), Error> {
 	let mut eh = EventHandler::new();
 	let x = Arc::new(Mutex::new(0));
 	let xclone = x.clone();
+	let complete = Arc::new(Mutex::new(false));
+	let completeclone = complete.clone();
 
 	let data_buf = Arc::new(Mutex::new(vec![]));
 	eh.set_on_read(move |buf, len, _wh| {
@@ -2430,10 +2432,14 @@ fn test_large_messages() -> Result<(), Error> {
 					}
 					assert_eq!(data_buf[i], (i % 123) as u8);
 				}
+
+				let mut x = xclone.lock().unwrap();
+				*x = data_buf.len();
+
+				let mut complete = completeclone.lock().unwrap();
+				*complete = true;
 			}
 		}
-		let mut x = xclone.lock().unwrap();
-		*x = data_buf.len();
 
 		Ok(())
 	})?;
@@ -2441,23 +2447,23 @@ fn test_large_messages() -> Result<(), Error> {
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 	eh.set_on_client_read(move |_buf, _len, _wh| Ok(()))?;
-
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
 	let mut msg = vec![];
 	for i in 0..buf_len {
 		msg.push((i % 123) as u8);
 	}
 	msg.push(128 as u8);
 	stream.write(&msg)?;
-	std::thread::sleep(std::time::Duration::from_millis(15000));
-	for i in 0..buf_len {
-		if msg[i] != (i % 123) as u8 {
-			log!("i={}", i);
+	loop {
+		std::thread::sleep(std::time::Duration::from_millis(50));
+		let xval = *(x.lock().unwrap());
+		let complete = complete.lock().unwrap();
+		if !*complete {
+			continue;
 		}
-		assert_eq!(msg[i], (i % 123) as u8);
+		assert_eq!(xval, buf_len + 1);
+		break;
 	}
-	assert_eq!(*(x.lock().unwrap()), buf_len + 1);
 	Ok(())
 }
