@@ -1592,12 +1592,21 @@ where
 								}
 								let res =
 									Self::write_until_block(fd, &mut state_info, &guarded_data);
+								#[cfg(target_os = "windows")]
 								match res {
-									Ok(_c) =>
-									#[cfg(target_os = "windows")]
-									{
-										complete = _c;
+									Ok(c) => {
+										complete = c;
 									}
+									Err(e) => {
+										log!(
+											"unexpected error in process_event_write: {}",
+											e.to_string()
+										);
+									}
+								}
+								#[cfg(unix)]
+								match res {
+									Ok(_) => {}
 									Err(e) => {
 										log!(
 											"unexpected error in process_event_write: {}",
