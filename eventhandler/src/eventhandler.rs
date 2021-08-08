@@ -2378,3 +2378,53 @@ fn test_stop() -> Result<(), Error> {
 	assert_eq!(*x, 1);
 	Ok(())
 }
+
+#[test]
+fn test_large_messages() -> Result<(), Error> {
+	use std::io::Write;
+	use std::net::TcpListener;
+	use std::net::TcpStream;
+
+	let buf_len = 100_000_000;
+	let listener = TcpListener::bind("127.0.0.1:9944")?;
+	let mut stream = TcpStream::connect("127.0.0.1:9944")?;
+	let mut eh = EventHandler::new();
+	let x = Arc::new(Mutex::new(0));
+	let xclone = x.clone();
+
+	let data_buf = Arc::new(Mutex::new(vec![]));
+	eh.set_on_read(move |buf, len, _wh| {
+		let mut data_buf = data_buf.lock().unwrap();
+		for i in 0..len {
+			data_buf.push(buf[i]);
+			if buf[i] == 128 {
+				// complete
+				assert_eq!(data_buf.len(), buf_len + 1);
+				for i in 0..buf_len {
+					assert_eq!(data_buf[i], (i % 128) as u8);
+				}
+			}
+		}
+		let mut x = xclone.lock().unwrap();
+		*x = data_buf.len();
+
+		Ok(())
+	})?;
+
+	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_close(|_| Ok(()))?;
+	eh.set_on_client_read(move |_buf, _len, _wh| Ok(()))?;
+
+	eh.start()?;
+	eh.add_tcp_listener(&listener)?;
+	std::thread::sleep(std::time::Duration::from_millis(1000));
+	let mut msg = vec![];
+	for i in 0..buf_len {
+		msg.push((i % 128) as u8);
+	}
+	msg.push(128 as u8);
+	stream.write(&msg)?;
+	std::thread::sleep(std::time::Duration::from_millis(10000));
+	assert_eq!(*(x.lock().unwrap()), buf_len + 1);
+	Ok(())
+}
