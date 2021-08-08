@@ -672,6 +672,7 @@ where
 		}
 
 		let mut fd_locks = vec![];
+		let mut on_read_locks = vec![];
 		let cloned_guarded_data = self.data.clone();
 		let cloned_callbacks = self.callbacks.clone();
 
@@ -687,6 +688,7 @@ where
 					&cloned_guarded_data,
 					&cloned_callbacks,
 					&mut fd_locks,
+					&mut on_read_locks,
 					selector,
 					win_selector,
 				);
@@ -1142,6 +1144,7 @@ where
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
+		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
 		selector: i32,
 		win_selector: *mut c_void,
 	) -> Result<(), Error> {
@@ -1382,6 +1385,7 @@ where
 						on_client_read.clone(),
 						use_on_client_read[event.fd as usize],
 						fd_locks,
+						on_read_locks,
 						seqno,
 						&global_lock,
 					);
@@ -1693,6 +1697,7 @@ where
 		on_client_read: Pin<Box<K>>,
 		use_on_client_read: bool,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
+		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
 		seqno: u128,
 		global_lock: &Arc<RwLock<bool>>,
 	) -> Result<(), Error> {
@@ -1735,6 +1740,14 @@ where
 						for _ in len..res as usize + 1 {
 							read_fd_type.push(FdType::Unknown);
 						}
+					}
+
+					if on_read_locks.len() <= res as usize {
+						Self::check_and_set(
+							on_read_locks,
+							res as usize,
+							Arc::new(Mutex::new(false)),
+						);
 					}
 
 					if fd_locks.len() <= res as usize {
@@ -1857,6 +1870,7 @@ where
 				let guarded_data = guarded_data.clone();
 				let fd_lock = fd_locks[fd as usize].clone();
 				let mut fd_locks = fd_locks.clone();
+				let on_read_locks = on_read_locks.clone();
 				let global_lock = global_lock.clone();
 				thread_pool
 					.execute(async move {
@@ -1867,6 +1881,13 @@ where
 						}
 						let mut buf = [0u8; BUFFER_SIZE];
 						loop {
+							let on_read_lock = on_read_locks[fd as usize].lock();
+							match on_read_lock {
+								Ok(_) => {}
+								Err(e) => {
+									log!("unexpected error obtaining on_read_lock: {}", e);
+								}
+							}
 							let (seqno, len) = {
 								let fd_lock = fd_lock.lock();
 								let seqno = match fd_lock {
@@ -1897,31 +1918,29 @@ where
 									}
 								};
 
-								if len >= 0 {
-									let _ = Self::process_read_result(
-										fd,
-										len as usize,
-										buf,
-										&guarded_data,
-										&mut fd_locks,
-										on_read.clone(),
-										on_client_read.clone(),
-										use_on_client_read,
-										seqno,
-									);
-									if len == 0 {
-										break;
-									}
-
-									// break on windows
-									#[cfg(target_os = "windows")]
-									break;
-								}
-
 								(seqno, len)
 							};
 
-							if len < 0 {
+							if len >= 0 {
+								let _ = Self::process_read_result(
+									fd,
+									len as usize,
+									buf,
+									&guarded_data,
+									&mut fd_locks,
+									on_read.clone(),
+									on_client_read.clone(),
+									use_on_client_read,
+									seqno,
+								);
+								if len == 0 {
+									break;
+								}
+
+								// break on windows
+								#[cfg(target_os = "windows")]
+								break;
+							} else {
 								let e = errno();
 								if e.0 != EAGAIN {
 									let _ = Self::process_read_err(
