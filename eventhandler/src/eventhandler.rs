@@ -1939,7 +1939,9 @@ where
 
 								// break on windows
 								#[cfg(target_os = "windows")]
-								break;
+								{
+									break;
+								}
 							} else {
 								let e = errno();
 								if e.0 != EAGAIN {
@@ -1962,7 +1964,7 @@ where
 								HandlerEventType::ResumeRead,
 								&guarded_data,
 								&mut fd_locks,
-								false,
+								true,
 								seqno,
 							);
 							match res {
@@ -2449,7 +2451,7 @@ fn test_large_messages() -> Result<(), Error> {
 	}
 	msg.push(128 as u8);
 	stream.write(&msg)?;
-	std::thread::sleep(std::time::Duration::from_millis(10000));
+	std::thread::sleep(std::time::Duration::from_millis(15000));
 	for i in 0..buf_len {
 		if msg[i] != (i % 123) as u8 {
 			log!("i={}", i);
