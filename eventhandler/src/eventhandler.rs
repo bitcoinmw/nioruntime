@@ -2401,7 +2401,7 @@ fn test_large_messages() -> Result<(), Error> {
 				// complete
 				assert_eq!(data_buf.len(), buf_len + 1);
 				for i in 0..buf_len {
-					assert_eq!(data_buf[i], (i % 128) as u8);
+					assert_eq!(data_buf[i], (i % 123) as u8);
 				}
 			}
 		}
@@ -2420,7 +2420,7 @@ fn test_large_messages() -> Result<(), Error> {
 	std::thread::sleep(std::time::Duration::from_millis(1000));
 	let mut msg = vec![];
 	for i in 0..buf_len {
-		msg.push((i % 128) as u8);
+		msg.push((i % 123) as u8);
 	}
 	msg.push(128 as u8);
 	stream.write(&msg)?;
