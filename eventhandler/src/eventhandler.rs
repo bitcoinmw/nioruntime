@@ -932,6 +932,30 @@ where
 						GenericEventType::AddReadET,
 					));
 				}
+				if events[i as usize].events & (EPOLLIN | EPOLLOUT) == 0 {
+					let fd = unsafe { events[i as usize].data.fd };
+					let data = epoll_data_t { fd };
+					let mut event = epoll_event {
+						events: 0, // not used for del
+						data,
+					};
+					let res = unsafe {
+						epoll_ctl(
+							win_selector,
+							EPOLL_CTL_DEL.try_into().unwrap_or(0),
+							fd.try_into().unwrap_or(0),
+							&mut event,
+						)
+					};
+
+					if res != 0 {
+						log!(
+							"Unexpected error with EPOLLHUP. res = {}, err={}",
+							res,
+							errno().to_string(),
+						);
+					}
+				}
 			}
 		}
 
@@ -1769,7 +1793,6 @@ where
 					}
 					#[cfg(target_os = "windows")]
 					{
-						/*
 						let fionbio = 0x8004667eu32;
 						let ioctl_res = unsafe {
 							ws2_32::ioctlsocket(
@@ -1782,7 +1805,6 @@ where
 						if ioctl_res != 0 {
 							log!("complete fion with error: {}", errno().to_string());
 						}
-						*/
 					}
 					let guarded_data = guarded_data.clone();
 
