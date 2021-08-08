@@ -2405,6 +2405,7 @@ fn test_stop() -> Result<(), Error> {
 
 #[test]
 fn test_large_messages() -> Result<(), Error> {
+	use std::io::Read;
 	use std::io::Write;
 	use std::net::TcpListener;
 	use std::net::TcpStream;
@@ -2419,7 +2420,7 @@ fn test_large_messages() -> Result<(), Error> {
 	let completeclone = complete.clone();
 
 	let data_buf = Arc::new(Mutex::new(vec![]));
-	eh.set_on_read(move |buf, len, _wh| {
+	eh.set_on_read(move |buf, len, wh| {
 		let mut data_buf = data_buf.lock().unwrap();
 		for i in 0..len {
 			data_buf.push(buf[i]);
@@ -2438,6 +2439,7 @@ fn test_large_messages() -> Result<(), Error> {
 
 				let mut complete = completeclone.lock().unwrap();
 				*complete = true;
+				wh.write(&data_buf, 0, data_buf.len(), false)?;
 			}
 		}
 
@@ -2449,12 +2451,30 @@ fn test_large_messages() -> Result<(), Error> {
 	eh.set_on_client_read(move |_buf, _len, _wh| Ok(()))?;
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
+
 	let mut msg = vec![];
 	for i in 0..buf_len {
 		msg.push((i % 123) as u8);
 	}
 	msg.push(128 as u8);
 	stream.write(&msg)?;
+	let mut buf = [0u8; 973];
+	let mut len_sum = 0;
+	let mut data_buf = vec![];
+
+	loop {
+		let len = stream.read(&mut buf)?;
+		for i in 0..len {
+			data_buf.push(buf[i]);
+		}
+		len_sum += len;
+		if len_sum == buf_len + 1 {
+			break;
+		}
+	}
+
+	assert_eq!(data_buf, msg);
+
 	loop {
 		std::thread::sleep(std::time::Duration::from_millis(50));
 		let xval = *(x.lock().unwrap());
