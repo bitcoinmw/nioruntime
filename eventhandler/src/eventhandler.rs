@@ -1896,29 +1896,32 @@ where
 										)
 									}
 								};
-								(seqno, len)
-							};
 
-							if len >= 0 {
-								let _ = Self::process_read_result(
-									fd,
-									len as usize,
-									buf,
-									&guarded_data,
-									&mut fd_locks,
-									on_read.clone(),
-									on_client_read.clone(),
-									use_on_client_read,
-									seqno,
-								);
-								if len == 0 {
+								if len >= 0 {
+									let _ = Self::process_read_result(
+										fd,
+										len as usize,
+										buf,
+										&guarded_data,
+										&mut fd_locks,
+										on_read.clone(),
+										on_client_read.clone(),
+										use_on_client_read,
+										seqno,
+									);
+									if len == 0 {
+										break;
+									}
+
+									// break on windows
+									#[cfg(target_os = "windows")]
 									break;
 								}
 
-								// break on windows
-								#[cfg(target_os = "windows")]
-								break;
-							} else {
+								(seqno, len)
+							};
+
+							if len < 0 {
 								let e = errno();
 								if e.0 != EAGAIN {
 									let _ = Self::process_read_err(
@@ -2401,6 +2404,9 @@ fn test_large_messages() -> Result<(), Error> {
 				// complete
 				assert_eq!(data_buf.len(), buf_len + 1);
 				for i in 0..buf_len {
+					if data_buf[i] != (i % 123) as u8 {
+						log!("i={}", i);
+					}
 					assert_eq!(data_buf[i], (i % 123) as u8);
 				}
 			}
@@ -2425,6 +2431,12 @@ fn test_large_messages() -> Result<(), Error> {
 	msg.push(128 as u8);
 	stream.write(&msg)?;
 	std::thread::sleep(std::time::Duration::from_millis(10000));
+	for i in 0..buf_len {
+		if msg[i] != (i % 123) as u8 {
+			log!("i={}", i);
+		}
+		assert_eq!(msg[i], (i % 123) as u8);
+	}
 	assert_eq!(*(x.lock().unwrap()), buf_len + 1);
 	Ok(())
 }
