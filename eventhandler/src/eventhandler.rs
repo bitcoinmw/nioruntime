@@ -30,7 +30,7 @@ use nix::sys::epoll::{
 #[cfg(unix)]
 use libc::fcntl;
 #[cfg(unix)]
-use libc::{pipe, read, write};
+use libc::{close, pipe, read, write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
@@ -40,7 +40,6 @@ use errno::errno;
 use libc::accept;
 use libc::c_int;
 use libc::c_void;
-use libc::close;
 use libc::uintptr_t;
 use libc::EAGAIN;
 use log::*;
@@ -1232,6 +1231,10 @@ where
 						if res != 0 {
 							log!("Error closing selector: {}", errno().to_string());
 						}
+						let res = unsafe { close(guarded_data.wakeup_fd) };
+						if res != 0 {
+							log!("Error closing selector: {}", errno().to_string());
+						}
 					}
 					#[cfg(target_os = "windows")]
 					{
@@ -1239,10 +1242,12 @@ where
 						if res != 0 {
 							log!("Error closing win_selector: {}", errno().to_string());
 						}
-					}
-					let res = unsafe { close(guarded_data.wakeup_fd) };
-					if res != 0 {
-						log!("Error closing selector: {}", errno().to_string());
+						let res = unsafe {
+							ws2_32::closesocket(guarded_data.wakeup_fd.try_into().unwrap_or(0))
+						};
+						if res != 0 {
+							log!("Error closing selector: {}", errno().to_string());
+						}
 					}
 					break;
 				}
