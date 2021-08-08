@@ -30,13 +30,9 @@ use nix::sys::epoll::{
 #[cfg(unix)]
 use libc::fcntl;
 #[cfg(unix)]
+use libc::{pipe, read, write};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-
-// windows specific deps
-#[cfg(target_os = "windows")]
-use std::os::windows::io::AsRawSocket;
-#[cfg(target_os = "windows")]
-use ws2_32::ioctlsocket;
 
 use crate::util::threadpool::StaticThreadPool;
 use crate::util::{Error, ErrorKind};
@@ -45,10 +41,7 @@ use libc::accept;
 use libc::c_int;
 use libc::c_void;
 use libc::close;
-use libc::pipe;
-use libc::read;
 use libc::uintptr_t;
-use libc::write;
 use libc::EAGAIN;
 use log::*;
 use std::collections::HashSet;
@@ -56,9 +49,16 @@ use std::collections::LinkedList;
 use std::convert::TryInto;
 use std::net::TcpListener;
 use std::net::TcpStream;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::spawn;
+#[cfg(target_os = "windows")]
+use wepoll_sys::{
+	epoll_close, epoll_create, epoll_ctl, epoll_data_t, epoll_event, epoll_wait, EPOLLIN, EPOLLOUT,
+	EPOLLRDHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
+};
 
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
@@ -150,7 +150,6 @@ impl WriteHandle {
 			))
 			.into());
 		}
-
 		{
 			let linked_list = &mut self
 				.fd_lock
@@ -161,7 +160,6 @@ impl WriteHandle {
 					error
 				})?
 				.write_buffer;
-
 			let mut rem = len;
 			let mut count = 0;
 			loop {
@@ -205,9 +203,19 @@ impl WriteHandle {
 		};
 
 		if !wakeup_scheduled {
-			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-			unsafe {
-				write(fd, buf, 1);
+			#[cfg(unix)]
+			{
+				let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+				unsafe {
+					write(fd, buf, 1);
+				}
+			}
+			#[cfg(target_os = "windows")]
+			{
+				let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
+				unsafe {
+					ws2_32::send(fd.try_into().unwrap_or(0), buf, 1, 0);
+				}
 			}
 		}
 
@@ -239,6 +247,14 @@ impl FdAction {
 enum HandlerEventType {
 	Accept,
 	Close,
+	#[cfg(target_os = "windows")]
+	PauseRead,
+	#[cfg(target_os = "windows")]
+	ResumeRead,
+	#[cfg(target_os = "windows")]
+	PauseWrite,
+	#[cfg(target_os = "windows")]
+	ResumeWrite,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -329,6 +345,8 @@ pub struct GuardedData {
 pub struct EventHandler<F, G, H, K> {
 	data: Arc<Mutex<GuardedData>>,
 	callbacks: Arc<Mutex<Callbacks<F, G, H, K>>>,
+	_pipe_listener: Option<TcpListener>,
+	_pipe_stream: Option<TcpStream>,
 }
 
 impl<F, G, H, K> EventHandler<F, G, H, K>
@@ -522,16 +540,29 @@ where
 	}
 
 	pub fn new() -> Self {
+		let mut _pipe_stream = None;
+		let mut _pipe_listener = None;
 		// create the pipe (for wakeups)
 		let (rx, tx) = {
 			let mut retfds = [0i32; 2];
 			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
-			unsafe {
-				#[cfg(target_os = "windows")]
-				pipe(fds, 1024, 0);
-				#[cfg(unix)]
-				pipe(fds);
+			#[cfg(target_os = "windows")]
+			{
+				let res = Self::socket_pipe(fds);
+				match res {
+					Ok((listener, stream)) => {
+						_pipe_stream = Some(stream);
+						_pipe_listener = Some(listener);
+					}
+					Err(e) => {
+						log!("Error creating socket_pipe on windows, {}", e.to_string());
+					}
+				}
 			}
+			#[cfg(unix)]
+			unsafe {
+				pipe(fds)
+			};
 			(retfds[0], retfds[1])
 		};
 
@@ -558,11 +589,13 @@ where
 		EventHandler {
 			data: guarded_data,
 			callbacks,
+			_pipe_listener,
+			_pipe_stream,
 		}
 	}
 
 	#[cfg(target_os = "linux")]
-	pub fn start(&self) -> Result<(), Error> {
+	pub fn start(&mut self) -> Result<(), Error> {
 		// create poll fd
 		let selector = epoll_create1(EpollCreateFlags::empty())?;
 		self.start_generic(selector)?;
@@ -570,7 +603,7 @@ where
 	}
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
-	pub fn start(&self) -> Result<(), Error> {
+	pub fn start(&mut self) -> Result<(), Error> {
 		// create the kqueue
 		let selector = unsafe { kqueue() };
 		self.start_generic(selector)?;
@@ -578,9 +611,8 @@ where
 	}
 
 	#[cfg(target_os = "windows")]
-	pub fn start(&self) -> Result<(), Error> {
-		let selector = 0;
-		self.start_generic(selector)?;
+	pub fn start(&mut self) -> Result<(), Error> {
+		self.start_generic(0)?;
 		Ok(())
 	}
 
@@ -591,14 +623,47 @@ where
 		})?;
 
 		guarded_data.stop = true;
-		let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-		unsafe {
-			write(guarded_data.wakeup_fd, buf, 1);
+		#[cfg(unix)]
+		{
+			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+			unsafe {
+				write(guarded_data.wakeup_fd, buf, 1);
+			}
 		}
+		#[cfg(target_os = "windows")]
+		{
+			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
+			unsafe {
+				ws2_32::send(guarded_data.wakeup_fd.try_into().unwrap_or(0), buf, 1, 0);
+			}
+		}
+
 		Ok(())
 	}
 
-	fn start_generic(&self, selector: i32) -> Result<(), Error> {
+	#[cfg(target_os = "windows")]
+	fn socket_pipe(fds: *mut i32) -> Result<(TcpListener, TcpStream), Error> {
+		let port = portpicker::pick_unused_port().unwrap_or(9999);
+		let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+		let res = unsafe {
+			accept(
+				listener.as_raw_socket().try_into().unwrap_or(0),
+				&mut libc::sockaddr {
+					..std::mem::zeroed()
+				},
+				&mut (std::mem::size_of::<libc::sockaddr>() as u32)
+					.try_into()
+					.unwrap_or(0),
+			)
+		};
+		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
+		fds[0] = res as i32;
+		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
+		Ok((listener, stream))
+	}
+
+	fn start_generic(&mut self, selector: i32) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -612,16 +677,27 @@ where
 		let cloned_callbacks = self.callbacks.clone();
 
 		spawn(move || {
-			let res = Self::poll_loop(
-				&cloned_guarded_data,
-				&cloned_callbacks,
-				&mut fd_locks,
-				selector,
-			);
-			match res {
-				Ok(_) => {}
-				Err(e) => {
-					log!("FATAL: Unexpected error in poll loop: {}", e.to_string());
+			#[cfg(target_os = "windows")]
+			let win_selector = unsafe { epoll_create(1) };
+			#[cfg(unix)]
+			let win_selector = 1 as *mut c_void;
+			if win_selector.is_null() {
+				log!("win_selector is null. Cannot start");
+			} else {
+				let res = Self::poll_loop(
+					&cloned_guarded_data,
+					&cloned_callbacks,
+					&mut fd_locks,
+					selector,
+					win_selector,
+				);
+				match res {
+					Ok(_) => {
+						log!("poll loop done");
+					}
+					Err(e) => {
+						log!("FATAL: Unexpected error in poll loop: {}", e.to_string());
+					}
 				}
 			}
 		});
@@ -647,6 +723,34 @@ where
 		}
 		for handler_event in &handler_events {
 			match handler_event.etype {
+				#[cfg(target_os = "windows")]
+				HandlerEventType::PauseRead => {
+					evs.push(GenericEvent::new(
+						handler_event.fd,
+						GenericEventType::DelRead,
+					));
+				}
+				#[cfg(target_os = "windows")]
+				HandlerEventType::ResumeRead => {
+					evs.push(GenericEvent::new(
+						handler_event.fd,
+						GenericEventType::AddReadET,
+					));
+				}
+				#[cfg(target_os = "windows")]
+				HandlerEventType::PauseWrite => {
+					evs.push(GenericEvent::new(
+						handler_event.fd,
+						GenericEventType::DelWrite,
+					));
+				}
+				#[cfg(target_os = "windows")]
+				HandlerEventType::ResumeWrite => {
+					evs.push(GenericEvent::new(
+						handler_event.fd,
+						GenericEventType::AddWriteET,
+					));
+				}
 				HandlerEventType::Accept => {
 					let fd = handler_event.fd as uintptr_t;
 					evs.push(GenericEvent::new(
@@ -676,8 +780,11 @@ where
 					Self::do_close(fd, seqno, fd_locks)?;
 					match fd_locks[fd as usize].lock() {
 						Ok(mut state) => {
-							evs.push(GenericEvent::new(state.fd, GenericEventType::DelRead));
-							evs.push(GenericEvent::new(state.fd, GenericEventType::DelWrite));
+							#[cfg(unix)]
+							{
+								evs.push(GenericEvent::new(state.fd, GenericEventType::DelRead));
+								evs.push(GenericEvent::new(state.fd, GenericEventType::DelWrite));
+							}
 							read_fd_type[handler_event.fd as usize] = FdType::Unknown;
 							use_on_client_read[handler_event.fd as usize] = false;
 							(*state).write_buffer.clear();
@@ -711,9 +818,130 @@ where
 		Ok(())
 	}
 
+	#[cfg(target_os = "windows")]
+	fn get_events(
+		_selector: i32,
+		win_selector: *mut c_void,
+		input_events: Vec<GenericEvent>,
+		output_events: &mut Vec<GenericEvent>,
+		filter_set: &mut HashSet<i32>,
+	) -> Result<i32, Error> {
+		for evt in input_events {
+			if evt.etype == GenericEventType::AddReadLT
+				|| evt.etype == GenericEventType::AddReadET
+				|| evt.etype == GenericEventType::DelWrite
+			{
+				let op = if filter_set.remove(&evt.fd) {
+					EPOLL_CTL_MOD
+				} else {
+					EPOLL_CTL_ADD
+				};
+				filter_set.insert(evt.fd);
+				let data = epoll_data_t { fd: evt.fd };
+				let mut event = epoll_event {
+					events: EPOLLIN | EPOLLRDHUP,
+					data,
+				};
+				let res = unsafe {
+					epoll_ctl(
+						win_selector,
+						op.try_into().unwrap_or(0),
+						evt.fd as usize,
+						&mut event,
+					)
+				};
+				if res != 0 {
+					// normal occurance, just means the socket is already closed
+					// must remove from filter set for next request
+					filter_set.remove(&evt.fd);
+				}
+			} else if evt.etype == GenericEventType::AddWriteET {
+				let op = if filter_set.remove(&evt.fd) {
+					EPOLL_CTL_MOD
+				} else {
+					EPOLL_CTL_ADD
+				};
+				filter_set.insert(evt.fd);
+				let data = epoll_data_t { fd: evt.fd };
+				let mut event = epoll_event {
+					events: EPOLLIN | EPOLLOUT | EPOLLRDHUP,
+					data,
+				};
+				let res = unsafe {
+					epoll_ctl(
+						win_selector,
+						op.try_into().unwrap_or(0),
+						evt.fd.try_into().unwrap_or(0),
+						&mut event,
+					)
+				};
+				if res != 0 {
+					filter_set.remove(&evt.fd);
+					log!(
+						"epoll_ctl (write) resulted in an unexpected error: {}, fd={}, op={}, epoll_ctl_add={}",
+						errno().to_string(), evt.fd, op, EPOLL_CTL_ADD,
+					);
+				}
+			} else if evt.etype == GenericEventType::DelRead {
+				filter_set.remove(&evt.fd);
+				let data = epoll_data_t { fd: evt.fd };
+				let mut event = epoll_event {
+					events: 0, // not used for del
+					data,
+				};
+
+				let res = unsafe {
+					epoll_ctl(
+						win_selector,
+						EPOLL_CTL_DEL.try_into().unwrap_or(0),
+						evt.fd.try_into().unwrap_or(0),
+						&mut event,
+					)
+				};
+
+				if res != 0 {
+					log!(
+						"epoll_ctl (del) resulted in unexpected error: {}",
+						errno().to_string(),
+					);
+				}
+			} else {
+				return Err(
+					ErrorKind::InternalError(format!("unexpected etype: {:?}", evt.etype)).into(),
+				);
+			}
+		}
+		let mut events: [epoll_event; MAX_EVENTS as usize] =
+			unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 1000) };
+		let mut ret_count_adjusted = 0;
+
+		if results > 0 {
+			for i in 0..results {
+				if !(events[i as usize].events & EPOLLOUT == 0) {
+					ret_count_adjusted += 1;
+					output_events.push(GenericEvent::new(
+						unsafe { events[i as usize].data.fd } as i32,
+						GenericEventType::AddWriteET,
+					));
+				}
+				if !(events[i as usize].events & EPOLLIN == 0) {
+					ret_count_adjusted += 1;
+					output_events.push(GenericEvent::new(
+						unsafe { events[i as usize].data.fd } as i32,
+						GenericEventType::AddReadET,
+					));
+				}
+			}
+		}
+
+		Ok(ret_count_adjusted)
+	}
+
 	#[cfg(target_os = "linux")]
 	fn get_events(
 		epollfd: i32,
+		_win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
 		filter_set: &mut HashSet<i32>,
@@ -828,6 +1056,7 @@ where
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn get_events(
 		queue: i32,
+		_win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
 		_filter_set: &HashSet<i32>,
@@ -886,21 +1115,12 @@ where
 		Ok(ret_count_adjusted)
 	}
 
-	#[cfg(target_os = "windows")]
-	fn get_events(
-		epollfd: i32,
-		input_events: Vec<GenericEvent>,
-		output_events: &mut Vec<GenericEvent>,
-		filter_set: &mut HashSet<i32>,
-	) -> Result<i32, Error> {
-		Ok(0)
-	}
-
 	fn poll_loop(
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 		selector: i32,
+		win_selector: *mut c_void,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(4)?;
@@ -923,6 +1143,11 @@ where
 		for _ in 0..INITIAL_MAX_FDS {
 			read_fd_type.push(FdType::Unknown);
 		}
+		if rx >= INITIAL_MAX_FDS.try_into().unwrap_or(0) {
+			for _ in INITIAL_MAX_FDS..(rx + 1) as usize {
+				read_fd_type.push(FdType::Unknown);
+			}
+		}
 		read_fd_type[rx as usize] = FdType::Wakeup;
 
 		let mut use_on_client_read = Vec::new();
@@ -932,12 +1157,24 @@ where
 			use_on_client_read.push(false);
 		}
 
+		if rx >= INITIAL_MAX_FDS.try_into().unwrap_or(0) {
+			for _ in INITIAL_MAX_FDS..(rx + 1) as usize {
+				use_on_client_read.push(false);
+			}
+		}
+
 		// add the wakeup pipe rx here
 		let mut output_events = vec![];
 		let mut input_events = vec![];
 		let mut filter_set = HashSet::new();
 		input_events.push(GenericEvent::new(rx, GenericEventType::AddReadLT));
-		Self::get_events(selector, input_events, &mut output_events, &mut filter_set)?;
+		Self::get_events(
+			selector,
+			win_selector,
+			input_events,
+			&mut output_events,
+			&mut filter_set,
+		)?;
 
 		let mut ret_count;
 		loop {
@@ -965,9 +1202,19 @@ where
 				// check if a stop is needed
 				if guarded_data.stop {
 					thread_pool.stop()?;
-					let res = unsafe { close(selector) };
-					if res != 0 {
-						log!("Error closing selector: {}", errno().to_string());
+					#[cfg(unix)]
+					{
+						let res = unsafe { close(selector) };
+						if res != 0 {
+							log!("Error closing selector: {}", errno().to_string());
+						}
+					}
+					#[cfg(target_os = "windows")]
+					{
+						let res = unsafe { epoll_close(win_selector) };
+						if res != 0 {
+							log!("Error closing win_selector: {}", errno().to_string());
+						}
 					}
 					let res = unsafe { close(guarded_data.wakeup_fd) };
 					if res != 0 {
@@ -1061,16 +1308,23 @@ where
 				&global_lock,
 				fd_locks,
 			)?;
-
+			/*if evs.len() > 0 {
+			log!("input events = {:?}", evs);
+			}*/
 			let mut output_events = vec![];
-			ret_count = Self::get_events(selector, evs, &mut output_events, &mut filter_set)?;
-
+			ret_count = Self::get_events(
+				selector,
+				win_selector,
+				evs,
+				&mut output_events,
+				&mut filter_set,
+			)?;
 			// if no events are returned (on timeout), just bypass following logic and wait
 			if ret_count == 0 {
 				continue;
 			}
-
 			for event in output_events {
+				//log!("proc event = {:?}", event);
 				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
 						event.fd as i32,
@@ -1126,11 +1380,29 @@ where
 				))
 				.into());
 			}
-			let buf: *mut c_void = &mut write_buffer.buffer
-				[(write_buffer.offset as usize)..(write_buffer.len as usize)]
-				as *mut _ as *mut c_void;
-			let len = unsafe { write(fd, buf, (write_buffer.len - write_buffer.offset).into()) };
+			#[cfg(unix)]
+			let len = {
+				let buf: *mut c_void = &mut write_buffer.buffer
+					[(write_buffer.offset as usize)..(write_buffer.len as usize)]
+					as *mut _ as *mut c_void;
 
+				unsafe { write(fd, buf, (write_buffer.len - write_buffer.offset).into()) }
+			};
+			#[cfg(target_os = "windows")]
+			let len = {
+				let buf: *mut i8 = &mut write_buffer.buffer
+					[(write_buffer.offset as usize)..(write_buffer.len as usize)]
+					as *mut _ as *mut i8;
+
+				unsafe {
+					ws2_32::send(
+						fd.try_into().unwrap_or(0),
+						buf,
+						(write_buffer.len - write_buffer.offset).into(),
+						0,
+					)
+				}
+			};
 			if len >= 0 {
 				if len
 					== (write_buffer.len as isize - write_buffer.offset as isize)
@@ -1150,6 +1422,7 @@ where
 				if errno().0 == EAGAIN {
 					// break because we're edge triggered.
 					// a new event occurs.
+
 					return Ok(initial_len - write_buffer.len);
 				} else {
 					// this is an actual write error.
@@ -1172,7 +1445,10 @@ where
 			Ok(mut state) => {
 				if state.fd == fd {
 					if state.state == State::Closing {
+						#[cfg(unix)]
 						let res = unsafe { close(state.fd) };
+						#[cfg(target_os = "windows")]
+						let res = unsafe { ws2_32::closesocket(state.fd.try_into().unwrap_or(0)) };
 						if res == 0 {
 							state.state = State::Closed;
 						} else {
@@ -1199,7 +1475,6 @@ where
 				return Err(ErrorKind::InternalError("can't obtain lock".to_string()).into());
 			}
 		}
-
 		Ok(())
 	}
 
@@ -1207,7 +1482,8 @@ where
 		fd: i32,
 		state_info: &mut StateInfo,
 		guarded_data: &Arc<Mutex<GuardedData>>,
-	) -> Result<(), Error> {
+	) -> Result<bool, Error> {
+		let mut complete = true;
 		loop {
 			let (ret, total_len, front_close, front_seqno) = {
 				let front = state_info.write_buffer.front_mut();
@@ -1242,6 +1518,7 @@ where
 						// we didn't complete, we need to break
 						// we had to block so a new
 						// edge triggered event will occur
+						complete = false;
 						break;
 					}
 				}
@@ -1260,7 +1537,7 @@ where
 			}
 		}
 
-		Ok(())
+		Ok(complete)
 	}
 
 	fn process_event_write(
@@ -1270,31 +1547,93 @@ where
 		global_lock: &Arc<RwLock<bool>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
+		#[cfg(target_os = "windows")]
+		{
+			// if windows push pause event before proceeding
+			let guarded_data = guarded_data.lock();
+			match guarded_data {
+				Ok(mut guarded_data) => {
+					let nevent = HandlerEvent::new(fd, HandlerEventType::PauseWrite, 0);
+					guarded_data.handler_events.push(nevent);
+				}
+				Err(e) => {
+					log!(
+						"unexpected error getting guareded_data lock: {}",
+						e.to_string()
+					);
+				}
+			}
+		}
+
 		let state_info = fd_locks[fd as usize].clone();
 		let guarded_data = guarded_data.clone();
 		let global_lock = global_lock.clone();
+		#[cfg(target_os = "windows")]
+		let mut fd_locks = fd_locks.clone();
 		thread_pool
 			.execute(async move {
-				let lock = global_lock.read();
-				match lock {
-					Ok(_) => {}
-					Err(e) => log!("Unexpected error obtaining write lock: {}", e),
-				}
-				let state_info = state_info.lock();
-				match state_info {
-					Ok(mut state_info) => {
-						let res = Self::write_until_block(fd, &mut state_info, &guarded_data);
-						match res {
-							Ok(_) => {}
+				#[cfg(target_os = "windows")]
+				let mut seqno = 0;
+				#[cfg(target_os = "windows")]
+				let mut complete = true;
+				{
+					let lock = global_lock.read();
+					match lock {
+						Ok(_) => {}
+						Err(e) => log!("Unexpected error obtaining write lock: {}", e),
+					}
+					{
+						let state_info = state_info.lock();
+						match state_info {
+							Ok(mut state_info) => {
+								#[cfg(target_os = "windows")]
+								{
+									seqno = state_info.seqno;
+								}
+								let res =
+									Self::write_until_block(fd, &mut state_info, &guarded_data);
+								match res {
+									Ok(_c) =>
+									#[cfg(target_os = "windows")]
+									{
+										complete = _c;
+									}
+									Err(e) => {
+										log!(
+											"unexpected error in process_event_write: {}",
+											e.to_string()
+										);
+									}
+								}
+							}
 							Err(e) => {
-								log!("unexpected error in process_event_write: {}", e.to_string());
+								log!(
+									"unexpected error with locking write_buffer: {}",
+									e.to_string()
+								);
 							}
 						}
 					}
-					Err(e) => log!(
-						"unexpected error with locking write_buffer: {}",
-						e.to_string()
-					),
+				}
+
+				#[cfg(target_os = "windows")]
+				{
+					if !complete {
+						let res = Self::push_handler_event(
+							fd,
+							HandlerEventType::ResumeWrite,
+							&guarded_data,
+							&mut fd_locks,
+							false,
+							seqno,
+						);
+						match res {
+							Ok(_) => {}
+							Err(e) => {
+								log!("Error pushing handler event: {}", e);
+							}
+						}
+					}
 				}
 			})
 			.map_err(|e| {
@@ -1327,7 +1666,7 @@ where
 					Ok(_) => {}
 					Err(e) => log!("Unexpected error obtaining read lock, {}", e),
 				}
-
+				#[cfg(unix)]
 				let res = unsafe {
 					accept(
 						fd.try_into().unwrap_or(0),
@@ -1340,6 +1679,18 @@ where
 					)
 				};
 
+				#[cfg(target_os = "windows")]
+				let res = unsafe {
+					ws2_32::accept(
+						fd.try_into().unwrap_or(0),
+						&mut winapi::ws2def::SOCKADDR {
+							..std::mem::zeroed()
+						},
+						&mut (std::mem::size_of::<winapi::ws2def::SOCKADDR>() as u32)
+							.try_into()
+							.unwrap_or(0),
+					)
+				};
 				if res > 0 {
 					let len = read_fd_type.len();
 					if res as usize >= len {
@@ -1398,12 +1749,31 @@ where
 
 					// set non-blocking
 					#[cfg(unix)]
-					let fcntl_res = unsafe { fcntl(res, libc::F_SETFL, libc::O_NONBLOCK) };
+					{
+						let fcntl_res = unsafe { fcntl(res, libc::F_SETFL, libc::O_NONBLOCK) };
+						if fcntl_res < 0 {
+							let e = errno().to_string();
+							return Err(
+								ErrorKind::InternalError(format!("fcntl error: {}", e)).into()
+							);
+						}
+					}
 					#[cfg(target_os = "windows")]
-					let fcntl_res = unsafe { ioctlsocket(res.try_into().unwrap_or(0), 5421, &mut 1) };
-					if fcntl_res < 0 {
-						let e = errno().to_string();
-						return Err(ErrorKind::InternalError(format!("fcntl error: {}", e)).into());
+					{
+						/*
+						let fionbio = 0x8004667eu32;
+						let ioctl_res = unsafe {
+							ws2_32::ioctlsocket(
+								res.try_into().unwrap_or(0),
+								fionbio as c_int,
+								&mut 1,
+							)
+						};
+
+						if ioctl_res != 0 {
+							log!("complete fion with error: {}", errno().to_string());
+						}
+						*/
 					}
 					let guarded_data = guarded_data.clone();
 
@@ -1430,6 +1800,24 @@ where
 				}?;
 			}
 			FdType::Stream => {
+				#[cfg(target_os = "windows")]
+				{
+					// if windows push pause event before proceeding
+					let guarded_data = guarded_data.lock();
+					match guarded_data {
+						Ok(mut guarded_data) => {
+							let nevent = HandlerEvent::new(fd, HandlerEventType::PauseRead, seqno);
+							guarded_data.handler_events.push(nevent);
+						}
+						Err(e) => {
+							log!(
+								"unexpected error getting guareded_data lock: {}",
+								e.to_string()
+							);
+						}
+					}
+				}
+
 				let guarded_data = guarded_data.clone();
 				let fd_lock = fd_locks[fd as usize].clone();
 				let mut fd_locks = fd_locks.clone();
@@ -1443,17 +1831,38 @@ where
 						}
 						let mut buf = [0u8; BUFFER_SIZE];
 						loop {
-							let fd_lock = fd_lock.lock();
-							let seqno = match fd_lock {
-								Ok(state_info) => (*state_info).seqno,
-								Err(e) => {
-									log!("Unexpected Error obtaining read lock: {}", e.to_string());
-									break;
-								}
+							let (seqno, len) = {
+								let fd_lock = fd_lock.lock();
+								let seqno = match fd_lock {
+									Ok(ref state_info) => (*state_info).seqno,
+									Err(e) => {
+										log!(
+											"Unexpected Error obtaining read lock: {}",
+											e.to_string()
+										);
+										break;
+									}
+								};
+								#[cfg(unix)]
+								let len = {
+									let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
+									unsafe { read(fd, cbuf, BUFFER_SIZE) }
+								};
+								#[cfg(target_os = "windows")]
+								let len = {
+									let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
+									unsafe {
+										ws2_32::recv(
+											fd.try_into().unwrap_or(0),
+											cbuf,
+											BUFFER_SIZE.try_into().unwrap_or(0),
+											0,
+										)
+									}
+								};
+								(seqno, len)
 							};
-							let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
-							let len =
-								unsafe { read(fd, cbuf, BUFFER_SIZE.try_into().unwrap_or(0)) };
+
 							if len >= 0 {
 								let _ = Self::process_read_result(
 									fd,
@@ -1469,6 +1878,10 @@ where
 								if len == 0 {
 									break;
 								}
+
+								// break on windows
+								#[cfg(target_os = "windows")]
+								break;
 							} else {
 								let e = errno();
 								if e.0 != EAGAIN {
@@ -1483,6 +1896,24 @@ where
 								break;
 							};
 						}
+						// resume read here - windows
+						#[cfg(target_os = "windows")]
+						{
+							let res = Self::push_handler_event(
+								fd,
+								HandlerEventType::ResumeRead,
+								&guarded_data,
+								&mut fd_locks,
+								false,
+								seqno,
+							);
+							match res {
+								Ok(_) => {}
+								Err(e) => {
+									log!("Error pushing handler event: {}", e);
+								}
+							}
+						}
 					})
 					.map_err(|e| {
 						let error: Error =
@@ -1495,10 +1926,24 @@ where
 				log!("unexpected fd_type (unknown) for fd: {}", fd);
 			}
 			FdType::Wakeup => {
-				let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-				unsafe {
-					read(fd, cbuf, 1);
-				}
+				#[cfg(unix)]
+				{
+					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+					unsafe { read(fd, cbuf, 1) }
+				};
+				#[cfg(target_os = "windows")]
+				{
+					let cbuf: *mut i8 = &mut [0u8; 1] as *mut _ as *mut i8;
+					unsafe {
+						ws2_32::recv(
+							fd.try_into().unwrap_or(0),
+							cbuf,
+							BUFFER_SIZE.try_into().unwrap_or(0),
+							0,
+						)
+					}
+				};
+
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
 					let error: Error =
 						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -1687,9 +2132,19 @@ where
 				}
 			}
 			if wakeup && !wakeup_scheduled {
-				let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-				unsafe {
-					write(wakeup_fd, buf, 1);
+				#[cfg(unix)]
+				{
+					let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+					unsafe {
+						write(wakeup_fd, buf, 1);
+					}
+				}
+				#[cfg(target_os = "windows")]
+				{
+					let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
+					unsafe {
+						ws2_32::send(wakeup_fd.try_into().unwrap_or(0), buf, 1, 0);
+					}
 				}
 			}
 		}

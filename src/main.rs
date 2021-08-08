@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #[cfg(unix)]
+use libc::close;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
 // windows specific deps
@@ -24,7 +26,6 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
 use errno::errno;
-use libc::close;
 use log::*;
 use nioruntime_evh::eventhandler::EventHandler;
 use nioruntime_util::{Error, ErrorKind};
@@ -165,7 +166,10 @@ fn client_thread(
 
 	{
 		let _lock = tlat_sum.lock();
+		#[cfg(unix)]
 		let close_res = unsafe { close(fd.try_into().unwrap_or(0)) };
+		#[cfg(target_os = "windows")]
+		let close_res = unsafe { ws2_32::closesocket(fd.try_into().unwrap_or(0)) };
 		if close_res != 0 {
 			let e = errno();
 			log!("error close {} (fd={})", e.to_string(), fd);
