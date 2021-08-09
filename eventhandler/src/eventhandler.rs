@@ -113,6 +113,102 @@ impl GenericEvent {
 	}
 }
 
+fn do_write(
+	fd: i32,
+	data: &[u8],
+	offset: usize,
+	len: usize,
+	close: bool,
+	fd_lock: &Arc<Mutex<StateInfo>>,
+	connection_id: u128,
+	guarded_data: &Arc<Mutex<GuardedData>>,
+) -> Result<(), Error> {
+	if len + offset > data.len() {
+		return Err(ErrorKind::ArrayIndexOutofBounds(format!(
+			"offset+len='{}',data.len='{}'",
+			offset + len,
+			data.len()
+		))
+		.into());
+	}
+	{
+		let linked_list = &mut fd_lock
+			.lock()
+			.map_err(|e| {
+				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+				error
+			})?
+			.write_buffer;
+		let mut rem = len;
+		let mut count = 0;
+		loop {
+			let len = match rem <= BUFFER_SIZE {
+				true => rem,
+				false => BUFFER_SIZE,
+			} as u16;
+			let mut write_buffer = WriteBuffer {
+				offset: 0,
+				len,
+				buffer: [0u8; BUFFER_SIZE],
+				close: match rem <= BUFFER_SIZE {
+					true => close,
+					false => false,
+				},
+				connection_seqno: connection_id,
+			};
+
+			let start = offset + count * BUFFER_SIZE;
+			let end = offset + count * BUFFER_SIZE + (len as usize);
+			write_buffer.buffer[0..(len as usize)].copy_from_slice(&data[start..end]);
+
+			linked_list.push_back(write_buffer);
+
+			if rem <= BUFFER_SIZE {
+				break;
+			}
+			rem -= BUFFER_SIZE;
+			count += 1;
+		}
+	}
+
+	let (fd, wakeup_scheduled) = {
+		let mut guarded_data = guarded_data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		guarded_data.write_pending.push(fd.into());
+		do_wakeup_with_lock(&mut *guarded_data)?
+	};
+
+	if !wakeup_scheduled {
+		#[cfg(unix)]
+		{
+			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+			unsafe {
+				write(fd, buf, 1);
+			}
+		}
+		#[cfg(target_os = "windows")]
+		{
+			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
+			unsafe {
+				ws2_32::send(fd.try_into().unwrap_or(0), buf, 1, 0);
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
+	let wakeup_scheduled = data.wakeup_scheduled;
+	if !wakeup_scheduled {
+		data.wakeup_scheduled = true;
+	}
+	Ok((data.wakeup_fd, wakeup_scheduled))
+}
+
 #[derive(Clone)]
 pub struct WriteHandle {
 	fd: i32,
@@ -141,92 +237,16 @@ impl WriteHandle {
 	}
 
 	pub fn write(&self, data: &[u8], offset: usize, len: usize, close: bool) -> Result<(), Error> {
-		if len + offset > data.len() {
-			return Err(ErrorKind::ArrayIndexOutofBounds(format!(
-				"offset+len='{}',data.len='{}'",
-				offset + len,
-				data.len()
-			))
-			.into());
-		}
-		{
-			let linked_list = &mut self
-				.fd_lock
-				.lock()
-				.map_err(|e| {
-					let error: Error =
-						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-					error
-				})?
-				.write_buffer;
-			let mut rem = len;
-			let mut count = 0;
-			loop {
-				let len = match rem <= BUFFER_SIZE {
-					true => rem,
-					false => BUFFER_SIZE,
-				} as u16;
-				let mut write_buffer = WriteBuffer {
-					offset: 0,
-					len,
-					buffer: [0u8; BUFFER_SIZE],
-					close: match rem <= BUFFER_SIZE {
-						true => close,
-						false => false,
-					},
-					connection_seqno: self.connection_id,
-				};
-
-				let start = offset + count * BUFFER_SIZE;
-				let end = offset + count * BUFFER_SIZE + (len as usize);
-				write_buffer.buffer[0..(len as usize)].copy_from_slice(&data[start..end]);
-
-				linked_list.push_back(write_buffer);
-
-				if rem <= BUFFER_SIZE {
-					break;
-				}
-				rem -= BUFFER_SIZE;
-				count += 1;
-			}
-		}
-
-		let (fd, wakeup_scheduled) = {
-			let mut guarded_data = self.guarded_data.lock().map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?;
-
-			guarded_data.write_pending.push(self.fd.into());
-			Self::do_wakeup_with_lock(&mut *guarded_data)?
-		};
-
-		if !wakeup_scheduled {
-			#[cfg(unix)]
-			{
-				let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-				unsafe {
-					write(fd, buf, 1);
-				}
-			}
-			#[cfg(target_os = "windows")]
-			{
-				let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
-				unsafe {
-					ws2_32::send(fd.try_into().unwrap_or(0), buf, 1, 0);
-				}
-			}
-		}
-
-		Ok(())
-	}
-
-	fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
-		let wakeup_scheduled = data.wakeup_scheduled;
-		if !wakeup_scheduled {
-			data.wakeup_scheduled = true;
-		}
-		Ok((data.wakeup_fd, wakeup_scheduled))
+		do_write(
+			self.fd,
+			data,
+			offset,
+			len,
+			close,
+			&self.fd_lock,
+			self.connection_id,
+			&self.guarded_data,
+		)
 	}
 }
 
@@ -234,11 +254,12 @@ impl WriteHandle {
 struct FdAction {
 	fd: i32,
 	atype: ActionType,
+	seqno: u128,
 }
 
 impl FdAction {
-	fn new(fd: i32, atype: ActionType) -> FdAction {
-		FdAction { fd, atype }
+	fn new(fd: i32, atype: ActionType, seqno: u128) -> FdAction {
+		FdAction { fd, atype, seqno }
 	}
 }
 
@@ -277,7 +298,13 @@ enum FdType {
 	Unknown,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct StreamWriteBuffer {
+	fd: i32,
+	write_buffer: WriteBuffer,
+}
+
+#[derive(Debug, Clone)]
 pub struct WriteBuffer {
 	offset: u16,
 	len: u16,
@@ -339,6 +366,7 @@ pub struct GuardedData {
 	write_pending: Vec<i32>,
 	selector: Option<i32>,
 	stop: bool,
+	write_queue: Vec<StreamWriteBuffer>,
 }
 
 pub struct EventHandler<F, G, H, K> {
@@ -355,7 +383,7 @@ where
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	K: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 {
-	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<i32, Error> {
+	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<(i32, u128), Error> {
 		// make sure we have a client on_read handler configured
 		{
 			let callbacks = self.callbacks.lock().map_err(|e| {
@@ -383,13 +411,13 @@ where
 			netbsd,
 			openbsd
 		))]
-		let ret = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
+		let (fd, seqno) = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
-		let ret = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
-		Ok(ret)
+		let (fd, seqno) = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
+		Ok((fd, seqno))
 	}
 
-	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<i32, Error> {
+	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<(i32, u128), Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
 		#[cfg(any(
@@ -400,20 +428,20 @@ where
 			netbsd,
 			openbsd
 		))]
-		let ret = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
+		let (fd, seqno) = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
-		let ret = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
-		Ok(ret)
+		let (fd, seqno) = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
+		Ok((fd, seqno))
 	}
 
 	#[cfg(target_os = "windows")]
-	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<i32, Error> {
+	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<(i32, u128), Error> {
 		let fd = socket.try_into().unwrap_or(0);
-		self.add_fd(fd, atype)?;
-		Ok(fd)
+		let (fd, seqno) = self.add_fd(fd, atype)?;
+		Ok((fd, seqno))
 	}
 
-	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<i32, Error> {
+	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<(i32, u128), Error> {
 		self.ensure_handlers()?;
 
 		let mut data = self.data.lock().map_err(|e| {
@@ -428,8 +456,9 @@ where
 		}
 
 		let fd_actions = &mut data.fd_actions;
-		fd_actions.push(FdAction::new(fd, atype));
-		Ok(fd.into())
+		let seqno: u128 = rand::random();
+		fd_actions.push(FdAction::new(fd, atype, seqno));
+		Ok((fd.into(), seqno))
 	}
 
 	fn _remove_fd(&mut self, fd: i32) -> Result<(), Error> {
@@ -438,7 +467,7 @@ where
 			error
 		})?;
 		let fd_actions = &mut data.fd_actions;
-		fd_actions.push(FdAction::new(fd, ActionType::Remove));
+		fd_actions.push(FdAction::new(fd, ActionType::Remove, 0));
 		Ok(())
 	}
 
@@ -582,6 +611,7 @@ where
 			write_pending: vec![],
 			selector: None,
 			stop: false,
+			write_queue: vec![],
 		};
 		let guarded_data = Arc::new(Mutex::new(guarded_data));
 
@@ -636,6 +666,97 @@ where
 				ws2_32::send(guarded_data.wakeup_fd.try_into().unwrap_or(0), buf, 1, 0);
 			}
 		}
+
+		Ok(())
+	}
+
+	pub fn write(
+		&self,
+		fd: i32,
+		connection_seqno: u128,
+		data: &[u8],
+		close: bool,
+	) -> Result<(), Error> {
+		let mut buf = [0u8; BUFFER_SIZE];
+		let len = data.len();
+		let mut rem = len;
+		let mut start = 0;
+		let mut end = if len > BUFFER_SIZE { BUFFER_SIZE } else { len };
+
+		let mut wakeupfd = 0;
+		let mut wakeup_scheduled = false;
+		match self.data.lock() {
+			Ok(mut guarded_data) => loop {
+				let len = if rem < BUFFER_SIZE { rem } else { BUFFER_SIZE };
+				buf[..len].clone_from_slice(&data[start..end]);
+				self.write_buffer(
+					fd,
+					buf.clone(),
+					0,
+					len.try_into().unwrap(),
+					close,
+					connection_seqno,
+					&mut guarded_data,
+				)?;
+				if rem <= BUFFER_SIZE {
+					let (fd_inner, wakeup_scheduled_inner) =
+						do_wakeup_with_lock(&mut *guarded_data)?;
+					wakeupfd = fd_inner;
+					wakeup_scheduled = wakeup_scheduled_inner;
+					break;
+				}
+				rem -= BUFFER_SIZE;
+				start += BUFFER_SIZE;
+				end += BUFFER_SIZE;
+				if end > data.len() {
+					end = data.len();
+				}
+			},
+			Err(e) => {
+				log!("unexpected error obtaining guarded_data lock, {}", e);
+			}
+		}
+
+		if !wakeup_scheduled {
+			#[cfg(unix)]
+			{
+				let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+				unsafe {
+					write(wakeupfd, buf, 1);
+				}
+			}
+			#[cfg(target_os = "windows")]
+			{
+				let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
+				unsafe {
+					ws2_32::send(wakeupfd.try_into().unwrap_or(0), buf, 1, 0);
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn write_buffer(
+		&self,
+		fd: i32,
+		data: [u8; BUFFER_SIZE],
+		offset: u16,
+		len: u16,
+		close: bool,
+		connection_seqno: u128,
+		guarded_data: &mut GuardedData,
+	) -> Result<(), Error> {
+		guarded_data.write_queue.push(StreamWriteBuffer {
+			fd,
+			write_buffer: WriteBuffer {
+				buffer: data,
+				offset,
+				len,
+				close,
+				connection_seqno,
+			},
+		});
 
 		Ok(())
 	}
@@ -1108,7 +1229,7 @@ where
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
 				MAX_EVENTS,
-				&duration_to_timespec(std::time::Duration::from_millis(100)),
+				&duration_to_timespec(std::time::Duration::from_millis(500)),
 			)
 		};
 
@@ -1205,6 +1326,7 @@ where
 		let mut ret_count;
 		loop {
 			seqno += 1;
+			let write_queue;
 			let to_process;
 			let handler_events;
 			let write_pending;
@@ -1218,9 +1340,11 @@ where
 						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
 					error
 				})?;
+				write_queue = guarded_data.write_queue.clone();
 				to_process = guarded_data.fd_actions.clone();
 				handler_events = guarded_data.handler_events.clone();
 				write_pending = guarded_data.write_pending.clone();
+				guarded_data.write_queue.clear();
 				guarded_data.fd_actions.clear();
 				guarded_data.handler_events.clear();
 				guarded_data.write_pending.clear();
@@ -1266,6 +1390,31 @@ where
 				on_close = callbacks.on_close.as_ref().unwrap().clone();
 				on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
 			}
+
+			for buffer in write_queue {
+				if fd_locks.len() <= buffer.fd as usize {
+					Self::check_and_set(
+						fd_locks,
+						buffer.fd as usize,
+						Arc::new(Mutex::new(StateInfo::new(
+							buffer.fd.try_into().unwrap_or(0),
+							State::Normal,
+							buffer.write_buffer.connection_seqno,
+						))),
+					);
+				}
+				do_write(
+					buffer.fd,
+					&buffer.write_buffer.buffer,
+					buffer.write_buffer.offset.into(),
+					buffer.write_buffer.len.into(),
+					buffer.write_buffer.close,
+					&fd_locks[buffer.fd as usize],
+					buffer.write_buffer.connection_seqno,
+					guarded_data,
+				)?;
+			}
+
 			let mut evs: Vec<GenericEvent> = Vec::new();
 
 			for proc in to_process {
@@ -1291,6 +1440,26 @@ where
 							}
 						}
 						use_on_client_read[fd] = true;
+
+						if on_read_locks.len() <= fd as usize {
+							Self::check_and_set(
+								on_read_locks,
+								fd as usize,
+								Arc::new(Mutex::new(false)),
+							);
+						}
+
+						if fd_locks.len() <= fd as usize {
+							Self::check_and_set(
+								fd_locks,
+								fd as usize,
+								Arc::new(Mutex::new(StateInfo::new(
+									fd.try_into().unwrap_or(0),
+									State::Normal,
+									proc.seqno,
+								))),
+							);
+						}
 					}
 					ActionType::AddListener => {
 						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadLT));
@@ -2405,89 +2574,67 @@ fn test_stop() -> Result<(), Error> {
 
 #[test]
 fn test_large_messages() -> Result<(), Error> {
-	use std::io::Read;
-	use std::io::Write;
 	use std::net::TcpListener;
 	use std::net::TcpStream;
 
-	#[cfg(unix)]
-	let buf_len = 100_000_000;
-	#[cfg(target_os = "windows")] // winsock buffer size issue. (appears client side only)
-	// TODO: monitor. leave test at 100k which passes for now.
-	let buf_len = 100_000;
-	let listener = TcpListener::bind("127.0.0.1:9944")?;
-	let mut stream = TcpStream::connect("127.0.0.1:9944")?;
+	let listener = TcpListener::bind("127.0.0.1:9933")?;
+	let stream = TcpStream::connect("127.0.0.1:9933")?;
 	let mut eh = EventHandler::new();
-	let x = Arc::new(Mutex::new(0));
-	let xclone = x.clone();
-	let complete = Arc::new(Mutex::new(false));
-	let completeclone = complete.clone();
 
-	let data_buf = Arc::new(Mutex::new(vec![]));
 	eh.set_on_read(move |buf, len, wh| {
-		let mut data_buf = data_buf.lock().unwrap();
-		for i in 0..len {
-			data_buf.push(buf[i]);
-			if buf[i] == 128 {
-				// complete
-				assert_eq!(data_buf.len(), buf_len + 1);
-				for i in 0..buf_len {
-					if data_buf[i] != (i % 123) as u8 {
-						log!("i={}", i);
-					}
-					assert_eq!(data_buf[i], (i % 123) as u8);
-				}
-
-				let mut x = xclone.lock().unwrap();
-				*x = data_buf.len();
-
-				let mut complete = completeclone.lock().unwrap();
-				*complete = true;
-				wh.write(&data_buf, 0, data_buf.len(), false)?;
+		match len {
+			// just close the connection with no response
+			7 => {
+				let _ = wh.close();
+			}
+			// close if len == 5, otherwise keep open
+			_ => {
+				let _ = wh.write(buf, 0, len, len == 5);
 			}
 		}
-
 		Ok(())
 	})?;
 
+	let mut msgbuf = vec![];
+	for i in 0..10_000_000 {
+		msgbuf.push((i % 123) as u8);
+	}
+	msgbuf.push(128);
+	let cloned_msgbuf = msgbuf.clone();
+
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
-	eh.set_on_client_read(move |_buf, _len, _wh| Ok(()))?;
+
+	let client_accumulator = Arc::new(Mutex::new(vec![]));
+	let complete = Arc::new(Mutex::new(false));
+	let complete_clone = complete.clone();
+
+	eh.set_on_client_read(move |buf, len, _wh| {
+		let mut client_accumulator = client_accumulator.lock().unwrap();
+		for i in 0..len {
+			client_accumulator.push(buf[i]);
+			if buf[i] == 128 {
+				assert_eq!(client_accumulator.len(), cloned_msgbuf.len());
+				assert_eq!(*client_accumulator, cloned_msgbuf);
+				let mut complete = complete_clone.lock().unwrap();
+				*complete = true;
+			}
+		}
+		Ok(())
+	})?;
+
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
-
-	let mut msg = vec![];
-	for i in 0..buf_len {
-		msg.push((i % 123) as u8);
-	}
-	msg.push(128 as u8);
-	stream.write(&msg)?;
-	let mut buf = [0u8; 973];
-	let mut len_sum = 0;
-	let mut data_buf = vec![];
-
+	let (fd, seqno) = eh.add_tcp_stream(&stream)?;
+	eh.write(fd, seqno, &msgbuf, false)?;
 	loop {
-		let len = stream.read(&mut buf)?;
-		for i in 0..len {
-			data_buf.push(buf[i]);
+		{
+			let complete = complete.lock().unwrap();
+			if *complete {
+				break;
+			}
 		}
-		len_sum += len;
-		if len_sum == buf_len + 1 {
-			break;
-		}
-	}
-
-	assert_eq!(data_buf, msg);
-
-	loop {
-		std::thread::sleep(std::time::Duration::from_millis(50));
-		let xval = *(x.lock().unwrap());
-		let complete = complete.lock().unwrap();
-		if !*complete {
-			continue;
-		}
-		assert_eq!(xval, buf_len + 1);
-		break;
+		std::thread::sleep(std::time::Duration::from_millis(10));
 	}
 	Ok(())
 }
