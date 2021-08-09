@@ -737,7 +737,7 @@ where
 		Ok(())
 	}
 
-	pub fn write_buffer(
+	fn write_buffer(
 		&self,
 		fd: i32,
 		data: [u8; BUFFER_SIZE],
@@ -1584,11 +1584,11 @@ where
 			}
 			#[cfg(unix)]
 			let len = {
-				let buf: *mut c_void = &mut write_buffer.buffer
-					[(write_buffer.offset as usize)..(write_buffer.len as usize)]
+				let buf: *mut c_void = &mut write_buffer.buffer[(write_buffer.offset as usize)
+					..(write_buffer.offset as usize + write_buffer.len as usize)]
 					as *mut _ as *mut c_void;
 
-				unsafe { write(fd, buf, (write_buffer.len - write_buffer.offset).into()) }
+				unsafe { write(fd, buf, write_buffer.len.into()) }
 			};
 			#[cfg(target_os = "windows")]
 			let len = {
@@ -1606,11 +1606,7 @@ where
 				}
 			};
 			if len >= 0 {
-				if len
-					== (write_buffer.len as isize - write_buffer.offset as isize)
-						.try_into()
-						.unwrap_or(0)
-				{
+				if len == (write_buffer.len as isize).try_into().unwrap_or(0) {
 					// we're done
 					write_buffer.offset += len as u16;
 					write_buffer.len -= len as u16;
