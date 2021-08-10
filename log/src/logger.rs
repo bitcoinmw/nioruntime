@@ -14,9 +14,12 @@
 
 #![macro_use]
 
+//! A logging library.
+
 use chrono::{DateTime, Local, Utc};
 use lazy_static::lazy_static;
 use nioruntime_util::{Error, ErrorKind};
+use std::collections::HashMap;
 use std::fs::{canonicalize, metadata, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,66 +28,257 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 lazy_static! {
-	pub static ref LOG: Arc<Mutex<Log>> = Arc::new(Mutex::new(Log::new()));
+	/// This is the static holder of all log objects. Generally this
+	/// should not be called directly. See [`log`] instead.
+	pub static ref LOG: Arc<Mutex<HashMap<String, Log>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
-/*
-  Example:
-  log_config!(LogConfig { .. });
-  log!("ok ok ok");
-  log!("test {}", 1);
-*/
+/// log_multi is identical to [`log`] except that the name of the logger is specified instead of using
+/// The default logger.
+/// For example:
+///
+/// ```
+/// let abc = 123;
+/// log_multi!("logger2", "hi");
+/// log_multi!("logger2", "value = {}", abc);
+/// ```
+#[macro_export]
+macro_rules! log_multi {
+	($a:expr, $b:expr) => {
+		let static_log = &LOG;
+		let mut log_map = static_log.lock();
+		match log_map {
+			Ok(mut log_map) => {
+				let log = log_map.get_mut($a);
+				match log {
+					Some(log) => {
+						do_log!(1, true, log, $b);
+					},
+					None => {
+						let mut log = log::Log::new();
+						do_log!(1, true, log, $b);
+						log_map.insert($a.to_string(), log);
+					}
+				}
+			},
+			Err(e) => {
+				println!(
+					"Error: could not log '{}' due to PoisonError: {}",
+					format!($b),
+					e.to_string()
+				);
+			}
+		}
+	};
+	($a:expr,$b:expr,$($c:tt)*)=>{
+		let static_log = &LOG;
+		let mut log_map = static_log.lock();
+		match log_map {
+			Ok(mut log_map) => {
+				let log = log_map.get_mut($a);
+				match log {
+					Some(log) => {
+						do_log!(1, true, log, $b, $($c)*);
+					},
+					None => {
+						let mut log = log::Log::new();
+						do_log!(1, true, log, $b, $($c)*);
+						log_map.insert($a.to_string(), log);
+					}
+				}
+			},
+			Err(e) => {
+				println!(
+					"Error: could not log '{}' due to PoisonError: {}",
+					format!($b, $($c)*),
+					e.to_string()
+				);
+			},
+		}
+	};
+}
 
+/// The main logging macro. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used exactly like the pritln/format macros. For example:
+///
+/// ```
+/// let abc = 123;
+/// log!("my value = {}", abc);
+/// log!("hi");
+///
+/// The output will look like this:
+/// [2021-08-09 19:41:37]: my value = 123
+/// [2021-08-09 19:41:37]: hi
+/// ```
 #[macro_export]
 macro_rules! log {
 	($a:expr)=>{
 		{
-                        let log = &LOG;
-                        let log = log.lock();
-			do_log!(true, log, $a)
+                	const DEFAULT_LOG: &str = "default";
+                	let static_log = &LOG;
+                	let mut log_map = static_log.lock();
+			match log_map {
+				Ok(mut log_map) => {
+                	let log = log_map.get_mut(&DEFAULT_LOG.to_string());
+                	match log {
+                        	Some(log) => {
+                                	do_log!(1, true, log, $a);
+                        	},
+                        	None => {
+                                	let mut log = log::Log::new();
+                                	do_log!(1, true, log, $a);
+                                	log_map.insert(DEFAULT_LOG.to_string(), log);
+                        	}
+                	}
+				},
+				Err(e) => {
+                                        println!(
+                                                "Error: could not log '{}' due to PoisonError: {}",
+                                                format!($a),
+                                                e.to_string()
+                                        );
+				},
+			}
 		}
     	};
 	($a:expr,$($b:tt)*)=>{
 		{
-			let log = &LOG;
-			let log = log.lock();
-			do_log!(true, log, $a, $($b)*)
+                        const DEFAULT_LOG: &str = "default";
+                        let static_log = &LOG;
+                        let mut log_map = static_log.lock().unwrap();
+                        let log = log_map.get_mut(&DEFAULT_LOG.to_string());
+                        match log {
+                                Some(log) => {
+                                        do_log!(1, true, log, $a, $($b)*);
+                                },
+                                None => {
+                                        let mut log = log::Log::new();
+                                        do_log!(1, true, log, $a, $($b)*);
+                                        log_map.insert(DEFAULT_LOG.to_string(), log);
+                                }
+                        }
 		}
-
 	}
 }
 
+/// Identical to [`log_no_ts`] except that the name of the logger is specified instead of using
+/// the default logger.
+/// For example:
+/// ```
+/// log_no_ts!("nondefaultlogger", "hi");
+/// log_no_ts!("nondefaultlogger", "value = {}", 123);
+/// ```
+#[macro_export]
+macro_rules! log_no_ts_multi {
+        ($a:expr, $b:expr)=>{
+                {
+                        let static_log = &LOG;
+                        let mut log_map = static_log.lock().unwrap();
+                        let log = log_map.get_mut($a);
+                        match log {
+                                Some(log) => {
+                                        { do_log!(1, false, log, $b); }
+                                },
+                                None => {
+                                        let mut log = log::Log::new();
+                                        { do_log!(1, false, log, $b); }
+                                        log_map.insert($a.to_string(), log);
+                                }
+                        }
+                }
+        };
+        ($a:expr,$b:expr,$($c:tt)*)=>{
+                {
+                        let static_log = &LOG;
+                        let mut log_map = static_log.lock().unwrap();
+                        let log = log_map.get_mut($a);
+                        match log {
+                                Some(log) => {
+                                        { do_log!(1, false, log, $b, $($c)*) }
+                                },
+                                None => {
+                                        let mut log = log::Log::new();
+                                        { do_log!(1, false, log, $b, $($c)*) }
+                                        log_map.insert($a, log);
+                                }
+                        }
+                }
+        };
+}
+
+/// Log using the default logger and don't print a timestamp. See [`log`] for more details on logging.
+/// For example:
+///
+/// ```
+/// log!("hi");
+/// log_no_ts!("message here");
+/// log!("more data");
+///
+/// The output will look like this:
+/// [2021-08-09 19:41:37]: hi
+/// message here
+/// [2021-08-09 19:41:37]: more data
+/// ```
 #[macro_export]
 macro_rules! log_no_ts {
 	($a:expr)=>{
                 {
-                        let log = &LOG;
-                        let log = log.lock();
-                        { do_log!(false, log, $a) }
+                        const DEFAULT_LOG: &str = "default";
+                        let static_log = &LOG;
+                        let mut log_map = static_log.lock().unwrap();
+                        let log = log_map.get_mut(&DEFAULT_LOG.to_string());
+                        match log {
+                                Some(log) => {
+                                        { do_log!(1, false, log, $a); }
+                                },
+                                None => {
+                                        let mut log = log::Log::new();
+                                        { do_log!(1, false, log, $a); }
+                                        log_map.insert(DEFAULT_LOG.to_string(), log);
+                                }
+                        }
                 }
 	};
 	($a:expr,$($b:tt)*)=>{
 		{
-                        let log = &LOG;
-                        let log = log.lock();
-                        { do_log!(false, log, $a, $($b)*) }
+
+                        const DEFAULT_LOG: &str = "default";
+                        let static_log = &LOG;
+                        let mut log_map = static_log.lock().unwrap();
+                        let log = log_map.get_mut(&DEFAULT_LOG.to_string());
+                        match log {
+                                Some(log) => {
+                                        { do_log!(1, false, log, $a, $($b)*) }
+                                },
+                                None => {
+                                        let mut log = log::Log::new();
+                                        { do_log!(1, false, log, $a, $($b)*) }
+                                        log_map.insert(DEFAULT_LOG.to_string(), log);
+                                }
+                        }
 		}
 	};
 }
 
+/// Generally, this macro should not be used directly. It is used by the other macros. See [`log`] instead.
 #[macro_export]
 macro_rules! do_log {
-        ($show_ts:expr, $log:expr, $a:expr)=>{
-                        match $log {
-                                Ok(mut log) => {
+        ($level:expr)=>{
+					const LOG_LEVEL: i32 = $level;
+	};
+        ($level:expr, $show_ts:expr, $log:expr, $a:expr)=>{
+			{
+				#[cfg(not(LOG_LEVEL))]
+				const LOG_LEVEL: i32 = 1;
+				if $level >= LOG_LEVEL {
                                         // if not configured, use defaults
-                                        if !log.is_configured() {
-                                                log.config_with_object(LogConfig::default()).unwrap();
+                                        if !$log.is_configured() {
+                                                $log.config_with_object(LogConfig::default()).unwrap();
                                         }
 
-					let _ = log.update_show_timestamp($show_ts);
+					let _ = $log.update_show_timestamp($show_ts);
 
-                                        match log.log(&format!($a)) {
+                                        match $log.log(&format!($a)) {
                                                 Ok(_) => {},
                                                 Err(e) => {
                                                         println!(
@@ -96,27 +290,21 @@ macro_rules! do_log {
                                         }
 
 					// always set to showing timestamp (as default)
-					let _ = log.update_show_timestamp(true);
-
-                                },
-                                Err(e) => {
-                                        println!(
-                                                "Error: could not log '{}' due to PoisonError: {}",
-                                                format!($a),
-                                                e.to_string()
-                                        );
-                                },
-                        }
+					let _ = $log.update_show_timestamp(true);
+				}
+			}
         };
-        ($show_ts:expr, $log:expr, $a:expr, $($b:tt)*)=>{
-                        match $log {
-                                Ok(mut log) => {
+        ($level:expr, $show_ts:expr, $log:expr, $a:expr, $($b:tt)*)=>{
+			{
+				#[cfg(not(LOG_LEVEL))]
+				const LOG_LEVEL: i32 = 1;
+				if $level >= LOG_LEVEL {
                                         // if not configured, use defaults
-                                        if !log.is_configured() {
-                                                log.config_with_object(LogConfig::default()).unwrap();
+                                        if !$log.is_configured() {
+                                                $log.config_with_object(LogConfig::default()).unwrap();
                                         }
 
-                                        match log.log(&format!($a, $($b)*)) {
+                                        match $log.log(&format!($a, $($b)*)) {
                                                 Ok(_) => {},
                                                 Err(e) => {
                                                         println!(
@@ -126,27 +314,85 @@ macro_rules! do_log {
                                                         );
                                                 }
                                         }
-
-                                },
-                                Err(e) => {
-                                        println!(
-                                                "Error: could not log '{}' due to PoisonError: {}",
-                                                format!($a, $($b)*),
-                                                e.to_string()
-                                        );
-                                },
-                        }
+				}
+			}
         };
 }
 
+/// log_config_multi is identical to [`log_config`] except that the name of the logger is specified instead of using
+/// The default logger.
+///
+/// A sample log_config_multi! call might look something like this:
+///
+/// ```
+/// log_config_multi!(
+///     "nondefaultlogger",
+///     log::LogConfig {
+///         max_age_millis: 10000, // set log rotations to every 10 seconds
+///         max_size: 10000, // set log rotations to every 10,000 bytes
+///         file_path: "./test2.log".to_string(), // log to the file "./test.log"
+///         ..Default::default()
+///     }
+/// )?;
+/// ```
+/// For full details on all parameters of LogConfig see [`LogConfig`].
+#[macro_export]
+macro_rules! log_config_multi {
+	($a:expr, $b:expr) => {{
+		let static_log = &LOG;
+		let mut log_map = static_log.lock();
+		match log_map {
+			Ok(mut log_map) => {
+				let log = log_map.get_mut($a);
+				match log {
+					Some(log) => log.config_with_object($b),
+					None => {
+						let mut log = crate::Log::new();
+						let ret = log.config_with_object($b);
+						log_map.insert($a.to_string(), log);
+						ret
+					}
+				}
+			}
+			Err(e) => {
+				Err(ErrorKind::PoisonError(format!("log generated poison error: {}", e)).into())
+			}
+		}
+	}};
+}
+
+/// This macro may be used to configure logging. If it is not called. The default LogConfig is used.
+/// By default logging is only done to stdout.
+/// A sample log_config! call might look something like this:
+///
+/// ```
+/// log_config!(log::LogConfig {
+/// 	max_age_millis: 10000, // set log rotations to every 10 seconds
+/// 	max_size: 10000, // set log rotations to every 10,000 bytes
+/// 	file_path: "./test.log".to_string(), // log to the file "./test.log"
+/// 	..Default::default()
+/// })?;
+/// ```
+/// For full details on all parameters of LogConfig see [`LogConfig`].
 #[macro_export]
 macro_rules! log_config {
 	($a:expr) => {{
-		let log = &LOG;
-		let log = log.lock();
-
-		match log {
-			Ok(mut log) => log.config_with_object($a),
+		const DEFAULT_LOG: &str = "default";
+		let static_log = &LOG;
+		let mut log_map = static_log.lock();
+		match log_map {
+			Ok(mut log_map) => {
+				let log = log_map.get_mut(&DEFAULT_LOG.to_string());
+				match log {
+					Some(log) => log.config_with_object($a),
+					None => {
+						let mut log = crate::Log::new();
+						let ret = log.config_with_object($a);
+						log_map.insert(DEFAULT_LOG.to_string(), log);
+						ret
+					}
+				}
+			}
 			Err(e) => {
 				Err(ErrorKind::PoisonError(format!("log generated poison error: {}", e)).into())
 			}
@@ -167,13 +413,34 @@ struct LogParams {
 	config: LogConfig,
 }
 
+/// Log Config object.
 pub struct LogConfig {
-	file_path: String,
-	max_size: u64,
-	max_age_millis: u128,
-	file_header: String,
-	show_timestamp: bool,
-	show_stdout: bool,
+	/// The path to the log file. By default, logging is only printed to standard output.
+	/// This default behaviour is acheived by setting file_path to an empty string.
+	/// If you wish to log to a file, this parameter must be set to a valid path.
+	pub file_path: String,
+	/// The maximum size in bytes of the log file before a log rotation occurs. By default,
+	/// this is set to 10485760 bytes (10 mb). After a log rotation, a new file named:
+	/// ```
+	/// <log_name>.r_<month>_<day>_<year>_<hour>-<minute>-<second>_<random_number>.log
+	/// For example, something like this: mainlog.r_08_10_2021_03-12-23_12701992901411981750.log
+	/// ```
+	/// is created.
+	pub max_size: u64,
+	/// The maximum age in milliseconds before a log rotation occurs. By default, this is set to
+	/// 3600000 ms (1 hour). After a log rotation, a new file named:
+	/// ```
+	/// <log_name>.r_<month>_<day>_<year>_<hour>-<minute>-<second>_<random_number>.log
+	/// For example, something like this: mainlog.r_08_10_2021_03-12-23_12701992901411981750.log
+	/// ```
+	/// is created.
+	pub max_age_millis: u128,
+	/// The header (first line) of a log file. By default the header is not printed.
+	pub file_header: String,
+	/// Whether or not to show the timestamp. By default, this is set to true.
+	pub show_timestamp: bool,
+	/// Whether or not to print the log lines to standard output. By default, this is set to true.
+	pub show_stdout: bool,
 }
 
 impl Default for LogConfig {
@@ -236,8 +503,10 @@ impl LogParams {
 			self.rotate()?;
 			let mut file = self.file.as_ref().unwrap();
 			let line_bytes = self.config.file_header.as_bytes();
-			file.write(line_bytes)?;
-			file.write(&[10u8])?; // new line
+			if line_bytes.len() > 0 {
+				file.write(line_bytes)?;
+				file.write(&[10u8])?; // new line
+			}
 			self.init_age_millis = time_now;
 			self.cur_size = self.config.file_header.len() as u64 + 1;
 		}
@@ -343,10 +612,12 @@ impl Log {
 		if cur_size == 0 && file_path.is_some() {
 			// add the header if the file is new
 			let line_bytes = file_header.as_bytes();
-			let mut file = file.as_ref().unwrap();
-			file.write(line_bytes)?;
-			file.write(&[10u8])?; // new line
-			cur_size = file_header.len() as u64 + 1;
+			if line_bytes.len() > 0 {
+				let mut file = file.as_ref().unwrap();
+				file.write(line_bytes)?;
+				file.write(&[10u8])?; // new line
+				cur_size = file_header.len() as u64 + 1;
+			}
 		}
 
 		self.params = Some(LogParams {

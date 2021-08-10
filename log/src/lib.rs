@@ -14,4 +14,4 @@
 
 pub mod logger;
 
-pub use crate::logger::{LogConfig, LOG};
+pub use crate::logger::{Log, LogConfig, LOG};
