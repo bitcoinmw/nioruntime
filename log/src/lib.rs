@@ -15,3 +15,4 @@
 pub mod logger;
 
 pub use crate::logger::{Log, LogConfig, LOG};
+pub use crate::logger::{DEBUG, ERROR, FATAL, INFO, TRACE, WARN};

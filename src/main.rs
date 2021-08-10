@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+debug!();
+
 #[cfg(unix)]
 use libc::close;
 #[cfg(unix)]
@@ -28,7 +30,7 @@ use clap::App;
 use errno::errno;
 use log::*;
 use nioruntime_evh::eventhandler::EventHandler;
-use nioruntime_util::{Error, ErrorKind};
+use nioruntime_util::Error;
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -64,7 +66,7 @@ fn main() {
 	let res = real_main();
 	match res {
 		Ok(_) => {}
-		Err(e) => println!("real_main generated Error: {}", e.to_string()),
+		Err(e) => log!("real_main generated Error: {}", e.to_string()),
 	}
 }
 
@@ -94,7 +96,7 @@ fn client_thread(
 		if i != 0 && i % 10000 == 0 {
 			let elapsed = start_itt.elapsed().unwrap().as_millis();
 			let qps = (i as f64 / elapsed as f64) * 1000 as f64;
-			log!("Request {} on thread {}, qps={}", i, id, qps);
+			info!("Request {} on thread {}, qps={}", i, id, qps);
 		}
 		let start_query = std::time::SystemTime::now();
 		let num: u32 = rand::thread_rng().gen_range(min..max);
@@ -111,7 +113,7 @@ fn client_thread(
 		match res {
 			Ok(_x) => {}
 			Err(e) => {
-				log!("Write Error: {}", e.to_string());
+				info!("Write Error: {}", e.to_string());
 				std::thread::sleep(std::time::Duration::from_millis(1));
 			}
 		}
@@ -122,7 +124,7 @@ fn client_thread(
 			match res {
 				Ok(_) => {}
 				Err(ref e) => {
-					log!("Read Error: {}, fd = {}", e.to_string(), fd);
+					info!("Read Error: {}, fd = {}", e.to_string(), fd);
 					assert!(false);
 				}
 			}
@@ -140,7 +142,7 @@ fn client_thread(
 			assert_eq!(len, 0);
 			// not that only a single request is currently supported in this mode.
 			// TODO: support reconnect
-			log!("Successful disconnect");
+			info!("Successful disconnect");
 		}
 
 		let elapsed = start_query.elapsed().unwrap().as_nanos();
@@ -154,7 +156,7 @@ fn client_thread(
 		assert_eq!(buf2[4], offt as u8);
 		for i in 0..num {
 			if buf2[i as usize + 5] != ((i + offt) % 128) as u8 {
-				log!("assertion at {} fails", i);
+				info!("assertion at {} fails", i);
 			}
 			assert_eq!(buf2[i as usize + 5], ((i + offt) % 128) as u8);
 		}
@@ -172,7 +174,7 @@ fn client_thread(
 		let close_res = unsafe { ws2_32::closesocket(fd.try_into().unwrap_or(0)) };
 		if close_res != 0 {
 			let e = errno();
-			log!("error close {} (fd={})", e.to_string(), fd);
+			info!("error close {} (fd={})", e.to_string(), fd);
 		}
 		drop(stream);
 	}
@@ -231,12 +233,12 @@ fn real_main() -> Result<(), Error> {
 	};
 
 	if client {
-		log!("Running client");
-		log!("Threads={}", threads);
-		log!("Iterations={}", itt);
-		log!("Requests per thread per iteration={}", count);
-		log!("Request length: Max={},Min={}", max, min);
-		log_no_ts!(
+		info!("Running client");
+		info!("Threads={}", threads);
+		info!("Iterations={}", itt);
+		info!("Requests per thread per iteration={}", count);
+		info!("Request length: Max={},Min={}", max, min);
+		info_no_ts!(
 			"--------------------------------------------------------------------------------"
 		);
 
@@ -256,7 +258,7 @@ fn real_main() -> Result<(), Error> {
 					match res {
 						Ok(_) => {}
 						Err(e) => {
-							log!("Error in client thread: {}", e.to_string());
+							info!("Error in client thread: {}", e.to_string());
 							assert!(false);
 						}
 					}
@@ -266,25 +268,25 @@ fn real_main() -> Result<(), Error> {
 			for jh in jhs {
 				jh.join().expect("panic in thread");
 			}
-			log!("Iteration {} complete. ", x + 1);
+			info!("Iteration {} complete. ", x + 1);
 		}
 
 		let elapsed_millis = time.elapsed().unwrap().as_millis();
 		let lat_max = tlat_max.lock().unwrap();
-		log_no_ts!(
+		info_no_ts!(
 			"--------------------------------------------------------------------------------"
 		);
-		log!("Test complete in {} ms", elapsed_millis);
+		info!("Test complete in {} ms", elapsed_millis);
 		let tlat = tlat_sum.lock().unwrap();
 		let avg_lat = (*tlat) / (1_000_000 * count * threads * itt) as f64;
 		//let qps_simple = (1000.0 / avg_lat) * threads as f64;
 		let qps = (threads * count * itt * 1000) as f64 / elapsed_millis as f64;
-		log!("QPS={}", qps);
-		log!("Average latency={}ms", avg_lat,);
-		log!("Max latency={}ms", (*lat_max) as f64 / (1_000_000 as f64));
+		info!("QPS={}", qps);
+		info!("Average latency={}ms", avg_lat,);
+		info!("Max latency={}ms", (*lat_max) as f64 / (1_000_000 as f64));
 	} else {
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
-		log!("Listener Started");
+		info!("Listener Started");
 		let mut eh = EventHandler::new();
 
 		let buffers: Arc<Mutex<HashMap<u128, Buffer>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -316,7 +318,7 @@ fn real_main() -> Result<(), Error> {
 								if held_buf.data[i as usize + 5]
 									!= ((i + offt as usize) % 128) as u8
 								{
-									log!("invalid data at index = {}", i + 5);
+									info!("invalid data at index = {}", i + 5);
 								}
 								assert_eq!(
 									held_buf.data[i as usize + 5],
@@ -334,7 +336,7 @@ fn real_main() -> Result<(), Error> {
 					}
 				}
 				None => {
-					log!("unexpected none: {}, len = {}", wh.connection_id, len);
+					info!("unexpected none: {}, len = {}", wh.connection_id, len);
 					Ok(())
 				}
 			}

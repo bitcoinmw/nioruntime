@@ -27,24 +27,343 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+pub const TRACE: i32 = 0;
+pub const DEBUG: i32 = 1;
+pub const INFO: i32 = 2;
+pub const WARN: i32 = 3;
+pub const ERROR: i32 = 4;
+pub const FATAL: i32 = 5;
+
 lazy_static! {
 	/// This is the static holder of all log objects. Generally this
 	/// should not be called directly. See [`log`] instead.
 	pub static ref LOG: Arc<Mutex<HashMap<String, Log>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
-/// log_multi is identical to [`log`] except that the name of the logger is specified instead of using
-/// The default logger.
+/// Log at the 'fatal' (5) log level. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used like the pritln/format macros.
+/// Also see [`trace`] [`debug`], [`info`], [`warn`], or [`error`].
 /// For example:
-///
 /// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// fatal!(); // set log level to fatal "5"
+///
 /// let abc = 123;
-/// log_multi!("logger2", "hi");
-/// log_multi!("logger2", "value = {}", abc);
+/// fatal!("my value = {}", abc);
+/// fatal!("hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
+/// ```
+#[macro_export]
+macro_rules! fatal {
+        () => {
+                do_log!(FATAL);
+        };
+        ($a:expr) => {
+                {
+                        log!(FATAL, $a);
+                }
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                        log!(FATAL, $a, $($b)*);
+                }
+        };
+}
+
+/// Just like [`fatal`], but with no timestamp.
+#[macro_export]
+macro_rules! fatal_no_ts {
+        ($a:expr) => {
+                {
+                        log_no_ts!(FATAL, $a);
+                }
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                        log_no_ts!(FATAL, $a, $($b)*);
+                }
+        };
+}
+
+/// Log at the 'error' (4) log level. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used like the pritln/format macros.
+/// Also see [`trace`], [`debug`], [`info`], [`warn`], or [`fatal`].
+/// For example:
+/// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// error!(); // set log level to error "4"
+///
+/// let abc = 123;
+/// error!("my value = {}", abc);
+/// error!("hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
+/// ```
+#[macro_export]
+macro_rules! error {
+        () => {
+                do_log!(ERROR);
+        };
+        ($a:expr) => {
+                {
+                        log!(ERROR, $a);
+                }
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                        log!(ERROR, $a, $($b)*);
+                }
+        };
+}
+
+/// Just like [`error`], but with no timestamp.
+#[macro_export]
+macro_rules! error_no_ts {
+        ($a:expr) => {
+                {
+                        log_no_ts!(ERROR, $a);
+                }
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                        log_no_ts!(ERROR, $a, $($b)*);
+                }
+        };
+}
+
+/// Log at the 'warn' (3) log level. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used like the pritln/format macros.
+/// Also see [`trace`], [`debug`], [`info`], [`error`], or [`fatal`].
+/// For example:
+/// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// warn!(); // set log level to warn "3"
+///
+/// let abc = 123;
+/// warn!("my value = {}", abc);
+/// warn!("hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
+/// ```
+#[macro_export]
+macro_rules! warn {
+        () => {
+                do_log!(WARN);
+        };
+        ($a:expr) => {
+		{
+                	log!(WARN, $a);
+		}
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                	log!(WARN, $a, $($b)*);
+		}
+        };
+}
+
+/// Just like [`warn`], but with no timestamp.
+#[macro_export]
+macro_rules! warn_no_ts {
+        ($a:expr) => {
+                {
+                	log_no_ts!(WARN, $a);
+		}
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                	log_no_ts!(WARN, $a, $($b)*);
+		}
+        };
+}
+
+/// Log at the 'info' (2) log level. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used like the pritln/format macros.
+/// Also see [`trace`], [`debug`], [`warn`], [`error`], or [`fatal`].
+/// For example:
+/// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// info!(); // set log level to info "2"
+///
+/// let abc = 123;
+/// info!("my value = {}", abc);
+/// info!("hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
+/// ```
+#[macro_export]
+macro_rules! info {
+	() => {
+		do_log!(INFO);
+	};
+        ($a:expr) => {
+                {
+                	log!(INFO, $a);
+		}
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                	log!(INFO, $a, $($b)*);
+		}
+        };
+}
+
+/// Just like [`info`], but with no timestamp.
+#[macro_export]
+macro_rules! info_no_ts {
+        ($a:expr) => {
+                {
+                	log_no_ts!(INFO, $a);
+		}
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                	log_no_ts!(INFO, $a, $($b)*);
+		}
+        };
+}
+
+/// Log at the 'debug' (1) log level. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used like the pritln/format macros.
+/// Also see [`trace`], [`info`], [`warn`], [`error`], or [`fatal`].
+/// For example:
+/// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// debug!(); // set log level to debug "1"
+///
+/// let abc = 123;
+/// trace!("my value = {}", abc);
+/// trace!("hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
+/// ```
+#[macro_export]
+macro_rules! debug {
+	() => {
+		do_log!(DEBUG);
+	};
+        ($a:expr) => {
+                {
+                	log!(DEBUG, $a);
+		}
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                	log!(DEBUG, $a, $($b)*);
+		}
+        };
+}
+
+/// Just like [`debug`], but with no timestamp.
+#[macro_export]
+macro_rules! debug_no_ts {
+        ($a:expr) => {
+                {
+                	log_no_ts!(DEBUG, $a);
+		}
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                	log_no_ts!(DEBUG, $a, $($b)*);
+		}
+        };
+}
+
+/// Log at the 'trace' (0) log level. This macro calls the default logger. To configure this
+/// logger, see [`log_config`]. It is used like the pritln/format macros.
+/// Also see [`debug`], [`info`], [`warn`], [`error`], or [`fatal`].
+/// For example:
+/// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// trace!(); // set log level to trace "0"
+///
+/// let abc = 123;
+/// trace!("my value = {}", abc);
+/// trace!("hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
+/// ```
+#[macro_export]
+macro_rules! trace {
+        () => {
+                do_log!(TRACE);
+        };
+        ($a:expr) => {
+                {
+                        log!(TRACE, $a);
+                }
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                        log!(TRACE, $a, $($b)*);
+                }
+        };
+}
+
+/// Just like [`trace`], but with no timestamp.
+#[macro_export]
+macro_rules! trace_no_ts {
+        ($a:expr) => {
+                {
+                        log_no_ts!(TRACE, $a);
+                }
+        };
+        ($a:expr,$($b:tt)*)=>{
+                {
+                        log_no_ts!(TRACE, $a, $($b)*);
+                }
+        };
+}
+
+/// log_multi is identical to [`log`] except that the name of the logger is specified instead of using
+/// the default logger.
+/// For example:
+/// ```
+/// use log::*;
+/// // log level must be set before calling any logging function.
+/// // typically it is done at the top of a file so that it's easy to change.
+/// // but it can be done at any level or scope. The inner scope prevails.
+/// info!();
+///
+/// let abc = 123;
+/// log_multi!(WARN, "logger2", "hi");
+/// log_multi!(WARN, "logger2", "value = {}", abc);
+///
 /// ```
 #[macro_export]
 macro_rules! log_multi {
-	($a:expr, $b:expr) => {
+	($level:expr, $a:expr, $b:expr) => {
 		let static_log = &LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
@@ -52,11 +371,11 @@ macro_rules! log_multi {
 				let log = log_map.get_mut($a);
 				match log {
 					Some(log) => {
-						do_log!(1, true, log, $b);
+						do_log!($level, true, log, $b);
 					},
 					None => {
 						let mut log = log::Log::new();
-						do_log!(1, true, log, $b);
+						do_log!($level, true, log, $b);
 						log_map.insert($a.to_string(), log);
 					}
 				}
@@ -70,7 +389,7 @@ macro_rules! log_multi {
 			}
 		}
 	};
-	($a:expr,$b:expr,$($c:tt)*)=>{
+	($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
 		let static_log = &LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
@@ -78,11 +397,11 @@ macro_rules! log_multi {
 				let log = log_map.get_mut($a);
 				match log {
 					Some(log) => {
-						do_log!(1, true, log, $b, $($c)*);
+						do_log!($level, true, log, $b, $($c)*);
 					},
 					None => {
 						let mut log = log::Log::new();
-						do_log!(1, true, log, $b, $($c)*);
+						do_log!($level, true, log, $b, $($c)*);
 						log_map.insert($a.to_string(), log);
 					}
 				}
@@ -99,20 +418,26 @@ macro_rules! log_multi {
 }
 
 /// The main logging macro. This macro calls the default logger. To configure this
-/// logger, see [`log_config`]. It is used exactly like the pritln/format macros. For example:
-///
+/// logger, see [`log_config`]. It is used like the pritln/format macros. The first
+/// parameter is the log level. To avoid specifying level, see [`trace`], [`debug`],
+/// [`info`], [`warn`], [`error`], or [`fatal`].
+/// For example:
 /// ```
-/// let abc = 123;
-/// log!("my value = {}", abc);
-/// log!("hi");
+/// use log::*;
 ///
-/// The output will look like this:
-/// [2021-08-09 19:41:37]: my value = 123
-/// [2021-08-09 19:41:37]: hi
+/// info!(); // set log level to info "2"
+///
+/// let abc = 123;
+/// log!(INFO, "my value = {}", abc);
+/// log!(INFO, "hi");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: my value = 123
+/// // [2021-08-09 19:41:37]: hi
 /// ```
 #[macro_export]
 macro_rules! log {
-	($a:expr)=>{
+	($level:expr, $a:expr)=>{
 		{
                 	const DEFAULT_LOG: &str = "default";
                 	let static_log = &LOG;
@@ -122,11 +447,11 @@ macro_rules! log {
                 	let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                 	match log {
                         	Some(log) => {
-                                	do_log!(1, true, log, $a);
+                                	do_log!($level, true, log, $a);
                         	},
                         	None => {
                                 	let mut log = log::Log::new();
-                                	do_log!(1, true, log, $a);
+                                	do_log!($level, true, log, $a);
                                 	log_map.insert(DEFAULT_LOG.to_string(), log);
                         	}
                 	}
@@ -141,7 +466,7 @@ macro_rules! log {
 			}
 		}
     	};
-	($a:expr,$($b:tt)*)=>{
+	($level:expr, $a:expr,$($b:tt)*)=>{
 		{
                         const DEFAULT_LOG: &str = "default";
                         let static_log = &LOG;
@@ -149,11 +474,11 @@ macro_rules! log {
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        do_log!(1, true, log, $a, $($b)*);
+                                        do_log!($level, true, log, $a, $($b)*);
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        do_log!(1, true, log, $a, $($b)*);
+                                        do_log!($level, true, log, $a, $($b)*);
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -164,42 +489,48 @@ macro_rules! log {
 /// Identical to [`log_no_ts`] except that the name of the logger is specified instead of using
 /// the default logger.
 /// For example:
+///
 /// ```
-/// log_no_ts!("nondefaultlogger", "hi");
-/// log_no_ts!("nondefaultlogger", "value = {}", 123);
+/// use log::*;
+///
+/// info!();
+///
+/// log_no_ts_multi!(2, "nondefaultlogger", "hi");
+/// log_no_ts_multi!(2, "nondefaultlogger", "value = {}", 123);
 /// ```
+///
 #[macro_export]
 macro_rules! log_no_ts_multi {
-        ($a:expr, $b:expr)=>{
+        ($level:expr, $a:expr, $b:expr)=>{
                 {
                         let static_log = &LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
                                 Some(log) => {
-                                        { do_log!(1, false, log, $b); }
+                                        { do_log!($level, false, log, $b); }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!(1, false, log, $b); }
+                                        { do_log!($level, false, log, $b); }
                                         log_map.insert($a.to_string(), log);
                                 }
                         }
                 }
         };
-        ($a:expr,$b:expr,$($c:tt)*)=>{
+        ($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
                 {
                         let static_log = &LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
                                 Some(log) => {
-                                        { do_log!(1, false, log, $b, $($c)*) }
+                                        { do_log!($level, false, log, $b, $($c)*) }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!(1, false, log, $b, $($c)*) }
-                                        log_map.insert($a, log);
+                                        { do_log!($level, false, log, $b, $($c)*) }
+                                        log_map.insert($a.to_string(), log);
                                 }
                         }
                 }
@@ -210,18 +541,24 @@ macro_rules! log_no_ts_multi {
 /// For example:
 ///
 /// ```
-/// log!("hi");
-/// log_no_ts!("message here");
-/// log!("more data");
+/// use log::*;
 ///
-/// The output will look like this:
-/// [2021-08-09 19:41:37]: hi
-/// message here
-/// [2021-08-09 19:41:37]: more data
+/// debug!();
+///
+/// log!(2, "hi");
+/// log_no_ts!(2, "message here");
+/// log_no_ts!(3, "my value = {}", 1);
+/// log!(2, "more data");
+///
+/// // The output will look like this:
+/// // [2021-08-09 19:41:37]: hi
+/// // message here
+/// // my value = 1
+/// // [2021-08-09 19:41:37]: more data
 /// ```
 #[macro_export]
 macro_rules! log_no_ts {
-	($a:expr)=>{
+	($level:expr, $a:expr)=>{
                 {
                         const DEFAULT_LOG: &str = "default";
                         let static_log = &LOG;
@@ -229,17 +566,17 @@ macro_rules! log_no_ts {
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        { do_log!(1, false, log, $a); }
+                                        { do_log!($level, false, log, $a); }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!(1, false, log, $a); }
+                                        { do_log!($level, false, log, $a); }
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
                 }
 	};
-	($a:expr,$($b:tt)*)=>{
+	($level:expr, $a:expr,$($b:tt)*)=>{
 		{
 
                         const DEFAULT_LOG: &str = "default";
@@ -248,11 +585,11 @@ macro_rules! log_no_ts {
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        { do_log!(1, false, log, $a, $($b)*) }
+                                        { do_log!($level, false, log, $a, $($b)*) }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!(1, false, log, $a, $($b)*) }
+                                        { do_log!($level, false, log, $a, $($b)*) }
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -260,7 +597,7 @@ macro_rules! log_no_ts {
 	};
 }
 
-/// Generally, this macro should not be used directly. It is used by the other macros. See [`log`] instead.
+/// Generally, this macro should not be used directly. It is used by the other macros. See [`log`] or [`info`] instead.
 #[macro_export]
 macro_rules! do_log {
         ($level:expr)=>{
@@ -268,9 +605,6 @@ macro_rules! do_log {
 	};
         ($level:expr, $show_ts:expr, $log:expr, $a:expr)=>{
 			{
-				#[cfg(not(LOG_LEVEL))]
-				const LOG_LEVEL: i32 = 1;
-				if $level >= LOG_LEVEL {
                                         // if not configured, use defaults
                                         if !$log.is_configured() {
                                                 $log.config_with_object(LogConfig::default()).unwrap();
@@ -278,63 +612,67 @@ macro_rules! do_log {
 
 					let _ = $log.update_show_timestamp($show_ts);
 
-                                        match $log.log(&format!($a)) {
-                                                Ok(_) => {},
-                                                Err(e) => {
-                                                        println!(
-                                                                "Logging of '{}' resulted in Error: {}",
-                                                                format!($a),
-                                                                e.to_string(),
-                                                        );
-                                                }
-                                        }
+						if $level >= LOG_LEVEL {
+                                        		match $log.log(&format!($a)) {
+                                                		Ok(_) => {},
+                                                		Err(e) => {
+                                                        		println!(
+                                                                		"Logging of '{}' resulted in Error: {}",
+                                                                		format!($a),
+                                                                		e.to_string(),
+                                                        		);
+                                                		}
+                                        		}
+						}
 
 					// always set to showing timestamp (as default)
 					let _ = $log.update_show_timestamp(true);
-				}
 			}
         };
         ($level:expr, $show_ts:expr, $log:expr, $a:expr, $($b:tt)*)=>{
 			{
-				#[cfg(not(LOG_LEVEL))]
-				const LOG_LEVEL: i32 = 1;
-				if $level >= LOG_LEVEL {
                                         // if not configured, use defaults
                                         if !$log.is_configured() {
                                                 $log.config_with_object(LogConfig::default()).unwrap();
                                         }
 
-                                        match $log.log(&format!($a, $($b)*)) {
-                                                Ok(_) => {},
-                                                Err(e) => {
-                                                        println!(
-                                                                "Logging of '{}' resulted in Error: {}",
-                                                                format!($a, $($b)*),
-                                                                e.to_string(),
-                                                        );
-                                                }
-                                        }
-				}
+					if $level >= LOG_LEVEL {
+                                        	match $log.log(&format!($a, $($b)*)) {
+                                                	Ok(_) => {},
+                                                	Err(e) => {
+                                                        	println!(
+                                                                	"Logging of '{}' resulted in Error: {}",
+                                                                	format!($a, $($b)*),
+                                                                	e.to_string(),
+                                                        	);
+                                                	}
+                                        	}
+					}
 			}
         };
 }
 
 /// log_config_multi is identical to [`log_config`] except that the name of the logger is specified instead of using
-/// The default logger.
+/// the default logger.
 ///
 /// A sample log_config_multi! call might look something like this:
 ///
 /// ```
+/// use log::*;
+///
+/// info!();
+///
 /// log_config_multi!(
 ///     "nondefaultlogger",
-///     log::LogConfig {
+///     LogConfig {
 ///         max_age_millis: 10000, // set log rotations to every 10 seconds
 ///         max_size: 10000, // set log rotations to every 10,000 bytes
 ///         file_path: "./test2.log".to_string(), // log to the file "./test.log"
 ///         ..Default::default()
 ///     }
-/// )?;
+/// );
 /// ```
+///
 /// For full details on all parameters of LogConfig see [`LogConfig`].
 #[macro_export]
 macro_rules! log_config_multi {
@@ -347,16 +685,18 @@ macro_rules! log_config_multi {
 				match log {
 					Some(log) => log.config_with_object($b),
 					None => {
-						let mut log = crate::Log::new();
+						let mut log = log::Log::new();
 						let ret = log.config_with_object($b);
 						log_map.insert($a.to_string(), log);
 						ret
 					}
 				}
 			}
-			Err(e) => {
-				Err(ErrorKind::PoisonError(format!("log generated poison error: {}", e)).into())
-			}
+			Err(e) => Err(nioruntime_util::ErrorKind::PoisonError(format!(
+				"log generated poison error: {}",
+				e
+			))
+			.into()),
 		}
 	}};
 }
@@ -366,12 +706,16 @@ macro_rules! log_config_multi {
 /// A sample log_config! call might look something like this:
 ///
 /// ```
+/// use log::*;
+///
+/// info!();
+///
 /// log_config!(log::LogConfig {
 /// 	max_age_millis: 10000, // set log rotations to every 10 seconds
 /// 	max_size: 10000, // set log rotations to every 10,000 bytes
 /// 	file_path: "./test.log".to_string(), // log to the file "./test.log"
 /// 	..Default::default()
-/// })?;
+/// });
 /// ```
 /// For full details on all parameters of LogConfig see [`LogConfig`].
 #[macro_export]
@@ -386,16 +730,18 @@ macro_rules! log_config {
 				match log {
 					Some(log) => log.config_with_object($a),
 					None => {
-						let mut log = crate::Log::new();
+						let mut log = log::Log::new();
 						let ret = log.config_with_object($a);
 						log_map.insert(DEFAULT_LOG.to_string(), log);
 						ret
 					}
 				}
 			}
-			Err(e) => {
-				Err(ErrorKind::PoisonError(format!("log generated poison error: {}", e)).into())
-			}
+			Err(e) => Err(nioruntime_util::ErrorKind::PoisonError(format!(
+				"log generated poison error: {}",
+				e
+			))
+			.into()),
 		}
 	}};
 }
@@ -421,18 +767,14 @@ pub struct LogConfig {
 	pub file_path: String,
 	/// The maximum size in bytes of the log file before a log rotation occurs. By default,
 	/// this is set to 10485760 bytes (10 mb). After a log rotation, a new file named:
-	/// ```
 	/// <log_name>.r_<month>_<day>_<year>_<hour>-<minute>-<second>_<random_number>.log
 	/// For example, something like this: mainlog.r_08_10_2021_03-12-23_12701992901411981750.log
-	/// ```
 	/// is created.
 	pub max_size: u64,
 	/// The maximum age in milliseconds before a log rotation occurs. By default, this is set to
 	/// 3600000 ms (1 hour). After a log rotation, a new file named:
-	/// ```
 	/// <log_name>.r_<month>_<day>_<year>_<hour>-<minute>-<second>_<random_number>.log
 	/// For example, something like this: mainlog.r_08_10_2021_03-12-23_12701992901411981750.log
-	/// ```
 	/// is created.
 	pub max_age_millis: u128,
 	/// The header (first line) of a log file. By default the header is not printed.

@@ -26,6 +26,8 @@ use nix::sys::epoll::{
 	epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
 };
 
+debug!();
+
 // unix specific deps
 #[cfg(unix)]
 use libc::fcntl;
@@ -421,7 +423,7 @@ where
 			};
 
 			if sockoptres != 0 {
-				log!("setsockopt resulted in error: {}", errno().to_string());
+				info!("setsockopt resulted in error: {}", errno().to_string());
 			}
 		}
 
@@ -605,7 +607,7 @@ where
 						_pipe_listener = Some(listener);
 					}
 					Err(e) => {
-						log!("Error creating socket_pipe on windows, {}", e.to_string());
+						info!("Error creating socket_pipe on windows, {}", e.to_string());
 					}
 				}
 			}
@@ -735,7 +737,7 @@ where
 				}
 			},
 			Err(e) => {
-				log!("unexpected error obtaining guarded_data lock, {}", e);
+				info!("unexpected error obtaining guarded_data lock, {}", e);
 			}
 		}
 
@@ -825,7 +827,7 @@ where
 			#[cfg(unix)]
 			let win_selector = 1 as *mut c_void;
 			if win_selector.is_null() {
-				log!("win_selector is null. Cannot start");
+				info!("win_selector is null. Cannot start");
 			} else {
 				let res = Self::poll_loop(
 					&cloned_guarded_data,
@@ -837,10 +839,10 @@ where
 				);
 				match res {
 					Ok(_) => {
-						log!("poll loop done");
+						info!("poll loop done");
 					}
 					Err(e) => {
-						log!("FATAL: Unexpected error in poll loop: {}", e.to_string());
+						info!("FATAL: Unexpected error in poll loop: {}", e.to_string());
 					}
 				}
 			}
@@ -863,7 +865,7 @@ where
 		let lock = global_lock.write();
 		match lock {
 			Ok(_) => {}
-			Err(e) => log!("Error obtaining global lock: {}", e),
+			Err(e) => info!("Error obtaining global lock: {}", e),
 		}
 		for handler_event in &handler_events {
 			match handler_event.etype {
@@ -937,13 +939,16 @@ where
 								match (on_close)(seqno) {
 									Ok(_) => {}
 									Err(e) => {
-										log!("on close handler generated error: {}", e.to_string());
+										info!(
+											"on close handler generated error: {}",
+											e.to_string()
+										);
 									}
 								}
 							})?;
 						}
 						Err(e) => {
-							log!(
+							info!(
 								"unexpected error getting state lock: {}, fd={}, seqno={}",
 								e.to_string(),
 								fd,
@@ -1021,7 +1026,7 @@ where
 				};
 				if res != 0 {
 					filter_set.remove(&evt.fd);
-					log!(
+					info!(
 						"epoll_ctl (write) resulted in an unexpected error: {}, fd={}, op={}, epoll_ctl_add={}",
 						errno().to_string(), evt.fd, op, EPOLL_CTL_ADD,
 					);
@@ -1044,7 +1049,7 @@ where
 				};
 
 				if res != 0 {
-					log!(
+					info!(
 						"epoll_ctl (del) resulted in unexpected error: {}",
 						errno().to_string(),
 					);
@@ -1093,7 +1098,7 @@ where
 					};
 
 					if res != 0 {
-						log!(
+						info!(
 							"Unexpected error with EPOLLHUP. res = {}, err={}",
 							res,
 							errno().to_string(),
@@ -1133,7 +1138,7 @@ where
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
-					Err(e) => log!("Error epoll_ctl1: {}, fd={}, op={:?}", e, fd, op),
+					Err(e) => info!("Error epoll_ctl1: {}, fd={}, op={:?}", e, fd, op),
 				}
 			} else if evt.etype == GenericEventType::AddReadET {
 				let fd = evt.fd;
@@ -1152,7 +1157,7 @@ where
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
-					Err(e) => log!("Error epoll_ctl2: {}, fd={}, op={:?}", e, fd, op),
+					Err(e) => info!("Error epoll_ctl2: {}, fd={}, op={:?}", e, fd, op),
 				}
 			} else if evt.etype == GenericEventType::AddWriteET {
 				let fd = evt.fd;
@@ -1172,7 +1177,7 @@ where
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
-					Err(e) => log!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
+					Err(e) => info!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
 				}
 			} else if evt.etype == GenericEventType::DelRead {
 				interest |= EpollFlags::EPOLLIN;
@@ -1214,7 +1219,7 @@ where
 				}
 			}
 			Err(e) => {
-				log!("Error with epoll wait = {}", e.to_string());
+				info!("Error with epoll wait = {}", e.to_string());
 			}
 		}
 
@@ -1256,7 +1261,7 @@ where
 		};
 
 		if ret_count < 0 {
-			log!("Error in kevent: kevs={:?}, error={}", kevs, errno());
+			info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
 		}
 
 		let mut ret_count_adjusted = 0;
@@ -1378,24 +1383,24 @@ where
 					{
 						let res = unsafe { close(selector) };
 						if res != 0 {
-							log!("Error closing selector: {}", errno().to_string());
+							info!("Error closing selector: {}", errno().to_string());
 						}
 						let res = unsafe { close(guarded_data.wakeup_fd) };
 						if res != 0 {
-							log!("Error closing selector: {}", errno().to_string());
+							info!("Error closing selector: {}", errno().to_string());
 						}
 					}
 					#[cfg(target_os = "windows")]
 					{
 						let res = unsafe { epoll_close(win_selector) };
 						if res != 0 {
-							log!("Error closing win_selector: {}", errno().to_string());
+							info!("Error closing win_selector: {}", errno().to_string());
 						}
 						let res = unsafe {
 							ws2_32::closesocket(guarded_data.wakeup_fd.try_into().unwrap_or(0))
 						};
 						if res != 0 {
-							log!("Error closing selector: {}", errno().to_string());
+							info!("Error closing selector: {}", errno().to_string());
 						}
 					}
 					break;
@@ -1532,7 +1537,7 @@ where
 				fd_locks,
 			)?;
 			/*if evs.len() > 0 {
-			log!("input events = {:?}", evs);
+			info!("input events = {:?}", evs);
 			}*/
 			let mut output_events = vec![];
 			ret_count = Self::get_events(
@@ -1547,7 +1552,7 @@ where
 				continue;
 			}
 			for event in output_events {
-				//log!("proc event = {:?}", event);
+				//info!("proc event = {:?}", event);
 				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
 						event.fd as i32,
@@ -1559,7 +1564,7 @@ where
 					match res {
 						Ok(_) => {}
 						Err(e) => {
-							log!("Unexpected error in poll loop: {}", e.to_string());
+							info!("Unexpected error in poll loop: {}", e.to_string());
 						}
 					}
 				}
@@ -1584,7 +1589,7 @@ where
 					match res {
 						Ok(_) => {}
 						Err(e) => {
-							log!("Unexpected error in poll loop: {}", e.to_string());
+							info!("Unexpected error in poll loop: {}", e.to_string());
 						}
 					}
 				}
@@ -1673,7 +1678,7 @@ where
 							state.state = State::Closed;
 						} else {
 							let e = errno();
-							log!("error closing socket: {}", e.to_string());
+							info!("error closing socket: {}", e.to_string());
 							return Err(
 								ErrorKind::InternalError("Already closed".to_string()).into()
 							);
@@ -1686,7 +1691,7 @@ where
 				}
 			}
 			Err(e) => {
-				log!(
+				info!(
 					"unexpected error obtaining fd_lock to close: {}, fd={}, seqno={}",
 					e.to_string(),
 					fd,
@@ -1743,7 +1748,7 @@ where
 					}
 				}
 				Err(e) => {
-					log!("write error: {}", e);
+					info!("write error: {}", e);
 					Self::push_handler_event_with_fd_lock(
 						fd,
 						HandlerEventType::Close,
@@ -1777,7 +1782,7 @@ where
 					guarded_data.handler_events.push(nevent);
 				}
 				Err(e) => {
-					log!(
+					info!(
 						"unexpected error getting guareded_data lock: {}",
 						e.to_string()
 					);
@@ -1800,7 +1805,7 @@ where
 					let lock = global_lock.read();
 					match lock {
 						Ok(_) => {}
-						Err(e) => log!("Unexpected error obtaining write lock: {}", e),
+						Err(e) => info!("Unexpected error obtaining write lock: {}", e),
 					}
 					{
 						let state_info = state_info.lock();
@@ -1818,7 +1823,7 @@ where
 										complete = c;
 									}
 									Err(e) => {
-										log!(
+										info!(
 											"unexpected error in process_event_write: {}",
 											e.to_string()
 										);
@@ -1828,7 +1833,7 @@ where
 								match res {
 									Ok(_) => {}
 									Err(e) => {
-										log!(
+										info!(
 											"unexpected error in process_event_write: {}",
 											e.to_string()
 										);
@@ -1836,7 +1841,7 @@ where
 								}
 							}
 							Err(e) => {
-								log!(
+								info!(
 									"unexpected error with locking write_buffer: {}",
 									e.to_string()
 								);
@@ -1859,7 +1864,7 @@ where
 						match res {
 							Ok(_) => {}
 							Err(e) => {
-								log!("Error pushing handler event: {}", e);
+								info!("Error pushing handler event: {}", e);
 							}
 						}
 					}
@@ -1894,7 +1899,7 @@ where
 				let lock = global_lock.write();
 				match lock {
 					Ok(_) => {}
-					Err(e) => log!("Unexpected error obtaining read lock, {}", e),
+					Err(e) => info!("Unexpected error obtaining read lock, {}", e),
 				}
 				#[cfg(unix)]
 				let res = unsafe {
@@ -1960,7 +1965,7 @@ where
 								);
 							}
 							Err(e) => {
-								log!("Error getting seqno: {}", e.to_string());
+								info!("Error getting seqno: {}", e.to_string());
 								return Err(ErrorKind::InternalError(
 									"unexpected error obtaining seqno".to_string(),
 								)
@@ -1976,7 +1981,7 @@ where
 							state.seqno = seqno;
 						}
 						Err(e) => {
-							log!(
+							info!(
 								"unexpected error obtaining fd_lock: {}, fd={}, seqno={}",
 								e.to_string(),
 								fd,
@@ -2008,7 +2013,7 @@ where
 						};
 
 						if ioctl_res != 0 {
-							log!("complete fion with error: {}", errno().to_string());
+							info!("complete fion with error: {}", errno().to_string());
 						}
 
 						let sockoptres = unsafe {
@@ -2022,7 +2027,7 @@ where
 						};
 
 						if sockoptres != 0 {
-							log!("setsockopt resulted in error: {}", errno().to_string());
+							info!("setsockopt resulted in error: {}", errno().to_string());
 						}
 					}
 					let guarded_data = guarded_data.clone();
@@ -2036,13 +2041,13 @@ where
 					match accept_res {
 						Ok(_) => {}
 						Err(e) => {
-							log!("process_accept_result resulted in: {}", e.to_string())
+							info!("process_accept_result resulted in: {}", e.to_string())
 						}
 					}
 					let accept_res = (on_accept)(seqno as u128);
 					match accept_res {
 						Ok(_) => {}
-						Err(e) => log!("on_accept callback resulted in: {}", e.to_string()),
+						Err(e) => info!("on_accept callback resulted in: {}", e.to_string()),
 					}
 					Ok(())
 				} else {
@@ -2060,7 +2065,7 @@ where
 							guarded_data.handler_events.push(nevent);
 						}
 						Err(e) => {
-							log!(
+							info!(
 								"unexpected error getting guareded_data lock: {}",
 								e.to_string()
 							);
@@ -2078,7 +2083,7 @@ where
 						let lock = global_lock.read();
 						match lock {
 							Ok(_) => {}
-							Err(e) => log!("Unexpected error obtaining read lock: {}", e),
+							Err(e) => info!("Unexpected error obtaining read lock: {}", e),
 						}
 						let mut buf = [0u8; BUFFER_SIZE];
 						loop {
@@ -2086,7 +2091,7 @@ where
 							match on_read_lock {
 								Ok(_) => {}
 								Err(e) => {
-									log!("unexpected error obtaining on_read_lock: {}", e);
+									info!("unexpected error obtaining on_read_lock: {}", e);
 								}
 							}
 							let (seqno, len) = {
@@ -2094,7 +2099,7 @@ where
 								let seqno = match fd_lock {
 									Ok(ref state_info) => (*state_info).seqno,
 									Err(e) => {
-										log!(
+										info!(
 											"Unexpected Error obtaining read lock: {}",
 											e.to_string()
 										);
@@ -2171,7 +2176,7 @@ where
 							match res {
 								Ok(_) => {}
 								Err(e) => {
-									log!("Error pushing handler event: {}", e);
+									info!("Error pushing handler event: {}", e);
 								}
 							}
 						}
@@ -2184,7 +2189,7 @@ where
 					})?;
 			}
 			FdType::Unknown => {
-				log!("unexpected fd_type (unknown) for fd: {}", fd);
+				info!("unexpected fd_type (unknown) for fd: {}", fd);
 			}
 			FdType::Wakeup => {
 				#[cfg(unix)]
@@ -2244,7 +2249,7 @@ where
 			match result {
 				Ok(_) => {}
 				Err(e) => {
-					log!("Client callback resulted in error: {}", e.to_string());
+					info!("Client callback resulted in error: {}", e.to_string());
 				}
 			}
 		} else {
@@ -2303,7 +2308,7 @@ where
 	}
 
 	fn process_accept_err(_acceptor: i32, error: String) -> Result<(), Error> {
-		log!("error on acceptor: {}", error);
+		info!("error on acceptor: {}", error);
 		Ok(())
 	}
 
@@ -2349,7 +2354,7 @@ where
 					}
 				}
 				Err(e) => {
-					log!(
+					info!(
                         "unexpected error obtaining lock for fd_lock push_handler_event, e={},fd={},event_type={:?},seqno={}",
                         e.to_string(),
                         fd,
@@ -2389,7 +2394,7 @@ where
 					}
 				}
 				Err(e) => {
-					log!("Unexpected handler error: {}", e.to_string());
+					info!("Unexpected handler error: {}", e.to_string());
 				}
 			}
 			if wakeup && !wakeup_scheduled {
@@ -2539,7 +2544,7 @@ fn test_client() -> Result<(), Error> {
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 	eh.set_on_client_read(move |buf, len, _wh| {
-		log!("client_read={:?}", &buf[0..len]);
+		info!("client_read={:?}", &buf[0..len]);
 		assert_eq!(&buf[0..len], [1, 2, 3, 4, 5, 6]);
 		Ok(())
 	})?;
