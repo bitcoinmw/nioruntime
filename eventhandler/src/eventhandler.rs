@@ -62,6 +62,8 @@ use wepoll_sys::{
 const INITIAL_MAX_FDS: usize = 100;
 const BUFFER_SIZE: usize = 1024;
 const MAX_EVENTS: i32 = 100;
+#[cfg(target_os = "windows")]
+const WINSOCK_BUF_SIZE: winapi::c_int = 100_000_000;
 
 #[derive(Debug, Clone)]
 pub enum ActionType {
@@ -407,15 +409,14 @@ where
 		#[cfg(target_os = "windows")]
 		{
 			let fd = stream.as_raw_socket();
-			let send_buf_size: winapi::c_int = 100_000_000;
 
 			let sockoptres = unsafe {
 				ws2_32::setsockopt(
 					fd.try_into().unwrap_or(0),
 					winapi::SOL_SOCKET,
 					winapi::SO_SNDBUF,
-					&send_buf_size as *const _ as *const i8,
-					std::mem::size_of_val(&send_buf_size) as winapi::c_int,
+					&WINSOCK_BUF_SIZE as *const _ as *const i8,
+					std::mem::size_of_val(&WINSOCK_BUF_SIZE) as winapi::c_int,
 				)
 			};
 
@@ -2010,15 +2011,13 @@ where
 							log!("complete fion with error: {}", errno().to_string());
 						}
 
-						let send_buf_size: winapi::c_int = 100_000_000;
-
 						let sockoptres = unsafe {
 							ws2_32::setsockopt(
 								res.try_into().unwrap_or(0),
 								winapi::SOL_SOCKET,
 								winapi::SO_SNDBUF,
-								&send_buf_size as *const _ as *const i8,
-								std::mem::size_of_val(&send_buf_size) as winapi::c_int,
+								&WINSOCK_BUF_SIZE as *const _ as *const i8,
+								std::mem::size_of_val(&WINSOCK_BUF_SIZE) as winapi::c_int,
 							)
 						};
 
