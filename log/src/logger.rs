@@ -667,7 +667,6 @@ macro_rules! do_log {
 ///     LogConfig {
 ///         max_age_millis: 10000, // set log rotations to every 10 seconds
 ///         max_size: 10000, // set log rotations to every 10,000 bytes
-///         file_path: "./test2.log".to_string(), // log to the file "./test.log"
 ///         ..Default::default()
 ///     }
 /// );
@@ -713,7 +712,6 @@ macro_rules! log_config_multi {
 /// log_config!(log::LogConfig {
 /// 	max_age_millis: 10000, // set log rotations to every 10 seconds
 /// 	max_size: 10000, // set log rotations to every 10,000 bytes
-/// 	file_path: "./test.log".to_string(), // log to the file "./test.log"
 /// 	..Default::default()
 /// });
 /// ```
