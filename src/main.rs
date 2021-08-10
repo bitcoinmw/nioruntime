@@ -66,7 +66,7 @@ fn main() {
 	let res = real_main();
 	match res {
 		Ok(_) => {}
-		Err(e) => log!("real_main generated Error: {}", e.to_string()),
+		Err(e) => error!("real_main generated Error: {}", e.to_string()),
 	}
 }
 
