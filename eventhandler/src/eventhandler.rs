@@ -2629,7 +2629,7 @@ fn test_large_messages() -> Result<(), Error> {
 	})?;
 
 	let mut msgbuf = vec![];
-	for i in 0..10_000_000 {
+	for i in 0..3_000_000 {
 		msgbuf.push((i % 123) as u8);
 	}
 	msgbuf.push(128);
