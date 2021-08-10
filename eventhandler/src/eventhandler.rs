@@ -403,6 +403,27 @@ where
 		}
 
 		stream.set_nonblocking(true)?;
+
+		#[cfg(target_os = "windows")]
+		{
+			let fd = stream.as_raw_socket();
+			let send_buf_size: winapi::c_int = 100_000_000;
+
+			let sockoptres = unsafe {
+				ws2_32::setsockopt(
+					fd.try_into().unwrap_or(0),
+					winapi::SOL_SOCKET,
+					winapi::SO_SNDBUF,
+					&send_buf_size as *const _ as *const i8,
+					std::mem::size_of_val(&send_buf_size) as winapi::c_int,
+				)
+			};
+
+			if sockoptres != 0 {
+				log!("setsockopt resulted in error: {}", errno().to_string());
+			}
+		}
+
 		#[cfg(any(
 			target_os = "linux",
 			target_os = "macos",
@@ -1987,6 +2008,22 @@ where
 
 						if ioctl_res != 0 {
 							log!("complete fion with error: {}", errno().to_string());
+						}
+
+						let send_buf_size: winapi::c_int = 100_000_000;
+
+						let sockoptres = unsafe {
+							ws2_32::setsockopt(
+								res.try_into().unwrap_or(0),
+								winapi::SOL_SOCKET,
+								winapi::SO_SNDBUF,
+								&send_buf_size as *const _ as *const i8,
+								std::mem::size_of_val(&send_buf_size) as winapi::c_int,
+							)
+						};
+
+						if sockoptres != 0 {
+							log!("setsockopt resulted in error: {}", errno().to_string());
 						}
 					}
 					let guarded_data = guarded_data.clone();
