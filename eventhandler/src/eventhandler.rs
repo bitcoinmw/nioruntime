@@ -171,14 +171,14 @@ fn do_write_no_fd_lock(
 		{
 			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 			unsafe {
-				write(wakeupfd.try_into().unwrap_or(i32::MAX), buf, 1);
+				write(wakeupfd, buf, 1);
 			}
 		}
 		#[cfg(target_os = "windows")]
 		{
 			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
 			unsafe {
-				ws2_32::send(wakeupfd.try_into().unwrap_or(0), buf, 1, 0);
+				ws2_32::send(wakeupfd, buf, 1, 0);
 			}
 		}
 	}
@@ -262,7 +262,7 @@ fn do_write(
 		{
 			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 			unsafe {
-				write(fd.try_into().unwrap_or(i32::MAX), buf, 1);
+				write(fd, buf, 1);
 			}
 		}
 		#[cfg(target_os = "windows")]
@@ -605,7 +605,7 @@ where
 
 			let sockoptres = unsafe {
 				ws2_32::setsockopt(
-					fd.try_into().unwrap_or(0),
+					fd,
 					winapi::SOL_SOCKET,
 					winapi::SO_SNDBUF,
 					&WINSOCK_BUF_SIZE as *const _ as *const i8,
@@ -626,10 +626,7 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, connection_id) = self.add_fd(
-			stream.as_raw_fd().try_into().unwrap_or(0),
-			ActionType::AddStream,
-		)?;
+		let (fd, connection_id) = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
 		let (fd, connection_id) = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
 		Ok(WriteHandle {
@@ -670,10 +667,7 @@ where
 			netbsd,
 			openbsd
 		))]
-		self.add_fd(
-			listener.as_raw_fd().try_into().unwrap_or(0),
-			ActionType::AddListener,
-		)?;
+		self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
 		self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
 		Ok(())
@@ -908,14 +902,14 @@ where
 		{
 			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 			unsafe {
-				write(guarded_data.wakeup_fd.try_into().unwrap_or(0), buf, 1);
+				write(guarded_data.wakeup_fd, buf, 1);
 			}
 		}
 		#[cfg(target_os = "windows")]
 		{
 			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
 			unsafe {
-				ws2_32::send(guarded_data.wakeup_fd.try_into().unwrap_or(0), buf, 1, 0);
+				ws2_32::send(guarded_data.wakeup_fd, buf, 1, 0);
 			}
 		}
 
@@ -926,7 +920,7 @@ where
 	fn do_start(&mut self) -> Result<(), Error> {
 		// create poll fd
 		let selector = epoll_create1(EpollCreateFlags::empty())?;
-		self.start_generic(selector.try_into().unwrap_or(0))?;
+		self.start_generic(selector)?;
 		Ok(())
 	}
 
@@ -934,7 +928,7 @@ where
 	fn do_start(&mut self) -> Result<(), Error> {
 		// create the kqueue
 		let selector = unsafe { kqueue() };
-		self.start_generic(selector.try_into().unwrap_or(0))?;
+		self.start_generic(selector)?;
 		Ok(())
 	}
 
@@ -1002,7 +996,7 @@ where
 		socket: ConnectionHandle,
 		atype: ActionType,
 	) -> Result<(ConnectionHandle, u128), Error> {
-		let fd = socket.try_into().unwrap_or(0);
+		let fd = socket;
 		let (fd, seqno) = self.add_fd(fd, atype)?;
 		Ok((fd, seqno))
 	}
@@ -1038,7 +1032,7 @@ where
 		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
 		let res = unsafe {
 			accept(
-				listener.as_raw_socket().try_into().unwrap_or(0),
+				listener.as_raw_socket(),
 				&mut libc::sockaddr {
 					..std::mem::zeroed()
 				},
@@ -1049,7 +1043,7 @@ where
 		};
 		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
 		fds[0] = res as i32;
-		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
+		fds[1] = stream.as_raw_socket();
 		Ok((listener, stream))
 	}
 
@@ -1232,9 +1226,7 @@ where
 					EPOLL_CTL_ADD
 				};
 				filter_set.insert(evt.fd);
-				let data = epoll_data_t {
-					fd: evt.fd.try_into().unwrap_or(0),
-				};
+				let data = epoll_data_t { fd: evt.fd };
 				let mut event = epoll_event {
 					events: EPOLLIN | EPOLLRDHUP,
 					data,
@@ -1259,20 +1251,13 @@ where
 					EPOLL_CTL_ADD
 				};
 				filter_set.insert(evt.fd);
-				let data = epoll_data_t {
-					fd: evt.fd.try_into().unwrap_or(0),
-				};
+				let data = epoll_data_t { fd: evt.fd };
 				let mut event = epoll_event {
 					events: EPOLLIN | EPOLLOUT | EPOLLRDHUP,
 					data,
 				};
 				let res = unsafe {
-					epoll_ctl(
-						win_selector,
-						op.try_into().unwrap_or(0),
-						evt.fd.try_into().unwrap_or(0),
-						&mut event,
-					)
+					epoll_ctl(win_selector, op.try_into().unwrap_or(0), evt.fd, &mut event)
 				};
 				if res != 0 {
 					filter_set.remove(&evt.fd);
@@ -1283,9 +1268,7 @@ where
 				}
 			} else if evt.etype == GenericEventType::DelRead {
 				filter_set.remove(&evt.fd);
-				let data = epoll_data_t {
-					fd: evt.fd.try_into().unwrap_or(0),
-				};
+				let data = epoll_data_t { fd: evt.fd };
 				let mut event = epoll_event {
 					events: 0, // not used for del
 					data,
@@ -1294,8 +1277,8 @@ where
 				let res = unsafe {
 					epoll_ctl(
 						win_selector,
-						EPOLL_CTL_DEL.try_into().unwrap_or(0),
-						evt.fd.try_into().unwrap_or(0),
+						EPOLL_CTL_DEL.try_into_unwrap_or(0),
+						evt.fd,
 						&mut event,
 					)
 				};
@@ -1344,7 +1327,7 @@ where
 						epoll_ctl(
 							win_selector,
 							EPOLL_CTL_DEL.try_into().unwrap_or(0),
-							fd.try_into().unwrap_or(0),
+							fd,
 							&mut event,
 						)
 					};
@@ -1386,13 +1369,8 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd.try_into().unwrap_or(0));
-				let res = epoll_ctl(
-					epollfd.try_into().unwrap_or(0),
-					op,
-					evt.fd.try_into().unwrap_or(0),
-					&mut event,
-				);
+				let mut event = EpollEvent::new(interest, evt.fd);
+				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl1: {}, fd={}, op={:?}", e, fd, op),
@@ -1410,13 +1388,8 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd.try_into().unwrap_or(0));
-				let res = epoll_ctl(
-					epollfd.try_into().unwrap_or(0),
-					op,
-					evt.fd.try_into().unwrap_or(0),
-					&mut event,
-				);
+				let mut event = EpollEvent::new(interest, evt.fd);
+				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl2: {}, fd={}, op={:?}", e, fd, op),
@@ -1435,13 +1408,8 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd.try_into().unwrap_or(0));
-				let res = epoll_ctl(
-					epollfd.try_into().unwrap_or(0),
-					op,
-					evt.fd.try_into().unwrap_or(0),
-					&mut event,
-				);
+				let mut event = EpollEvent::new(interest, evt.fd);
+				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
@@ -1460,7 +1428,7 @@ where
 
 		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
 		let mut events = [empty_event; MAX_EVENTS as usize];
-		let results = epoll_wait(epollfd.try_into().unwrap_or(0), &mut events, 100);
+		let results = epoll_wait(epollfd, &mut events, 100);
 
 		let mut ret_count_adjusted = 0;
 
@@ -1518,7 +1486,7 @@ where
 
 		let ret_count = unsafe {
 			kevent(
-				queue.try_into().unwrap_or(0),
+				queue,
 				kevs.as_ptr(),
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
@@ -1648,11 +1616,11 @@ where
 					thread_pool.stop()?;
 					#[cfg(unix)]
 					{
-						let res = unsafe { close(selector.try_into().unwrap_or(0)) };
+						let res = unsafe { close(selector) };
 						if res != 0 {
 							info!("Error closing selector: {}", errno().to_string());
 						}
-						let res = unsafe { close(guarded_data.wakeup_fd.try_into().unwrap_or(0)) };
+						let res = unsafe { close(guarded_data.wakeup_fd) };
 						if res != 0 {
 							info!("Error closing selector: {}", errno().to_string());
 						}
@@ -1663,9 +1631,7 @@ where
 						if res != 0 {
 							info!("Error closing win_selector: {}", errno().to_string());
 						}
-						let res = unsafe {
-							ws2_32::closesocket(guarded_data.wakeup_fd.try_into().unwrap_or(0))
-						};
+						let res = unsafe { ws2_32::closesocket(guarded_data.wakeup_fd) };
 						if res != 0 {
 							info!("Error closing selector: {}", errno().to_string());
 						}
@@ -1691,7 +1657,7 @@ where
 						fd_locks,
 						buffer.fd as usize,
 						Arc::new(Mutex::new(StateInfo::new(
-							buffer.fd.try_into().unwrap_or(0),
+							buffer.fd,
 							State::Normal,
 							buffer.write_buffer.connection_seqno,
 						))),
@@ -1870,7 +1836,7 @@ where
 					..(write_buffer.offset as usize + write_buffer.len as usize)]
 					as *mut _ as *mut c_void;
 
-				unsafe { write(fd.try_into().unwrap_or(0), buf, write_buffer.len.into()) }
+				unsafe { write(fd, buf, write_buffer.len.into()) }
 			};
 			#[cfg(target_os = "windows")]
 			let len = {
@@ -1878,17 +1844,10 @@ where
 					[(write_buffer.offset as usize)..(write_buffer.len as usize)]
 					as *mut _ as *mut i8;
 
-				unsafe {
-					ws2_32::send(
-						fd.try_into().unwrap_or(0),
-						buf,
-						(write_buffer.len - write_buffer.offset).into(),
-						0,
-					)
-				}
+				unsafe { ws2_32::send(fd, buf, (write_buffer.len - write_buffer.offset).into(), 0) }
 			};
 			if len >= 0 {
-				if len == (write_buffer.len as isize).try_into().unwrap_or(0) {
+				if len == (write_buffer.len as isize) {
 					// we're done
 					write_buffer.offset += len as u16;
 					write_buffer.len -= len as u16;
@@ -1926,9 +1885,9 @@ where
 				if state.fd == fd {
 					if state.state == State::Closing {
 						#[cfg(unix)]
-						let res = unsafe { close(state.fd.try_into().unwrap_or(0)) };
+						let res = unsafe { close(state.fd) };
 						#[cfg(target_os = "windows")]
-						let res = unsafe { ws2_32::closesocket(state.fd.try_into().unwrap_or(0)) };
+						let res = unsafe { ws2_32::closesocket(state.fd) };
 						if res == 0 {
 							state.state = State::Closed;
 						} else {
@@ -2161,11 +2120,7 @@ where
 			Self::check_and_set(
 				fd_locks,
 				(fd + 100) as usize,
-				Arc::new(Mutex::new(StateInfo::new(
-					fd.try_into().unwrap_or(0),
-					State::Normal,
-					seqno,
-				))),
+				Arc::new(Mutex::new(StateInfo::new(fd, State::Normal, seqno))),
 			);
 		}
 
@@ -2177,7 +2132,7 @@ where
 			let state = fd_locks[fd as usize].lock();
 			match state {
 				Ok(mut state) => {
-					*state = StateInfo::new(fd.try_into().unwrap_or(0), State::Normal, seqno);
+					*state = StateInfo::new(fd, State::Normal, seqno);
 				}
 				Err(e) => {
 					info!("Error getting seqno: {}", e.to_string());
@@ -2217,7 +2172,7 @@ where
 				#[cfg(unix)]
 				let res = unsafe {
 					accept(
-						fd.try_into().unwrap_or(0),
+						fd,
 						&mut libc::sockaddr {
 							..std::mem::zeroed()
 						},
@@ -2230,7 +2185,7 @@ where
 				#[cfg(target_os = "windows")]
 				let res = unsafe {
 					ws2_32::accept(
-						fd.try_into().unwrap_or(0),
+						fd,
 						&mut winapi::ws2def::SOCKADDR {
 							..std::mem::zeroed()
 						},
@@ -2241,7 +2196,7 @@ where
 				};
 				if res > 0 {
 					Self::ensure_allocations(
-						res.try_into().unwrap_or(0),
+						res,
 						read_fd_type,
 						fd_locks,
 						on_read_locks,
@@ -2263,13 +2218,8 @@ where
 					#[cfg(target_os = "windows")]
 					{
 						let fionbio = 0x8004667eu32;
-						let ioctl_res = unsafe {
-							ws2_32::ioctlsocket(
-								res.try_into().unwrap_or(0),
-								fionbio as c_int,
-								&mut 1,
-							)
-						};
+						let ioctl_res =
+							unsafe { ws2_32::ioctlsocket(res, fionbio as c_int, &mut 1) };
 
 						if ioctl_res != 0 {
 							info!("complete fion with error: {}", errno().to_string());
@@ -2277,7 +2227,7 @@ where
 
 						let sockoptres = unsafe {
 							ws2_32::setsockopt(
-								res.try_into().unwrap_or(0),
+								res,
 								winapi::SOL_SOCKET,
 								winapi::SO_SNDBUF,
 								&WINSOCK_BUF_SIZE as *const _ as *const i8,
@@ -2290,12 +2240,7 @@ where
 						}
 					}
 
-					let accept_res = Self::process_accept_result(
-						fd,
-						res.try_into().unwrap_or(0),
-						&guarded_data,
-						fd_locks,
-					);
+					let accept_res = Self::process_accept_result(fd, res, &guarded_data, fd_locks);
 					match accept_res {
 						Ok(_) => {}
 						Err(e) => {
@@ -2367,14 +2312,14 @@ where
 								#[cfg(unix)]
 								let len = {
 									let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
-									unsafe { read(fd.try_into().unwrap_or(0), cbuf, BUFFER_SIZE) }
+									unsafe { read(fd, cbuf, BUFFER_SIZE) }
 								};
 								#[cfg(target_os = "windows")]
 								let len = {
 									let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
 									unsafe {
 										ws2_32::recv(
-											fd.try_into().unwrap_or(0),
+											fd,
 											cbuf,
 											BUFFER_SIZE.try_into().unwrap_or(0),
 											0,
@@ -2453,19 +2398,12 @@ where
 				#[cfg(unix)]
 				{
 					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-					unsafe { read(fd.try_into().unwrap_or(0), cbuf, 1) }
+					unsafe { read(fd, cbuf, 1) }
 				};
 				#[cfg(target_os = "windows")]
 				{
 					let cbuf: *mut i8 = &mut [0u8; 1] as *mut _ as *mut i8;
-					unsafe {
-						ws2_32::recv(
-							fd.try_into().unwrap_or(0),
-							cbuf,
-							BUFFER_SIZE.try_into().unwrap_or(0),
-							0,
-						)
-					}
+					unsafe { ws2_32::recv(fd, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) }
 				};
 
 				let mut guarded_data = guarded_data.lock().map_err(|e| {
@@ -2660,14 +2598,14 @@ where
 				{
 					let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 					unsafe {
-						write(wakeup_fd.try_into().unwrap_or(0), buf, 1);
+						write(wakeup_fd, buf, 1);
 					}
 				}
 				#[cfg(target_os = "windows")]
 				{
 					let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
 					unsafe {
-						ws2_32::send(wakeup_fd.try_into().unwrap_or(0), buf, 1, 0);
+						ws2_32::send(wakeup_fd, buf, 1, 0);
 					}
 				}
 			}
