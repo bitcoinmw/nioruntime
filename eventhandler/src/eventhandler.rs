@@ -116,13 +116,77 @@ impl GenericEvent {
 	}
 }
 
+fn do_write_no_fd_lock(
+	fd: i32,
+	connection_seqno: u128,
+	data: &[u8],
+	close: bool,
+	guarded_data: &Arc<Mutex<GuardedData>>,
+) -> Result<(), Error> {
+	let mut buf = [0u8; BUFFER_SIZE];
+	let len = data.len();
+	let mut rem = len;
+	let mut start = 0;
+	let mut end = if len > BUFFER_SIZE { BUFFER_SIZE } else { len };
+	let mut wakeupfd = 0;
+	let mut wakeup_scheduled = false;
+	match guarded_data.lock() {
+		Ok(mut guarded_data) => loop {
+			let len = if rem < BUFFER_SIZE { rem } else { BUFFER_SIZE };
+			buf[..len].clone_from_slice(&data[start..end]);
+			guarded_data.write_queue.push(StreamWriteBuffer {
+				fd,
+				write_buffer: WriteBuffer {
+					buffer: buf.clone(),
+					offset: 0,
+					len: len.try_into().unwrap_or(0),
+					close,
+					connection_seqno,
+				},
+			});
+			if rem <= BUFFER_SIZE {
+				let (fd_inner, wakeup_scheduled_inner) = do_wakeup_with_lock(&mut *guarded_data)?;
+				wakeupfd = fd_inner;
+				wakeup_scheduled = wakeup_scheduled_inner;
+				break;
+			}
+			rem -= BUFFER_SIZE;
+			start += BUFFER_SIZE;
+			end += BUFFER_SIZE;
+			if end > data.len() {
+				end = data.len();
+			}
+		},
+		Err(e) => {
+			info!("unexpected error obtaining guarded_data lock, {}", e);
+		}
+	}
+	if !wakeup_scheduled {
+		#[cfg(unix)]
+		{
+			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+			unsafe {
+				write(wakeupfd, buf, 1);
+			}
+		}
+		#[cfg(target_os = "windows")]
+		{
+			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
+			unsafe {
+				ws2_32::send(wakeupfd.try_into().unwrap_or(0), buf, 1, 0);
+			}
+		}
+	}
+	Ok(())
+}
+
 fn do_write(
 	fd: i32,
 	data: &[u8],
 	offset: usize,
 	len: usize,
 	close: bool,
-	fd_lock: &Arc<Mutex<StateInfo>>,
+	fd_lock: Option<&Arc<Mutex<StateInfo>>>,
 	connection_id: u128,
 	guarded_data: &Arc<Mutex<GuardedData>>,
 ) -> Result<(), Error> {
@@ -134,7 +198,11 @@ fn do_write(
 		))
 		.into());
 	}
-	{
+	if fd_lock.is_none() {
+		do_write_no_fd_lock(fd, connection_id, data, close, guarded_data)?;
+		return Ok(());
+	} else {
+		let fd_lock = fd_lock.unwrap();
 		let linked_list = &mut fd_lock
 			.lock()
 			.map_err(|e| {
@@ -212,18 +280,20 @@ fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
 	Ok((data.wakeup_fd, wakeup_scheduled))
 }
 
-/// A Write handle that is associated with a particular connection.
+/// A handle that is associated with a particular connection and may be used for writing
+/// to the socket.
 ///
 /// This struct is passed into the callbacks specified by [`EventHandler::set_on_read`]
 /// and [`EventHandler::set_on_client_read`] functions when data are ready.
 /// It can then be used to write back to the associated connection.
-/// See [`EventHandler::set_on_read`] for examples.
+/// It is also returned when a [`TcpStream`] is registered with the [`EventHandler`].
+/// See [`EventHandler::set_on_read`] for examples on how to use it.
 #[derive(Clone)]
 pub struct WriteHandle {
 	fd: i32,
-	guarded_data: Arc<Mutex<GuardedData>>,
 	connection_id: u128,
-	fd_lock: Arc<Mutex<StateInfo>>,
+	guarded_data: Arc<Mutex<GuardedData>>,
+	fd_lock: Option<Arc<Mutex<StateInfo>>>,
 }
 
 impl WriteHandle {
@@ -231,7 +301,7 @@ impl WriteHandle {
 		fd: i32,
 		guarded_data: Arc<Mutex<GuardedData>>,
 		connection_id: u128,
-		fd_lock: Arc<Mutex<StateInfo>>,
+		fd_lock: Option<Arc<Mutex<StateInfo>>>,
 	) -> Self {
 		WriteHandle {
 			fd,
@@ -264,7 +334,7 @@ impl WriteHandle {
 			offset,
 			len,
 			close,
-			&self.fd_lock,
+			self.fd_lock.as_ref(),
 			self.connection_id,
 			&self.guarded_data,
 		)
@@ -378,7 +448,7 @@ impl StateInfo {
 	}
 }
 
-pub(crate) struct GuardedData {
+struct GuardedData {
 	fd_actions: Vec<FdAction>,
 	wakeup_fd: i32,
 	wakeup_rx: i32,
@@ -457,9 +527,9 @@ pub(crate) struct GuardedData {
 ///     eh.add_tcp_listener(&listener)?;
 ///     // add the tcp stream and retreive the fd, seqno which are needed to write
 ///     // on this client through the EventHandler interface
-///     let (fd, seqno) = eh.add_tcp_stream(&stream)?;
+///     let wh = eh.add_tcp_stream(&stream)?;
 ///     // send the message
-///     eh.write(fd, seqno, &[1, 2, 3, 4, 5], false)?;
+///     wh.write(&[1, 2, 3, 4, 5], 5, 0, false)?;
 ///     // wait long enough to make sure the client got the message
 ///     std::thread::sleep(std::time::Duration::from_millis(100));
 ///     let x = x_clone.lock().unwrap();
@@ -498,12 +568,12 @@ where
 	/// [`EventHandler`] interface. Calling functions in [`TcpStream`] like [`std::io::Read`] or
 	/// [`std::io::Write`] will result in undefined behavior. If the stream closes for any reason, the
 	/// callback specified by [`EventHandler::set_on_close`] will be executed to notify the user.
-	/// This function returns the file descriptor (or socket handle on windows) and a connection_id
-	/// respectively that may be used to call the [`EventHandler::write`] function to write to the socket.
+	/// This function returns the [`WriteHandle`]
+	/// that may be used to write to the socket.
 	/// See the example above on how to do that.
 	/// This function will result in an error if an i/o error occurs while trying to configure the stream
 	/// or the [`EventHandler`] has not been started by calling the [`EventHandler::start`] function.
-	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<(i32, u128), Error> {
+	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<WriteHandle, Error> {
 		// make sure we have a client on_read handler configured
 		{
 			let callbacks = self.callbacks.lock().map_err(|e| {
@@ -551,10 +621,15 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, seqno) = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
-		let (fd, seqno) = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
-		Ok((fd, seqno))
+		let (fd, connection_id) = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
+		Ok(WriteHandle {
+			fd,
+			connection_id,
+			guarded_data: self.data.clone(),
+			fd_lock: None,
+		})
 	}
 
 	/// Add a [`TcpListener`] to this EventHandler.
@@ -836,74 +911,6 @@ where
 		Ok(())
 	}
 
-	/// Write data to a [`TcpStream`] that has been registered to this [`EventHandler`].
-	pub fn write(
-		&self,
-		fd: i32,
-		connection_seqno: u128,
-		data: &[u8],
-		close: bool,
-	) -> Result<(), Error> {
-		let mut buf = [0u8; BUFFER_SIZE];
-		let len = data.len();
-		let mut rem = len;
-		let mut start = 0;
-		let mut end = if len > BUFFER_SIZE { BUFFER_SIZE } else { len };
-
-		let mut wakeupfd = 0;
-		let mut wakeup_scheduled = false;
-		match self.data.lock() {
-			Ok(mut guarded_data) => loop {
-				let len = if rem < BUFFER_SIZE { rem } else { BUFFER_SIZE };
-				buf[..len].clone_from_slice(&data[start..end]);
-				self.write_buffer(
-					fd,
-					buf.clone(),
-					0,
-					len.try_into().unwrap(),
-					close,
-					connection_seqno,
-					&mut guarded_data,
-				)?;
-				if rem <= BUFFER_SIZE {
-					let (fd_inner, wakeup_scheduled_inner) =
-						do_wakeup_with_lock(&mut *guarded_data)?;
-					wakeupfd = fd_inner;
-					wakeup_scheduled = wakeup_scheduled_inner;
-					break;
-				}
-				rem -= BUFFER_SIZE;
-				start += BUFFER_SIZE;
-				end += BUFFER_SIZE;
-				if end > data.len() {
-					end = data.len();
-				}
-			},
-			Err(e) => {
-				info!("unexpected error obtaining guarded_data lock, {}", e);
-			}
-		}
-
-		if !wakeup_scheduled {
-			#[cfg(unix)]
-			{
-				let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-				unsafe {
-					write(wakeupfd, buf, 1);
-				}
-			}
-			#[cfg(target_os = "windows")]
-			{
-				let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
-				unsafe {
-					ws2_32::send(wakeupfd.try_into().unwrap_or(0), buf, 1, 0);
-				}
-			}
-		}
-
-		Ok(())
-	}
-
 	#[cfg(target_os = "linux")]
 	fn do_start(&mut self) -> Result<(), Error> {
 		// create poll fd
@@ -1003,30 +1010,6 @@ where
 		let seqno: u128 = rand::random();
 		fd_actions.push(FdAction::new(fd, atype, seqno));
 		Ok((fd.into(), seqno))
-	}
-
-	fn write_buffer(
-		&self,
-		fd: i32,
-		data: [u8; BUFFER_SIZE],
-		offset: u16,
-		len: u16,
-		close: bool,
-		connection_seqno: u128,
-		guarded_data: &mut GuardedData,
-	) -> Result<(), Error> {
-		guarded_data.write_queue.push(StreamWriteBuffer {
-			fd,
-			write_buffer: WriteBuffer {
-				buffer: data,
-				offset,
-				len,
-				close,
-				connection_seqno,
-			},
-		});
-
-		Ok(())
 	}
 
 	#[cfg(target_os = "windows")]
@@ -1680,7 +1663,7 @@ where
 					buffer.write_buffer.offset.into(),
 					buffer.write_buffer.len.into(),
 					buffer.write_buffer.close,
-					&fd_locks[buffer.fd as usize],
+					Some(&fd_locks[buffer.fd as usize]),
 					buffer.write_buffer.connection_seqno,
 					guarded_data,
 				)?;
@@ -2469,7 +2452,7 @@ where
 				fd,
 				guarded_data.clone(),
 				connection_seqno,
-				fd_locks[fd as usize].clone(),
+				Some(fd_locks[fd as usize].clone()),
 			);
 
 			let result = match use_on_client_read {
@@ -2893,8 +2876,8 @@ fn test_large_messages() -> Result<(), Error> {
 
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
-	let (fd, seqno) = eh.add_tcp_stream(&stream)?;
-	eh.write(fd, seqno, &msgbuf, false)?;
+	let wh = eh.add_tcp_stream(&stream)?;
+	wh.write(&msgbuf, 0, msgbuf.len(), false)?;
 	loop {
 		{
 			let complete = complete.lock().unwrap();
