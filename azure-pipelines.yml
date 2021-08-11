@@ -101,6 +101,6 @@ jobs:
         apt list --installed
         cargo install cargo-tarpaulin
         cargo tarpaulin --all > tarpaulin.out.`date +"%s"`.txt
-        sshpass -p "$(upload_pw)" ssh -o StrictHostKeyChecking=no uploader@bitcoinmw.com "mkdir -p /var/www/html/ci_uploads/bmw_wallet/`date +"%Y_%m_%d"`"
-        sshpass -p "$(upload_pw)" scp -o StrictHostKeyChecking=no tarpaulin.*.txt uploader@bitcoinmw.com:/var/www/html/ci_uploads/bmw_wallet/`date +"%Y_%m_%d"`
+        sshpass -p "$(upload_pw)" ssh -o StrictHostKeyChecking=no uploader@bitcoinmw.com "mkdir -p /var/www/html/ci_uploads/nioruntime/`date +"%Y_%m_%d"`"
+        sshpass -p "$(upload_pw)" scp -o StrictHostKeyChecking=no tarpaulin.*.txt uploader@bitcoinmw.com:/var/www/html/ci_uploads/nioruntime/`date +"%Y_%m_%d"`
       displayName: Code Coverage
