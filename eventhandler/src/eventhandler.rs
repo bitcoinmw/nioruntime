@@ -2690,18 +2690,20 @@ fn test_close() -> Result<(), Error> {
 	let mut stream = TcpStream::connect("127.0.0.1:9982")?;
 	let mut eh = EventHandler::new();
 
-	// echo
 	eh.set_on_read(|buf, len, wh| {
-		match len {
-			// just close the connection with no response
-			7 => {
-				let _ = wh.close();
-			}
-			// close if len == 5, otherwise keep open
-			_ => {
-				let _ = wh.write(buf, 0, len, len == 5);
+		for i in 0..len {
+			if buf[i] == 7 {
+				wh.close()?;
+				return Ok(());
 			}
 		}
+		for i in 0..len {
+			if buf[i] == 8 {
+				wh.write(&[0, 0, 0, 0], 0, 4, true)?;
+				return Ok(());
+			}
+		}
+		wh.write(&[1, 1, 1, 1, 1], 0, 5, false)?;
 		Ok(())
 	})?;
 
@@ -2715,15 +2717,15 @@ fn test_close() -> Result<(), Error> {
 	stream.write(&[1, 2, 3, 4, 5, 6])?;
 	let mut buf = [0u8; 1000];
 	let len = stream.read(&mut buf)?;
-	assert_eq!(len, 6);
-	stream.write(&[1, 2, 3, 4, 5])?;
-	let len = stream.read(&mut buf)?;
 	assert_eq!(len, 5);
+	stream.write(&[8, 8, 8])?;
+	let len = stream.read(&mut buf)?;
+	assert_eq!(len, 4);
 	let len = stream.read(&mut buf)?;
 	assert_eq!(len, 0); // means connection closed
 
 	let mut stream2 = TcpStream::connect("127.0.0.1:9982")?;
-	stream2.write(&[1, 2, 3, 4, 5, 6, 7])?;
+	stream2.write(&[7])?;
 	let len = stream2.read(&mut buf)?;
 	assert_eq!(len, 0); // means connection closed
 
