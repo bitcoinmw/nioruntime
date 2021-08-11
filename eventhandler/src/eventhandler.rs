@@ -1750,9 +1750,6 @@ where
 				&global_lock,
 				fd_locks,
 			)?;
-			/*if evs.len() > 0 {
-			info!("input events = {:?}", evs);
-			}*/
 			let mut output_events = vec![];
 			ret_count = Self::get_events(
 				selector,
@@ -1766,7 +1763,6 @@ where
 				continue;
 			}
 			for event in output_events {
-				//info!("proc event = {:?}", event);
 				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
 						event.fd as i32,
@@ -2838,9 +2834,14 @@ fn test_stop() -> Result<(), Error> {
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
 	eh.add_tcp_stream(&stream)?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
 	stream.write(&[1, 2, 3, 4, 5, 6])?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
+	loop {
+		let x = x.lock().unwrap();
+		if *x == 1 {
+			break;
+		}
+		std::thread::sleep(std::time::Duration::from_millis(10));
+	}
 	eh.stop()?;
 	std::thread::sleep(std::time::Duration::from_millis(1000));
 	stream.write(&[1, 2, 3, 4, 5, 6, 7])?;
