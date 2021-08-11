@@ -924,7 +924,7 @@ where
 	fn do_start(&mut self) -> Result<(), Error> {
 		// create poll fd
 		let selector = epoll_create1(EpollCreateFlags::empty())?;
-		self.start_generic(selector)?;
+		self.start_generic(selector.try_into().unwrap_or(0))?;
 		Ok(())
 	}
 
@@ -1371,7 +1371,12 @@ where
 				filter_set.insert(fd);
 
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
-				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
+				let res = epoll_ctl(
+					epollfd.try_into().unwrap_or(0),
+					op,
+					evt.fd.try_into().unwrap_or(0),
+					&mut event,
+				);
 				match res {
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl1: {}, fd={}, op={:?}", e, fd, op),
@@ -1390,7 +1395,12 @@ where
 				filter_set.insert(fd);
 
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
-				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
+				let res = epoll_ctl(
+					epollfd.try_into().unwrap_or(0),
+					op,
+					evt.fd.try_into().unwrap_or(0),
+					&mut event,
+				);
 				match res {
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl2: {}, fd={}, op={:?}", e, fd, op),
@@ -1410,7 +1420,12 @@ where
 				filter_set.insert(fd);
 
 				let mut event = EpollEvent::new(interest, evt.fd as u64);
-				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
+				let res = epoll_ctl(
+					epollfd.try_into().unwrap_or(0),
+					op,
+					evt.fd.try_into().unwrap_or(0),
+					&mut event,
+				);
 				match res {
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
@@ -1429,7 +1444,7 @@ where
 
 		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
 		let mut events = [empty_event; MAX_EVENTS as usize];
-		let results = epoll_wait(epollfd, &mut events, 100);
+		let results = epoll_wait(epollfd.try_into().unwrap_or(0), &mut events, 100);
 
 		let mut ret_count_adjusted = 0;
 
