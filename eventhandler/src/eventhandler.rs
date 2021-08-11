@@ -834,10 +834,7 @@ where
 		let mut _pipe_listener = None;
 		// create the pipe (for wakeups)
 		let (rx, tx) = {
-			#[cfg(unix)]
 			let mut retfds = [0i32; 2];
-			#[cfg(windows)]
-			let mut retfds = [0u64; 2];
 			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
 			#[cfg(target_os = "windows")]
 			{
@@ -1022,7 +1019,7 @@ where
 	}
 
 	#[cfg(target_os = "windows")]
-	fn socket_pipe(fds: *mut u64) -> Result<(TcpListener, TcpStream), Error> {
+	fn socket_pipe(fds: *mut i32) -> Result<(TcpListener, TcpStream), Error> {
 		let port = portpicker::pick_unused_port().unwrap_or(9999);
 		let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
 		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
@@ -1037,9 +1034,9 @@ where
 					.unwrap_or(0),
 			)
 		};
-		let fds: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
-		fds[0] = res as u64;
-		fds[1] = stream.as_raw_socket();
+		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
+		fds[0] = res as i32;
+		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
 		Ok((listener, stream))
 	}
 
@@ -1222,7 +1219,9 @@ where
 					EPOLL_CTL_ADD
 				};
 				filter_set.insert(evt.fd);
-				let data = epoll_data_t { fd: evt.fd };
+				let data = epoll_data_t {
+					fd: evt.fd.try_into().unwrap_or(0),
+				};
 				let mut event = epoll_event {
 					events: EPOLLIN | EPOLLRDHUP,
 					data,
@@ -1247,7 +1246,9 @@ where
 					EPOLL_CTL_ADD
 				};
 				filter_set.insert(evt.fd);
-				let data = epoll_data_t { fd: evt.fd };
+				let data = epoll_data_t {
+					fd: evt.fd.try_into().unwrap_or(0),
+				};
 				let mut event = epoll_event {
 					events: EPOLLIN | EPOLLOUT | EPOLLRDHUP,
 					data,
@@ -1269,7 +1270,9 @@ where
 				}
 			} else if evt.etype == GenericEventType::DelRead {
 				filter_set.remove(&evt.fd);
-				let data = epoll_data_t { fd: evt.fd };
+				let data = epoll_data_t {
+					fd: evt.fd.try_into().unwrap_or(0),
+				};
 				let mut event = epoll_event {
 					events: 0, // not used for del
 					data,
