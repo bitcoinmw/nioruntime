@@ -2202,7 +2202,7 @@ where
 				};
 				if res > 0 {
 					Self::ensure_allocations(
-						res,
+						res.try_into().unwrap_or(0),
 						read_fd_type,
 						fd_locks,
 						on_read_locks,
