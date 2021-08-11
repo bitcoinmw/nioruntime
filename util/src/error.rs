@@ -21,13 +21,14 @@ use std::fmt;
 use std::fmt::Display;
 use std::str::Utf8Error;
 
+/// Base Error struct which is used throught this crate and other crates
 #[derive(Debug, Fail)]
 pub struct Error {
 	inner: Context<ErrorKind>,
 }
 
+/// Kinds of errors that can occur
 #[derive(Clone, Eq, PartialEq, Debug, Fail)]
-/// ErrorKinds for crate
 pub enum ErrorKind {
 	/// IOError Error
 	#[fail(display = "IOError Error: {}", _0)]

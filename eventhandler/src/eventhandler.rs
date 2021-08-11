@@ -68,10 +68,9 @@ const MAX_EVENTS: i32 = 100;
 const WINSOCK_BUF_SIZE: winapi::c_int = 100_000_000;
 
 #[derive(Debug, Clone)]
-pub enum ActionType {
+pub(crate) enum ActionType {
 	AddStream,
 	AddListener,
-	Remove,
 }
 
 #[derive(Debug, PartialEq)]
@@ -213,16 +212,22 @@ fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
 	Ok((data.wakeup_fd, wakeup_scheduled))
 }
 
+/// A Write handle that is associated with a particular connection.
+///
+/// This struct is passed into the callbacks specified by [`EventHandler::set_on_read`]
+/// and [`EventHandler::set_on_client_read`] functions when data are ready.
+/// It can then be used to write back to the associated connection.
+/// See [`EventHandler::set_on_read`] for examples.
 #[derive(Clone)]
 pub struct WriteHandle {
 	fd: i32,
 	guarded_data: Arc<Mutex<GuardedData>>,
-	pub connection_id: u128,
+	connection_id: u128,
 	fd_lock: Arc<Mutex<StateInfo>>,
 }
 
 impl WriteHandle {
-	pub fn new(
+	fn new(
 		fd: i32,
 		guarded_data: Arc<Mutex<GuardedData>>,
 		connection_id: u128,
@@ -236,10 +241,22 @@ impl WriteHandle {
 		}
 	}
 
+	/// Get the connection_id associated with this write handle.
+	pub fn get_connection_id(&self) -> u128 {
+		self.connection_id
+	}
+
+	/// Close the connection associated with this write handle.
 	pub fn close(&self) -> Result<(), Error> {
 		self.write(&[1], 0, 0, true)
 	}
 
+	/// Write the specifed data to the connection associated with this write handle.
+	///
+	/// * `data` - The data to write to this connection.
+	/// * `offset` - The offset into this data buffer to start writing at.
+	/// * `len` - The length of data to write.
+	/// * `close` - Whether or not to close this connection after writing the data.
 	pub fn write(&self, data: &[u8], offset: usize, len: usize, close: bool) -> Result<(), Error> {
 		do_write(
 			self.fd,
@@ -303,13 +320,13 @@ enum FdType {
 }
 
 #[derive(Debug, Clone)]
-pub struct StreamWriteBuffer {
+pub(crate) struct StreamWriteBuffer {
 	fd: i32,
 	write_buffer: WriteBuffer,
 }
 
 #[derive(Debug, Clone)]
-pub struct WriteBuffer {
+pub(crate) struct WriteBuffer {
 	offset: u16,
 	len: u16,
 	buffer: [u8; BUFFER_SIZE],
@@ -332,7 +349,7 @@ enum State {
 }
 
 #[derive(Debug)]
-pub struct StateInfo {
+pub(crate) struct StateInfo {
 	fd: i32,
 	state: State,
 	seqno: u128,
@@ -361,7 +378,7 @@ impl StateInfo {
 	}
 }
 
-pub struct GuardedData {
+pub(crate) struct GuardedData {
 	fd_actions: Vec<FdAction>,
 	wakeup_fd: i32,
 	wakeup_rx: i32,
@@ -373,6 +390,84 @@ pub struct GuardedData {
 	write_queue: Vec<StreamWriteBuffer>,
 }
 
+/// EventHandler struct.
+///
+/// The EventHandler provides a simple interface for registering [`TcpStream`]'s and [`TcpListener`]'s such
+/// that when data is available on any of the sockets, a user defined callback will be executed. Data
+/// may also be written back to the sockets inband or out of band. The interface uses
+/// [epoll](https://man7.org/linux/man-pages/man7/epoll.7.html) on linux,
+/// [wepoll](https://github.com/piscisaureus/wepoll) on windows, and
+/// [kqueues](https://www.freebsd.org/cgi/man.cgi?query=kqueue&sektion=2) on BSD variants, so perforamance
+/// is optimized. In addition to using libraries that are optimized for their respective platforms, the
+/// EventHandler preallocates all memory upon accepting a connection (once per file descriptor), so only
+/// stack memory allocation is done when running with a heavy load. This allows for very good performance and
+/// stable (low) memory usage. The EventHandler uses a little less than 100k RAM per connection, so 10,000
+/// connections would require less than 1 GB of memory. When only a few hundred connections are needed, the
+/// EventHandler uses around 1 mb of RAM so it would work fine on systems like a Raspberry Pi or other low
+/// memory environments. This performance, coupled with Rust's memory safety and the ability to run user
+/// defined rust programs allows for various applications.
+/// # Examples
+/// ```
+/// // use required libraries
+/// use std::io::Write;
+/// use std::net::{TcpListener, TcpStream};
+/// use std::sync::{Mutex, Arc};
+/// use nioruntime_evh::EventHandler;
+/// use nioruntime_util::Error;
+///
+/// fn main() -> Result<(), Error> {
+///     // create a mutex to ensure functions are called
+///     let x = Arc::new(Mutex::new(0));
+///     let x_clone = x.clone();
+///
+///     // create a listener/stream with a port that is likely not used
+///     let listener = TcpListener::bind("127.0.0.1:9991")?;
+///     let mut stream = TcpStream::connect("127.0.0.1:9991")?;
+///     // instantiate the EventHandler
+///     let mut eh = EventHandler::new();
+///
+///     // set the on_read callback to simply echo back what is written to it
+///     eh.set_on_read(|buf, len, wh| {
+///         let _ = wh.write(buf, 0, len, false);
+///         Ok(())
+///     })?;
+///
+///     // don't do anything with the accept callback for now
+///     eh.set_on_accept(|_| Ok(()))?;
+///     // don't do anything with the close callback for now
+///     eh.set_on_close(|_| Ok(()))?;
+///     // assert that the client receives the echoed message back exactly
+///     // as was sent
+///     eh.set_on_client_read(move |buf, len, _wh| {
+///         assert_eq!(len, 5);
+///         assert_eq!(buf[0], 1);
+///         assert_eq!(buf[1], 2);
+///         assert_eq!(buf[2], 3);
+///         assert_eq!(buf[3], 4);
+///         assert_eq!(buf[4], 5);
+///         let mut x = x.lock().unwrap();
+///         (*x) += 1;
+///         Ok(())
+///     })?;
+///
+///     // start the event handler
+///     eh.start()?;
+///
+///     // add the tcp listener
+///     eh.add_tcp_listener(&listener)?;
+///     // add the tcp stream and retreive the fd, seqno which are needed to write
+///     // on this client through the EventHandler interface
+///     let (fd, seqno) = eh.add_tcp_stream(&stream)?;
+///     // send the message
+///     eh.write(fd, seqno, &[1, 2, 3, 4, 5], false)?;
+///     // wait long enough to make sure the client got the message
+///     std::thread::sleep(std::time::Duration::from_millis(100));
+///     let x = x_clone.lock().unwrap();
+///     // ensure that the client callback executed
+///     assert_eq!((*x), 1);
+///     Ok(())
+/// }
+/// ```
 pub struct EventHandler<F, G, H, K> {
 	data: Arc<Mutex<GuardedData>>,
 	callbacks: Arc<Mutex<Callbacks<F, G, H, K>>>,
@@ -387,6 +482,27 @@ where
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	K: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 {
+	/// Add a [`TcpStream`] to this EventHandler.
+	///
+	/// This function adds the specified [`TcpStream`] to this [`EventHandler`]. When data is read
+	/// on this [`TcpStream`], the callback specified by [`EventHandler::set_on_client_read`] will be
+	/// executed and the user can respond accordingly. Please note that
+	/// the EventHanlder is only responsible for handling reads/writes/closes (when an error occurs,
+	/// or the user specifies) on the stream. The calling function must ensure that the [`TcpStream`]
+	/// stays in scope because [`TcpStream`]'s drop function will close the socket which will result
+	/// in the [`EventHandler`] detecting the close of the socket and taking appropriate action.
+	/// Also note that the caller is responsible for managing this resource. The [`EventHandler`] will
+	/// never close a connection unless it is instructed by the caller through the [`WriteHandle`] interface
+	/// or if an error occurs or the other side of the connection closes. Also, once the [`TcpStream`] is
+	/// registered with the [`EventHandler`], all reads/writes to this stream should occur through the
+	/// [`EventHandler`] interface. Calling functions in [`TcpStream`] like [`std::io::Read`] or
+	/// [`std::io::Write`] will result in undefined behavior. If the stream closes for any reason, the
+	/// callback specified by [`EventHandler::set_on_close`] will be executed to notify the user.
+	/// This function returns the file descriptor (or socket handle on windows) and a connection_id
+	/// respectively that may be used to call the [`EventHandler::write`] function to write to the socket.
+	/// See the example above on how to do that.
+	/// This function will result in an error if an i/o error occurs while trying to configure the stream
+	/// or the [`EventHandler`] has not been started by calling the [`EventHandler::start`] function.
 	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<(i32, u128), Error> {
 		// make sure we have a client on_read handler configured
 		{
@@ -423,7 +539,7 @@ where
 			};
 
 			if sockoptres != 0 {
-				info!("setsockopt resulted in error: {}", errno().to_string());
+				error!("setsockopt resulted in error: {}", errno().to_string());
 			}
 		}
 
@@ -441,7 +557,26 @@ where
 		Ok((fd, seqno))
 	}
 
-	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<(i32, u128), Error> {
+	/// Add a [`TcpListener`] to this EventHandler.
+	///
+	/// This function adds the specified [`TcpListener`] to this [`EventHandler`]. When a client connects to
+	/// this [`TcpListener`], it is accepted by [`EventHandler`] and when any data is read on that accepted
+	/// client's connection, the callback specified by [`EventHandler::set_on_read`] will be
+	/// executed and the user can respond accordingly. The callback specified by [`EventHandler::set_on_accept`]
+	/// will be executed when a new connection is accepted on this [`TcpListener`] and the callback specified
+	/// by [`EventHandler::set_on_close`] will be executed when the connection closes. Please note that
+	/// the EventHanlder is only responsible for accepting new connections on the [`TcpListener`]
+	/// Closing the [`TcpListener`] or any accepted connection is the responsibility of the user.
+	/// The calling function must
+	/// ensure that the [`TcpListener`] stays in scope because [`TcpListener`]'s drop function will close
+	/// the socket which will result in the [`EventHandler`] detecting the close of the listener and taking
+	/// appropriate action. Also note that the caller is responsible for managing this resource. The
+	/// [`EventHandler`] will never close a connection unless an error occurs. Also, once the [`TcpListener`] is
+	/// registered with the [`EventHandler`], no additional function calls should be made directly to the
+	/// [`TcpListener`] itself. Calling any functions in [`TcpListener`] will result in undefined behavior.
+	/// This function will result in an error if an i/o error occurs while trying to configure the listener
+	/// or the [`EventHandler`] has not been started by calling the [`EventHandler::start`] function.
+	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<(), Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
 		#[cfg(any(
@@ -452,101 +587,34 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, seqno) = self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
+		self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
-		let (fd, seqno) = self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
-		Ok((fd, seqno))
-	}
-
-	#[cfg(target_os = "windows")]
-	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<(i32, u128), Error> {
-		let fd = socket.try_into().unwrap_or(0);
-		let (fd, seqno) = self.add_fd(fd, atype)?;
-		Ok((fd, seqno))
-	}
-
-	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<(i32, u128), Error> {
-		self.ensure_handlers()?;
-
-		let mut data = self.data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
-		if data.selector.is_none() {
-			return Err(
-				ErrorKind::SetupError("EventHandler must be started first".to_string()).into(),
-			);
-		}
-
-		let fd_actions = &mut data.fd_actions;
-		let seqno: u128 = rand::random();
-		fd_actions.push(FdAction::new(fd, atype, seqno));
-		Ok((fd.into(), seqno))
-	}
-
-	fn _remove_fd(&mut self, fd: i32) -> Result<(), Error> {
-		let mut data = self.data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-		let fd_actions = &mut data.fd_actions;
-		fd_actions.push(FdAction::new(fd, ActionType::Remove, 0));
+		self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
 		Ok(())
 	}
 
-	fn ensure_handlers(&self) -> Result<(), Error> {
-		let callbacks = self.callbacks.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
-		match callbacks.on_read {
-			Some(_) => {}
-			None => {
-				return Err(ErrorKind::SetupError(
-					"on_read callback must be registered first".to_string(),
-				)
-				.into());
-			}
-		}
-
-		match callbacks.on_accept {
-			Some(_) => {}
-			None => {
-				return Err(ErrorKind::SetupError(
-					"on_accept callback must be registered first".to_string(),
-				)
-				.into());
-			}
-		}
-
-		match callbacks.on_close {
-			Some(_) => {}
-			None => {
-				return Err(ErrorKind::SetupError(
-					"on_close callback must be registered first".to_string(),
-				)
-				.into());
-			}
-		}
-
-		Ok(())
-	}
-
-	fn check_and_set<T>(vec: &mut Vec<T>, i: usize, value: T)
-	where
-		T: Default,
-	{
-		let cur_len = vec.len();
-		if cur_len <= i {
-			for _ in cur_len..i + 1 {
-				vec.push(T::default());
-			}
-		}
-		vec[i] = value;
-	}
-
+	/// This sets the on_read callback for this [`EventHandler`].
+	///
+	/// As described in [`EventHandler::add_tcp_listener`], this callback is executed when data is available
+	/// on a connection that has been accepted by a [`TcpListener`] that was registered with this [`EventHandler`].
+	/// # Examples
+	/// ```
+	/// use nioruntime_evh::EventHandler;
+	/// use nioruntime_util::Error;
+	///
+	/// fn main() -> Result<(), Error> {
+	///     let mut eh = EventHandler::new();
+	///     // set the on_read callback to simply echo back what is written to it
+	///     eh.set_on_read(|buf, len, wh| {
+	///         let _ = wh.write(buf, 0, len, false);
+	///         Ok(())
+	///     })?;
+	///     eh.set_on_accept(|_| Ok(()))?;
+	///     eh.set_on_client_read(|_,_,_| Ok(()))?;
+	///     eh.set_on_close(|_| Ok(()))?;
+	///     Ok(())
+	/// }
+	/// ```
 	pub fn set_on_read(&mut self, on_read: F) -> Result<(), Error> {
 		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -558,6 +626,32 @@ where
 		Ok(())
 	}
 
+	/// This sets the on_accept callback for this [`EventHandler`].
+	///
+	/// As described in [`EventHandler::add_tcp_listener`], this callback is executed when a new connection is
+	/// accepted on a [`TcpListener`] that was registered with this [`EventHandler`].
+	///
+	/// # Examples
+	/// ```
+	/// use nioruntime_evh::EventHandler;
+	/// use nioruntime_util::Error;
+	/// use log::*;
+	///
+	/// info!();
+	///
+	/// fn main() -> Result<(), Error> {
+	///     let mut eh = EventHandler::new();
+	///     // print out a message when a new connection is accepted
+	///     eh.set_on_accept(|connection_id| {
+	///         info!("accepted connection with id = {}", connection_id);
+	///         Ok(())
+	///     })?;
+	///     eh.set_on_read(|_,_,_|  Ok(()))?;
+	///     eh.set_on_client_read(|_,_,_| Ok(()))?;
+	///     eh.set_on_close(|_| Ok(()))?;
+	///     Ok(())
+	/// }   
+	/// ```
 	pub fn set_on_accept(&mut self, on_accept: G) -> Result<(), Error> {
 		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -569,6 +663,34 @@ where
 		Ok(())
 	}
 
+	/// This sets the on_close callback for this [`EventHandler`].
+	///
+	/// As described in [`EventHandler::add_tcp_listener`], this callback is executed when a connection is
+	/// closed on a [`TcpListener`] that was registered with this [`EventHandler`]. This may happen due to
+	/// an error, if the other side disconnects and EOF is reached or if the user closes this connection
+	/// via the [`WriteHandle`].
+	///
+	/// # Examples
+	/// ```
+	/// use nioruntime_evh::EventHandler;
+	/// use nioruntime_util::Error;
+	/// use log::*;
+	///
+	/// info!();
+	///
+	/// fn main() -> Result<(), Error> {
+	///     let mut eh = EventHandler::new();
+	///     // print out a message when a connection is closed
+	///     eh.set_on_close(|connection_id| {
+	///         info!("closed connection with id = {}", connection_id);
+	///         Ok(())
+	///     })?;
+	///     eh.set_on_read(|_,_,_|  Ok(()))?;
+	///     eh.set_on_client_read(|_,_,_| Ok(()))?;
+	///     eh.set_on_accept(|_| Ok(()))?;
+	///     Ok(())
+	/// }
+	/// ```
 	pub fn set_on_close(&mut self, on_close: H) -> Result<(), Error> {
 		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -580,6 +702,35 @@ where
 		Ok(())
 	}
 
+	/// This sets the on_client_read callback for this [`EventHandler`].
+	///
+	/// As described in [`EventHandler::add_tcp_stream`], this callback is executed when a connection
+	/// has data available for reading on a [`TcpStream`] that was registered with this [`EventHandler`].
+	/// The only difference between this callback and [`EventHandler::set_on_read`] is that this one is
+	/// called for [`TcpStream`]'s that were registed with the [`EventHandler`] and [`EventHandler::set_on_read`]
+	/// is used for connections that were accepted with a registered [`TcpListener`].
+	///
+	/// # Examples
+	/// ```
+	/// use nioruntime_evh::EventHandler;
+	/// use nioruntime_util::Error;
+	/// use log::*;
+	///
+	/// info!();
+	///
+	/// fn main() -> Result<(), Error> {
+	///     let mut eh = EventHandler::new();
+	///     // echo back the message
+	///     eh.set_on_client_read(|buf, len, wh| {
+	///         let _ = wh.write(buf, 0, len, false);
+	///         Ok(())
+	///     })?;
+	///     eh.set_on_close(|_| Ok(()))?;
+	///     eh.set_on_read(|_,_,_|  Ok(()))?;
+	///     eh.set_on_accept(|_| Ok(()))?;
+	///     Ok(())
+	/// }
+	/// ```
 	pub fn set_on_client_read(&mut self, on_client_read: K) -> Result<(), Error> {
 		let mut callbacks = self.callbacks.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -591,6 +742,9 @@ where
 		Ok(())
 	}
 
+	/// Create a new instance of the [`EventHandler`]. Note that all callbacks must be registered
+	/// and [`EventHandler::start`] must be called before handleing events. See the example in the
+	/// [`EventHandler`] section of the documentation for a full details.
 	pub fn new() -> Self {
 		let mut _pipe_stream = None;
 		let mut _pipe_listener = None;
@@ -647,28 +801,13 @@ where
 		}
 	}
 
-	#[cfg(target_os = "linux")]
+	/// Start the event handler.
 	pub fn start(&mut self) -> Result<(), Error> {
-		// create poll fd
-		let selector = epoll_create1(EpollCreateFlags::empty())?;
-		self.start_generic(selector)?;
-		Ok(())
+		self.do_start()
 	}
 
-	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
-	pub fn start(&mut self) -> Result<(), Error> {
-		// create the kqueue
-		let selector = unsafe { kqueue() };
-		self.start_generic(selector)?;
-		Ok(())
-	}
-
-	#[cfg(target_os = "windows")]
-	pub fn start(&mut self) -> Result<(), Error> {
-		self.start_generic(0)?;
-		Ok(())
-	}
-
+	/// Stop the event handler and free any internal resources associated with it. Note: this
+	/// does not close any registered sockets. That is the responsibility of the user.
 	pub fn stop(&self) -> Result<(), Error> {
 		let mut guarded_data = self.data.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -694,6 +833,7 @@ where
 		Ok(())
 	}
 
+	/// Write data to a [`TcpStream`] that has been registered to this [`EventHandler`].
 	pub fn write(
 		&self,
 		fd: i32,
@@ -759,6 +899,107 @@ where
 		}
 
 		Ok(())
+	}
+
+	#[cfg(target_os = "linux")]
+	fn do_start(&mut self) -> Result<(), Error> {
+		// create poll fd
+		let selector = epoll_create1(EpollCreateFlags::empty())?;
+		self.start_generic(selector)?;
+		Ok(())
+	}
+
+	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+	fn do_start(&mut self) -> Result<(), Error> {
+		// create the kqueue
+		let selector = unsafe { kqueue() };
+		self.start_generic(selector)?;
+		Ok(())
+	}
+
+	#[cfg(target_os = "windows")]
+	fn do_start(&mut self) -> Result<(), Error> {
+		self.start_generic(0)?;
+		Ok(())
+	}
+
+	fn ensure_handlers(&self) -> Result<(), Error> {
+		let callbacks = self.callbacks.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		match callbacks.on_read {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_read callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		match callbacks.on_accept {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_accept callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		match callbacks.on_close {
+			Some(_) => {}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"on_close callback must be registered first".to_string(),
+				)
+				.into());
+			}
+		}
+
+		Ok(())
+	}
+
+	fn check_and_set<T>(vec: &mut Vec<T>, i: usize, value: T)
+	where
+		T: Default,
+	{
+		let cur_len = vec.len();
+		if cur_len <= i {
+			for _ in cur_len..i + 1 {
+				vec.push(T::default());
+			}
+		}
+		vec[i] = value;
+	}
+
+	#[cfg(target_os = "windows")]
+	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<(i32, u128), Error> {
+		let fd = socket.try_into().unwrap_or(0);
+		let (fd, seqno) = self.add_fd(fd, atype)?;
+		Ok((fd, seqno))
+	}
+
+	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<(i32, u128), Error> {
+		self.ensure_handlers()?;
+
+		let mut data = self.data.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+			error
+		})?;
+
+		if data.selector.is_none() {
+			return Err(
+				ErrorKind::SetupError("EventHandler must be started first".to_string()).into(),
+			);
+		}
+
+		let fd_actions = &mut data.fd_actions;
+		let seqno: u128 = rand::random();
+		fd_actions.push(FdAction::new(fd, atype, seqno));
+		Ok((fd.into(), seqno))
 	}
 
 	fn write_buffer(
@@ -1508,19 +1749,6 @@ where
 							}
 						}
 						use_on_client_read[fd] = false;
-					}
-					ActionType::Remove => {
-						evs.push(GenericEvent::new(proc.fd, GenericEventType::DelRead));
-						let fd = proc.fd as uintptr_t;
-
-						// make sure there's enough space
-						let len = read_fd_type.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								read_fd_type.push(FdType::Unknown);
-							}
-						}
-						read_fd_type[fd] = FdType::Unknown;
 					}
 				}
 			}

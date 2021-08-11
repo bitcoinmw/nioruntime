@@ -21,6 +21,8 @@ pub mod eventhandler;
 
 pub use nioruntime_util as util;
 
+pub use crate::eventhandler::EventHandler;
+
 // Some needed timespec code
 
 #[cfg(any(target_os = "macos", dragonfly, netbsd, openbsd))]

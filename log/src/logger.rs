@@ -43,7 +43,7 @@ lazy_static! {
 /// Log at the 'fatal' (5) log level. This macro calls the default logger. To configure this
 /// logger, see [`log_config`]. It is used like the pritln/format macros.
 /// Also see [`trace`] [`debug`], [`info`], [`warn`], or [`error`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -94,7 +94,7 @@ macro_rules! fatal_no_ts {
 /// Log at the 'error' (4) log level. This macro calls the default logger. To configure this
 /// logger, see [`log_config`]. It is used like the pritln/format macros.
 /// Also see [`trace`], [`debug`], [`info`], [`warn`], or [`fatal`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -145,7 +145,7 @@ macro_rules! error_no_ts {
 /// Log at the 'warn' (3) log level. This macro calls the default logger. To configure this
 /// logger, see [`log_config`]. It is used like the pritln/format macros.
 /// Also see [`trace`], [`debug`], [`info`], [`error`], or [`fatal`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -196,7 +196,7 @@ macro_rules! warn_no_ts {
 /// Log at the 'info' (2) log level. This macro calls the default logger. To configure this
 /// logger, see [`log_config`]. It is used like the pritln/format macros.
 /// Also see [`trace`], [`debug`], [`warn`], [`error`], or [`fatal`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -247,7 +247,7 @@ macro_rules! info_no_ts {
 /// Log at the 'debug' (1) log level. This macro calls the default logger. To configure this
 /// logger, see [`log_config`]. It is used like the pritln/format macros.
 /// Also see [`trace`], [`info`], [`warn`], [`error`], or [`fatal`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -256,8 +256,8 @@ macro_rules! info_no_ts {
 /// debug!(); // set log level to debug "1"
 ///
 /// let abc = 123;
-/// trace!("my value = {}", abc);
-/// trace!("hi");
+/// debug!("my value = {}", abc);
+/// debug!("hi");
 ///
 /// // The output will look like this:
 /// // [2021-08-09 19:41:37]: my value = 123
@@ -298,7 +298,7 @@ macro_rules! debug_no_ts {
 /// Log at the 'trace' (0) log level. This macro calls the default logger. To configure this
 /// logger, see [`log_config`]. It is used like the pritln/format macros.
 /// Also see [`debug`], [`info`], [`warn`], [`error`], or [`fatal`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -348,7 +348,7 @@ macro_rules! trace_no_ts {
 
 /// log_multi is identical to [`log`] except that the name of the logger is specified instead of using
 /// the default logger.
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 /// // log level must be set before calling any logging function.
@@ -421,7 +421,7 @@ macro_rules! log_multi {
 /// logger, see [`log_config`]. It is used like the pritln/format macros. The first
 /// parameter is the log level. To avoid specifying level, see [`trace`], [`debug`],
 /// [`info`], [`warn`], [`error`], or [`fatal`].
-/// For example:
+/// # Examples
 /// ```
 /// use log::*;
 ///
@@ -488,7 +488,7 @@ macro_rules! log {
 
 /// Identical to [`log_no_ts`] except that the name of the logger is specified instead of using
 /// the default logger.
-/// For example:
+/// # Examples
 ///
 /// ```
 /// use log::*;
@@ -538,7 +538,7 @@ macro_rules! log_no_ts_multi {
 }
 
 /// Log using the default logger and don't print a timestamp. See [`log`] for more details on logging.
-/// For example:
+/// # Examples
 ///
 /// ```
 /// use log::*;

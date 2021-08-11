@@ -294,7 +294,7 @@ fn real_main() -> Result<(), Error> {
 		let buffers_clone2 = buffers.clone();
 		eh.set_on_read(move |buf, len, wh| {
 			let mut buffers = buffers_clone2.lock().unwrap();
-			let held_buf = &mut buffers.get_mut(&wh.connection_id);
+			let held_buf = &mut buffers.get_mut(&wh.get_connection_id());
 			match held_buf {
 				Some(held_buf) => {
 					copy(
@@ -336,7 +336,7 @@ fn real_main() -> Result<(), Error> {
 					}
 				}
 				None => {
-					info!("unexpected none: {}, len = {}", wh.connection_id, len);
+					info!("unexpected none: {}, len = {}", wh.get_connection_id(), len);
 					Ok(())
 				}
 			}

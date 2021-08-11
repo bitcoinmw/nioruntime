@@ -25,15 +25,24 @@ use std::sync::Mutex;
 use std::thread;
 
 lazy_static! {
-	pub static ref STATIC_THREAD_POOL: Arc<Mutex<HashMap<u128, ThreadPoolImpl>>> =
+	pub(crate) static ref STATIC_THREAD_POOL: Arc<Mutex<HashMap<u128, ThreadPoolImpl>>> =
 		Arc::new(Mutex::new(HashMap::new()));
 }
 
+/// The static thread pool is a thread pool that can be used to execute futures. It is used
+/// by the event handler and other structs to take advantage of the ability to run multiple
+/// threads at the same time.
 pub struct StaticThreadPool {
 	id: u128,
 }
 
 impl StaticThreadPool {
+	/// Build a new static thread pool or return an error if an error occurs.
+	///
+	/// This function builds a static thread pool. Note that it does not start
+	/// the thread pool. [`EventHandler.start`] must be called before using the thread pool.
+	///
+	/// Returns Ok(()) or Error if the static thread pool lock cannot be obtained.
 	pub fn new() -> Result<Self, Error> {
 		let tp = ThreadPoolImpl::new();
 		let id: u128 = rand::random::<u128>();
@@ -50,6 +59,12 @@ impl StaticThreadPool {
 		Ok(StaticThreadPool { id })
 	}
 
+	/// Start the static thread pool.
+	///
+	/// Start the thread pool with the specified size. After calling this function,
+	/// [`Eventhandler.execute`] may be called to execute futures.
+	///
+	/// * `size` - The number of threads for this thread pool to start.
 	pub fn start(&self, size: usize) -> Result<(), Error> {
 		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
@@ -75,6 +90,8 @@ impl StaticThreadPool {
 		Ok(())
 	}
 
+	/// Stop this thread pool free all resources used by the thread pool and terminate
+	/// all running threads.
 	pub fn stop(&self) -> Result<(), Error> {
 		let stp = STATIC_THREAD_POOL.lock().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
@@ -99,6 +116,11 @@ impl StaticThreadPool {
 		Ok(())
 	}
 
+	/// Execute the specified future.
+	///
+	/// The specified future will be executed in one of the thread pool's threads.
+	///
+	/// * `f` - The future to execute.
 	pub fn execute<F>(&self, f: F) -> Result<(), Error>
 	where
 		F: Future<Output = ()> + Send + Sync + 'static,
@@ -127,11 +149,11 @@ impl StaticThreadPool {
 	}
 }
 
-pub struct FuturesHolder {
+pub(crate) struct FuturesHolder {
 	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
 
-pub struct ThreadPoolImpl {
+pub(crate) struct ThreadPoolImpl {
 	tx: Arc<Mutex<mpsc::Sender<(FuturesHolder, bool)>>>,
 	rx: Arc<Mutex<mpsc::Receiver<(FuturesHolder, bool)>>>,
 	size: Arc<Mutex<usize>>,
