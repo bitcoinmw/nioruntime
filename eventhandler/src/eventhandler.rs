@@ -2701,8 +2701,8 @@ fn test_close() -> Result<(), Error> {
 	let mut eh = EventHandler::new();
 
 	let read_buf = Arc::new(Mutex::new(vec![]));
-	eh.set_on_read(|buf, len, wh| {
-		let read_buf = read_buf.lock().unwrap();
+	eh.set_on_read(move |buf, len, wh| {
+		let mut read_buf = read_buf.lock().unwrap();
 		for i in 0..len {
 			read_buf.push(buf[i]);
 		}
@@ -2721,11 +2721,11 @@ fn test_close() -> Result<(), Error> {
 		}
 		for i in 0..len {
 			if read_buf[i] == 8 {
-				wh.write(&[0], 0, 4, true)?;
+				wh.write(&[0], 0, 1, true)?;
 				return Ok(());
 			}
 		}
-		wh.write(&[1], 0, 5, false)?;
+		wh.write(&[1], 0, 1, false)?;
 		Ok(())
 	})?;
 
