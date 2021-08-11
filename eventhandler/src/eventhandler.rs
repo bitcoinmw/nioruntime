@@ -2817,33 +2817,20 @@ fn test_stop() -> Result<(), Error> {
 	let xclone = x.clone();
 
 	// echo
-	eh.set_on_read(move |buf, len, wh| {
+	eh.set_on_read(move |_, _, _| {
 		let mut x = xclone.lock().unwrap();
 		*x += 1;
-		match len {
-			// just close the connection with no response
-			7 => {
-				let _ = wh.close();
-			}
-			// close if len == 5, otherwise keep open
-			_ => {
-				let _ = wh.write(buf, 0, len, len == 5);
-			}
-		}
 		Ok(())
 	})?;
 
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
-	eh.set_on_client_read(move |buf, len, _wh| {
-		assert_eq!(&buf[0..len], [1, 2, 3, 4, 5, 6]);
-		Ok(())
-	})?;
+	eh.set_on_client_read(move |_, _, _| Ok(()))?;
 
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
 	eh.add_tcp_stream(&stream)?;
-	stream.write(&[1, 2, 3, 4, 5, 6])?;
+	stream.write(&[1])?;
 	loop {
 		let x = x.lock().unwrap();
 		if *x == 1 {
@@ -2852,9 +2839,9 @@ fn test_stop() -> Result<(), Error> {
 		std::thread::sleep(std::time::Duration::from_millis(10));
 	}
 	eh.stop()?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
-	stream.write(&[1, 2, 3, 4, 5, 6, 7])?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
+	std::thread::sleep(std::time::Duration::from_millis(3000));
+	stream.write(&[1])?;
+	std::thread::sleep(std::time::Duration::from_millis(3000));
 	let x = x.lock().unwrap();
 	assert_eq!(*x, 1);
 	Ok(())
