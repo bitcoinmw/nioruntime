@@ -2690,6 +2690,7 @@ fn test_echo() -> Result<(), Error> {
 
 	// echo
 	eh.set_on_read(|buf, len, wh| {
+		info!("server received: {} bytes", len);
 		let _ = wh.write(buf, 0, len, false);
 		Ok(())
 	})?;
@@ -2698,6 +2699,7 @@ fn test_echo() -> Result<(), Error> {
 	eh.set_on_close(|_| Ok(()))?;
 	let client_buf = Arc::new(Mutex::new(vec![]));
 	eh.set_on_client_read(move |buf, len, _wh| {
+		info!("client received: {} bytes", len);
 		let mut client_buf = client_buf.lock().unwrap();
 		for i in 0..len {
 			client_buf.push(buf[i]);
@@ -2722,13 +2724,14 @@ fn test_echo() -> Result<(), Error> {
 	let wh = eh.add_tcp_stream(&stream)?;
 	wh.write(&[1, 2, 3, 4, 5], 0, 5, false)?;
 	loop {
-		let x = x_clone.lock().unwrap();
-		if *x == 0 {
-			std::thread::sleep(std::time::Duration::from_millis(10));
-			continue;
+		{
+			let x = x_clone.lock().unwrap();
+			if *x != 0 {
+				assert_eq!(*x, 5);
+				break;
+			}
 		}
-		assert_eq!((*x), 5);
-		break;
+		std::thread::sleep(std::time::Duration::from_millis(10));
 	}
 	Ok(())
 }
@@ -2871,9 +2874,11 @@ fn test_stop() -> Result<(), Error> {
 	eh.add_tcp_stream(&stream)?;
 	stream.write(&[1])?;
 	loop {
-		let x = x.lock().unwrap();
-		if *x == 1 {
-			break;
+		{
+			let x = x.lock().unwrap();
+			if *x == 1 {
+				break;
+			}
 		}
 		std::thread::sleep(std::time::Duration::from_millis(10));
 	}
