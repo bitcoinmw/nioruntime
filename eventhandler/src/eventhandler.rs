@@ -28,6 +28,11 @@ use nix::sys::epoll::{
 
 debug!();
 
+#[cfg(unix)]
+type ConnectionHandle = i32;
+#[cfg(target_os = "windows")]
+type ConnectionHandle = u64;
+
 // unix specific deps
 #[cfg(unix)]
 use libc::fcntl;
@@ -84,12 +89,12 @@ enum GenericEventType {
 
 #[derive(Debug)]
 struct GenericEvent {
-	fd: u64,
+	fd: ConnectionHandle,
 	etype: GenericEventType,
 }
 
 impl GenericEvent {
-	fn new(fd: u64, etype: GenericEventType) -> Self {
+	fn new(fd: ConnectionHandle, etype: GenericEventType) -> Self {
 		GenericEvent { fd, etype }
 	}
 
@@ -117,7 +122,7 @@ impl GenericEvent {
 }
 
 fn do_write_no_fd_lock(
-	fd: u64,
+	fd: ConnectionHandle,
 	connection_seqno: u128,
 	data: &[u8],
 	close: bool,
@@ -181,7 +186,7 @@ fn do_write_no_fd_lock(
 }
 
 fn do_write(
-	fd: u64,
+	fd: ConnectionHandle,
 	data: &[u8],
 	offset: usize,
 	len: usize,
@@ -272,7 +277,7 @@ fn do_write(
 	Ok(())
 }
 
-fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(u64, bool), Error> {
+fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(ConnectionHandle, bool), Error> {
 	let wakeup_scheduled = data.wakeup_scheduled;
 	if !wakeup_scheduled {
 		data.wakeup_scheduled = true;
@@ -290,7 +295,7 @@ fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(u64, bool), Error> {
 /// See [`EventHandler::set_on_read`] for examples on how to use it.
 #[derive(Clone)]
 pub struct WriteHandle {
-	fd: u64,
+	fd: ConnectionHandle,
 	connection_id: u128,
 	guarded_data: Arc<Mutex<GuardedData>>,
 	fd_lock: Option<Arc<Mutex<StateInfo>>>,
@@ -298,7 +303,7 @@ pub struct WriteHandle {
 
 impl WriteHandle {
 	fn new(
-		fd: u64,
+		fd: ConnectionHandle,
 		guarded_data: Arc<Mutex<GuardedData>>,
 		connection_id: u128,
 		fd_lock: Option<Arc<Mutex<StateInfo>>>,
@@ -343,13 +348,13 @@ impl WriteHandle {
 
 #[derive(Debug, Clone)]
 struct FdAction {
-	fd: u64,
+	fd: ConnectionHandle,
 	atype: ActionType,
 	seqno: u128,
 }
 
 impl FdAction {
-	fn new(fd: u64, atype: ActionType, seqno: u128) -> FdAction {
+	fn new(fd: ConnectionHandle, atype: ActionType, seqno: u128) -> FdAction {
 		FdAction { fd, atype, seqno }
 	}
 }
@@ -371,12 +376,12 @@ enum HandlerEventType {
 #[derive(Clone, PartialEq, Debug)]
 struct HandlerEvent {
 	etype: HandlerEventType,
-	fd: u64,
+	fd: ConnectionHandle,
 	seqno: u128,
 }
 
 impl HandlerEvent {
-	fn new(fd: u64, etype: HandlerEventType, seqno: u128) -> Self {
+	fn new(fd: ConnectionHandle, etype: HandlerEventType, seqno: u128) -> Self {
 		HandlerEvent { fd, etype, seqno }
 	}
 }
@@ -391,7 +396,7 @@ enum FdType {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamWriteBuffer {
-	fd: u64,
+	fd: ConnectionHandle,
 	write_buffer: WriteBuffer,
 }
 
@@ -420,7 +425,7 @@ enum State {
 
 #[derive(Debug)]
 pub(crate) struct StateInfo {
-	fd: u64,
+	fd: ConnectionHandle,
 	state: State,
 	seqno: u128,
 	write_buffer: LinkedList<WriteBuffer>,
@@ -438,7 +443,7 @@ impl Default for StateInfo {
 }
 
 impl StateInfo {
-	fn new(fd: u64, state: State, seqno: u128) -> Self {
+	fn new(fd: ConnectionHandle, state: State, seqno: u128) -> Self {
 		StateInfo {
 			fd,
 			state,
@@ -450,12 +455,12 @@ impl StateInfo {
 
 struct GuardedData {
 	fd_actions: Vec<FdAction>,
-	wakeup_fd: u64,
-	wakeup_rx: u64,
+	wakeup_fd: ConnectionHandle,
+	wakeup_rx: ConnectionHandle,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
-	write_pending: Vec<u64>,
-	selector: Option<u64>,
+	write_pending: Vec<ConnectionHandle>,
+	selector: Option<ConnectionHandle>,
 	stop: bool,
 	write_queue: Vec<StreamWriteBuffer>,
 }
@@ -866,8 +871,8 @@ where
 
 		let guarded_data = GuardedData {
 			fd_actions: vec![],
-			wakeup_fd: tx as u64,
-			wakeup_rx: rx as u64,
+			wakeup_fd: tx as ConnectionHandle,
+			wakeup_rx: rx as ConnectionHandle,
 			wakeup_scheduled: false,
 			handler_events: vec![],
 			write_pending: vec![],
@@ -992,13 +997,21 @@ where
 	}
 
 	#[cfg(target_os = "windows")]
-	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<(u64, u128), Error> {
+	fn add_socket(
+		&mut self,
+		socket: ConnectionHandle,
+		atype: ActionType,
+	) -> Result<(ConnectionHandle, u128), Error> {
 		let fd = socket.try_into().unwrap_or(0);
 		let (fd, seqno) = self.add_fd(fd, atype)?;
 		Ok((fd, seqno))
 	}
 
-	fn add_fd(&mut self, fd: u64, atype: ActionType) -> Result<(u64, u128), Error> {
+	fn add_fd(
+		&mut self,
+		fd: ConnectionHandle,
+		atype: ActionType,
+	) -> Result<(ConnectionHandle, u128), Error> {
 		self.ensure_handlers()?;
 
 		let mut data = self.data.lock().map_err(|e| {
@@ -1040,7 +1053,7 @@ where
 		Ok((listener, stream))
 	}
 
-	fn start_generic(&mut self, selector: u64) -> Result<(), Error> {
+	fn start_generic(&mut self, selector: ConnectionHandle) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -1086,7 +1099,7 @@ where
 
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
-		write_pending: Vec<u64>,
+		write_pending: Vec<ConnectionHandle>,
 		evs: &mut Vec<GenericEvent>,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
@@ -1202,12 +1215,12 @@ where
 
 	#[cfg(target_os = "windows")]
 	fn get_events(
-		_selector: u64,
+		_selector: ConnectionHandle,
 		win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		filter_set: &mut HashSet<u64>,
-	) -> Result<u64, Error> {
+		filter_set: &mut HashSet<ConnectionHandle>,
+	) -> Result<ConnectionHandle, Error> {
 		for evt in input_events {
 			if evt.etype == GenericEventType::AddReadLT
 				|| evt.etype == GenericEventType::AddReadET
@@ -1309,14 +1322,14 @@ where
 				if !(events[i as usize].events & EPOLLOUT == 0) {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						unsafe { events[i as usize].data.fd } as u64,
+						unsafe { events[i as usize].data.fd } as ConnectionHandle,
 						GenericEventType::AddWriteET,
 					));
 				}
 				if !(events[i as usize].events & EPOLLIN == 0) {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						unsafe { events[i as usize].data.fd } as u64,
+						unsafe { events[i as usize].data.fd } as ConnectionHandle,
 						GenericEventType::AddReadET,
 					));
 				}
@@ -1352,12 +1365,12 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		epollfd: u64,
+		epollfd: ConnectionHandle,
 		_win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		filter_set: &mut HashSet<u64>,
-	) -> Result<u64, Error> {
+		filter_set: &mut HashSet<ConnectionHandle>,
+	) -> Result<ConnectionHandle, Error> {
 		for evt in input_events {
 			let mut interest = EpollFlags::empty();
 
@@ -1373,7 +1386,7 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd as u64);
+				let mut event = EpollEvent::new(interest, evt.fd as ConnectionHandle);
 				let res = epoll_ctl(
 					epollfd.try_into().unwrap_or(0),
 					op,
@@ -1397,7 +1410,7 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd as u64);
+				let mut event = EpollEvent::new(interest, evt.fd as ConnectionHandle);
 				let res = epoll_ctl(
 					epollfd.try_into().unwrap_or(0),
 					op,
@@ -1422,7 +1435,7 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd as u64);
+				let mut event = EpollEvent::new(interest, evt.fd as ConnectionHandle);
 				let res = epoll_ctl(
 					epollfd.try_into().unwrap_or(0),
 					op,
@@ -1458,14 +1471,14 @@ where
 						if !(events[i].events() & EpollFlags::EPOLLOUT).is_empty() {
 							ret_count_adjusted += 1;
 							output_events.push(GenericEvent::new(
-								events[i].data() as u64,
+								events[i].data() as ConnectionHandle,
 								GenericEventType::AddWriteET,
 							));
 						}
 						if !(events[i].events() & EpollFlags::EPOLLIN).is_empty() {
 							ret_count_adjusted += 1;
 							output_events.push(GenericEvent::new(
-								events[i].data() as u64,
+								events[i].data() as ConnectionHandle,
 								GenericEventType::AddReadET,
 							));
 						}
@@ -1482,12 +1495,12 @@ where
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn get_events(
-		queue: u64,
+		queue: ConnectionHandle,
 		_win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		_filter_set: &HashSet<u64>,
-	) -> Result<u64, Error> {
+		_filter_set: &HashSet<ConnectionHandle>,
+	) -> Result<ConnectionHandle, Error> {
 		let mut kevs = vec![];
 		for ev in input_events {
 			kevs.push(ev.to_kev());
@@ -1552,7 +1565,7 @@ where
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
-		selector: u64,
+		selector: ConnectionHandle,
 		win_selector: *mut c_void,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
@@ -1792,7 +1805,7 @@ where
 			for event in output_events {
 				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
-						event.fd as u64,
+						event.fd as ConnectionHandle,
 						&thread_pool,
 						guarded_data,
 						&global_lock,
@@ -1809,7 +1822,7 @@ where
 					|| event.etype == GenericEventType::AddReadLT
 				{
 					let res = Self::process_event_read(
-						event.fd as u64,
+						event.fd as ConnectionHandle,
 						&mut read_fd_type,
 						&thread_pool,
 						guarded_data,
@@ -1837,7 +1850,11 @@ where
 		Ok(())
 	}
 
-	fn write_loop(fd: u64, statefd: u64, write_buffer: &mut WriteBuffer) -> Result<u16, Error> {
+	fn write_loop(
+		fd: ConnectionHandle,
+		statefd: ConnectionHandle,
+		write_buffer: &mut WriteBuffer,
+	) -> Result<u16, Error> {
 		let initial_len = write_buffer.len;
 		loop {
 			if statefd != fd {
@@ -1899,7 +1916,7 @@ where
 	}
 
 	fn do_close(
-		fd: u64,
+		fd: ConnectionHandle,
 		seqno: u128,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
@@ -1942,7 +1959,7 @@ where
 	}
 
 	fn write_until_block(
-		fd: u64,
+		fd: ConnectionHandle,
 		state_info: &mut StateInfo,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<bool, Error> {
@@ -2004,7 +2021,7 @@ where
 	}
 
 	fn process_event_write(
-		fd: u64,
+		fd: ConnectionHandle,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		global_lock: &Arc<RwLock<bool>>,
@@ -2118,7 +2135,7 @@ where
 	}
 
 	fn ensure_allocations(
-		fd: u64,
+		fd: ConnectionHandle,
 		read_fd_type: &mut Vec<FdType>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
@@ -2175,7 +2192,7 @@ where
 	}
 
 	fn process_event_read(
-		fd: u64,
+		fd: ConnectionHandle,
 		read_fd_type: &mut Vec<FdType>,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
@@ -2463,7 +2480,7 @@ where
 	}
 
 	fn process_read_result(
-		fd: u64,
+		fd: ConnectionHandle,
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
 		guarded_data: &Arc<Mutex<GuardedData>>,
@@ -2508,7 +2525,7 @@ where
 	}
 
 	fn process_read_err(
-		fd: u64,
+		fd: ConnectionHandle,
 		_error: String,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
@@ -2526,8 +2543,8 @@ where
 	}
 
 	fn process_accept_result(
-		_acceptor: u64,
-		nfd: u64,
+		_acceptor: ConnectionHandle,
+		nfd: ConnectionHandle,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
@@ -2548,13 +2565,13 @@ where
 		Ok(())
 	}
 
-	fn process_accept_err(_acceptor: u64, error: String) -> Result<(), Error> {
+	fn process_accept_err(_acceptor: ConnectionHandle, error: String) -> Result<(), Error> {
 		info!("error on acceptor: {}", error);
 		Ok(())
 	}
 
 	fn push_handler_event_with_fd_lock(
-		fd: u64,
+		fd: ConnectionHandle,
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		state: &mut StateInfo,
@@ -2574,7 +2591,7 @@ where
 	}
 
 	fn push_handler_event(
-		fd: u64,
+		fd: ConnectionHandle,
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
@@ -2611,7 +2628,7 @@ where
 	}
 
 	fn generic_handler_complete(
-		fd: u64,
+		fd: ConnectionHandle,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		event_type: HandlerEventType,
 		seqno: u128,
