@@ -2711,6 +2711,7 @@ fn test_close() -> Result<(), Error> {
 		if read_buf.len() < 5 {
 			return Ok(());
 		}
+		info!("read = {:?}", read_buf);
 
 		let len = read_buf.len();
 
@@ -2723,10 +2724,12 @@ fn test_close() -> Result<(), Error> {
 		for i in 0..len {
 			if read_buf[i] == 8 {
 				wh.write(&[0], 0, 1, true)?;
+				read_buf.clear();
 				return Ok(());
 			}
 		}
 		wh.write(&[1], 0, 1, false)?;
+		read_buf.clear();
 		Ok(())
 	})?;
 
@@ -2737,7 +2740,7 @@ fn test_close() -> Result<(), Error> {
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
 
-	stream.write(&[1, 2, 3, 4, 5, 6])?;
+	stream.write(&[1, 2, 3, 4, 5])?;
 	let mut buf = [0u8; 1000];
 	let len = stream.read(&mut buf)?;
 	assert_eq!(len, 1);
