@@ -637,6 +637,7 @@ where
 	/// use nioruntime_util::Error;
 	/// use log::*;
 	///
+	/// // set log level to info
 	/// info!();
 	///
 	/// fn main() -> Result<(), Error> {
@@ -676,6 +677,7 @@ where
 	/// use nioruntime_util::Error;
 	/// use log::*;
 	///
+	/// // set log level to info
 	/// info!();
 	///
 	/// fn main() -> Result<(), Error> {
@@ -716,6 +718,7 @@ where
 	/// use nioruntime_util::Error;
 	/// use log::*;
 	///
+	/// // set log level to info
 	/// info!();
 	///
 	/// fn main() -> Result<(), Error> {
