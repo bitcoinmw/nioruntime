@@ -84,12 +84,12 @@ enum GenericEventType {
 
 #[derive(Debug)]
 struct GenericEvent {
-	fd: i32,
+	fd: u64,
 	etype: GenericEventType,
 }
 
 impl GenericEvent {
-	fn new(fd: i32, etype: GenericEventType) -> Self {
+	fn new(fd: u64, etype: GenericEventType) -> Self {
 		GenericEvent { fd, etype }
 	}
 
@@ -117,7 +117,7 @@ impl GenericEvent {
 }
 
 fn do_write_no_fd_lock(
-	fd: i32,
+	fd: u64,
 	connection_seqno: u128,
 	data: &[u8],
 	close: bool,
@@ -166,7 +166,7 @@ fn do_write_no_fd_lock(
 		{
 			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 			unsafe {
-				write(wakeupfd, buf, 1);
+				write(wakeupfd.try_into().unwrap_or(i32::MAX), buf, 1);
 			}
 		}
 		#[cfg(target_os = "windows")]
@@ -181,7 +181,7 @@ fn do_write_no_fd_lock(
 }
 
 fn do_write(
-	fd: i32,
+	fd: u64,
 	data: &[u8],
 	offset: usize,
 	len: usize,
@@ -257,14 +257,14 @@ fn do_write(
 		{
 			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 			unsafe {
-				write(fd, buf, 1);
+				write(fd.try_into().unwrap_or(i32::MAX), buf, 1);
 			}
 		}
 		#[cfg(target_os = "windows")]
 		{
 			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
 			unsafe {
-				ws2_32::send(fd.try_into().unwrap_or(0), buf, 1, 0);
+				ws2_32::send(fd, buf, 1, 0);
 			}
 		}
 	}
@@ -272,7 +272,7 @@ fn do_write(
 	Ok(())
 }
 
-fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
+fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(u64, bool), Error> {
 	let wakeup_scheduled = data.wakeup_scheduled;
 	if !wakeup_scheduled {
 		data.wakeup_scheduled = true;
@@ -290,7 +290,7 @@ fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(i32, bool), Error> {
 /// See [`EventHandler::set_on_read`] for examples on how to use it.
 #[derive(Clone)]
 pub struct WriteHandle {
-	fd: i32,
+	fd: u64,
 	connection_id: u128,
 	guarded_data: Arc<Mutex<GuardedData>>,
 	fd_lock: Option<Arc<Mutex<StateInfo>>>,
@@ -298,7 +298,7 @@ pub struct WriteHandle {
 
 impl WriteHandle {
 	fn new(
-		fd: i32,
+		fd: u64,
 		guarded_data: Arc<Mutex<GuardedData>>,
 		connection_id: u128,
 		fd_lock: Option<Arc<Mutex<StateInfo>>>,
@@ -343,13 +343,13 @@ impl WriteHandle {
 
 #[derive(Debug, Clone)]
 struct FdAction {
-	fd: i32,
+	fd: u64,
 	atype: ActionType,
 	seqno: u128,
 }
 
 impl FdAction {
-	fn new(fd: i32, atype: ActionType, seqno: u128) -> FdAction {
+	fn new(fd: u64, atype: ActionType, seqno: u128) -> FdAction {
 		FdAction { fd, atype, seqno }
 	}
 }
@@ -371,12 +371,12 @@ enum HandlerEventType {
 #[derive(Clone, PartialEq, Debug)]
 struct HandlerEvent {
 	etype: HandlerEventType,
-	fd: i32,
+	fd: u64,
 	seqno: u128,
 }
 
 impl HandlerEvent {
-	fn new(fd: i32, etype: HandlerEventType, seqno: u128) -> Self {
+	fn new(fd: u64, etype: HandlerEventType, seqno: u128) -> Self {
 		HandlerEvent { fd, etype, seqno }
 	}
 }
@@ -391,7 +391,7 @@ enum FdType {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamWriteBuffer {
-	fd: i32,
+	fd: u64,
 	write_buffer: WriteBuffer,
 }
 
@@ -420,7 +420,7 @@ enum State {
 
 #[derive(Debug)]
 pub(crate) struct StateInfo {
-	fd: i32,
+	fd: u64,
 	state: State,
 	seqno: u128,
 	write_buffer: LinkedList<WriteBuffer>,
@@ -438,7 +438,7 @@ impl Default for StateInfo {
 }
 
 impl StateInfo {
-	fn new(fd: i32, state: State, seqno: u128) -> Self {
+	fn new(fd: u64, state: State, seqno: u128) -> Self {
 		StateInfo {
 			fd,
 			state,
@@ -450,12 +450,12 @@ impl StateInfo {
 
 struct GuardedData {
 	fd_actions: Vec<FdAction>,
-	wakeup_fd: i32,
-	wakeup_rx: i32,
+	wakeup_fd: u64,
+	wakeup_rx: u64,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
-	write_pending: Vec<i32>,
-	selector: Option<i32>,
+	write_pending: Vec<u64>,
+	selector: Option<u64>,
 	stop: bool,
 	write_queue: Vec<StreamWriteBuffer>,
 }
@@ -621,7 +621,10 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, connection_id) = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add_fd(
+			stream.as_raw_fd().try_into().unwrap_or(0),
+			ActionType::AddStream,
+		)?;
 		#[cfg(target_os = "windows")]
 		let (fd, connection_id) = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
 		Ok(WriteHandle {
@@ -662,7 +665,10 @@ where
 			netbsd,
 			openbsd
 		))]
-		self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
+		self.add_fd(
+			listener.as_raw_fd().try_into().unwrap_or(0),
+			ActionType::AddListener,
+		)?;
 		#[cfg(target_os = "windows")]
 		self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
 		Ok(())
@@ -828,7 +834,10 @@ where
 		let mut _pipe_listener = None;
 		// create the pipe (for wakeups)
 		let (rx, tx) = {
+			#[cfg(unix)]
 			let mut retfds = [0i32; 2];
+			#[cfg(windows)]
+			let mut retfds = [0u64; 2];
 			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
 			#[cfg(target_os = "windows")]
 			{
@@ -860,8 +869,8 @@ where
 
 		let guarded_data = GuardedData {
 			fd_actions: vec![],
-			wakeup_fd: tx,
-			wakeup_rx: rx,
+			wakeup_fd: tx as u64,
+			wakeup_rx: rx as u64,
 			wakeup_scheduled: false,
 			handler_events: vec![],
 			write_pending: vec![],
@@ -897,7 +906,7 @@ where
 		{
 			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 			unsafe {
-				write(guarded_data.wakeup_fd, buf, 1);
+				write(guarded_data.wakeup_fd.try_into().unwrap_or(0), buf, 1);
 			}
 		}
 		#[cfg(target_os = "windows")]
@@ -923,7 +932,7 @@ where
 	fn do_start(&mut self) -> Result<(), Error> {
 		// create the kqueue
 		let selector = unsafe { kqueue() };
-		self.start_generic(selector)?;
+		self.start_generic(selector.try_into().unwrap_or(0))?;
 		Ok(())
 	}
 
@@ -986,13 +995,13 @@ where
 	}
 
 	#[cfg(target_os = "windows")]
-	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<(i32, u128), Error> {
+	fn add_socket(&mut self, socket: u64, atype: ActionType) -> Result<(u64, u128), Error> {
 		let fd = socket.try_into().unwrap_or(0);
 		let (fd, seqno) = self.add_fd(fd, atype)?;
 		Ok((fd, seqno))
 	}
 
-	fn add_fd(&mut self, fd: i32, atype: ActionType) -> Result<(i32, u128), Error> {
+	fn add_fd(&mut self, fd: u64, atype: ActionType) -> Result<(u64, u128), Error> {
 		self.ensure_handlers()?;
 
 		let mut data = self.data.lock().map_err(|e| {
@@ -1013,7 +1022,7 @@ where
 	}
 
 	#[cfg(target_os = "windows")]
-	fn socket_pipe(fds: *mut i32) -> Result<(TcpListener, TcpStream), Error> {
+	fn socket_pipe(fds: *mut u64) -> Result<(TcpListener, TcpStream), Error> {
 		let port = portpicker::pick_unused_port().unwrap_or(9999);
 		let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
 		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
@@ -1028,13 +1037,13 @@ where
 					.unwrap_or(0),
 			)
 		};
-		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
-		fds[0] = res as i32;
-		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
+		let fds: &mut [u64] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
+		fds[0] = res as u64;
+		fds[1] = stream.as_raw_socket();
 		Ok((listener, stream))
 	}
 
-	fn start_generic(&mut self, selector: i32) -> Result<(), Error> {
+	fn start_generic(&mut self, selector: u64) -> Result<(), Error> {
 		{
 			let mut guarded_data = self.data.lock().map_err(|e| {
 				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
@@ -1080,7 +1089,7 @@ where
 
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
-		write_pending: Vec<i32>,
+		write_pending: Vec<u64>,
 		evs: &mut Vec<GenericEvent>,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
@@ -1196,12 +1205,12 @@ where
 
 	#[cfg(target_os = "windows")]
 	fn get_events(
-		_selector: i32,
+		_selector: u64,
 		win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		filter_set: &mut HashSet<i32>,
-	) -> Result<i32, Error> {
+		filter_set: &mut HashSet<u64>,
+	) -> Result<u64, Error> {
 		for evt in input_events {
 			if evt.etype == GenericEventType::AddReadLT
 				|| evt.etype == GenericEventType::AddReadET
@@ -1297,14 +1306,14 @@ where
 				if !(events[i as usize].events & EPOLLOUT == 0) {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						unsafe { events[i as usize].data.fd } as i32,
+						unsafe { events[i as usize].data.fd } as u64,
 						GenericEventType::AddWriteET,
 					));
 				}
 				if !(events[i as usize].events & EPOLLIN == 0) {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						unsafe { events[i as usize].data.fd } as i32,
+						unsafe { events[i as usize].data.fd } as u64,
 						GenericEventType::AddReadET,
 					));
 				}
@@ -1340,12 +1349,12 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		epollfd: i32,
+		epollfd: u64,
 		_win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		filter_set: &mut HashSet<i32>,
-	) -> Result<i32, Error> {
+		filter_set: &mut HashSet<u64>,
+	) -> Result<u64, Error> {
 		for evt in input_events {
 			let mut interest = EpollFlags::empty();
 
@@ -1431,14 +1440,14 @@ where
 						if !(events[i].events() & EpollFlags::EPOLLOUT).is_empty() {
 							ret_count_adjusted += 1;
 							output_events.push(GenericEvent::new(
-								events[i].data() as i32,
+								events[i].data() as u64,
 								GenericEventType::AddWriteET,
 							));
 						}
 						if !(events[i].events() & EpollFlags::EPOLLIN).is_empty() {
 							ret_count_adjusted += 1;
 							output_events.push(GenericEvent::new(
-								events[i].data() as i32,
+								events[i].data() as u64,
 								GenericEventType::AddReadET,
 							));
 						}
@@ -1455,12 +1464,12 @@ where
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn get_events(
-		queue: i32,
+		queue: u64,
 		_win_selector: *mut c_void,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
-		_filter_set: &HashSet<i32>,
-	) -> Result<i32, Error> {
+		_filter_set: &HashSet<u64>,
+	) -> Result<u64, Error> {
 		let mut kevs = vec![];
 		for ev in input_events {
 			kevs.push(ev.to_kev());
@@ -1478,7 +1487,7 @@ where
 
 		let ret_count = unsafe {
 			kevent(
-				queue,
+				queue.try_into().unwrap_or(0),
 				kevs.as_ptr(),
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
@@ -1492,9 +1501,9 @@ where
 		// it appears harmless as all connections are processed correctly.
 		// So for the time being, we will comment this out so it doesn't
 		// pollute the logs.
-		//if ret_count < 0 {
-		//	info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
-		//}
+		if ret_count < 0 {
+			info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
+		}
 
 		let mut ret_count_adjusted = 0;
 		for i in 0..ret_count {
@@ -1503,14 +1512,14 @@ where
 				if kev.filter == EVFILT_WRITE {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						kev.ident as i32,
+						kev.ident.try_into().unwrap_or(0),
 						GenericEventType::AddWriteET,
 					));
 				}
 				if kev.filter == EVFILT_READ {
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
-						kev.ident as i32,
+						kev.ident.try_into().unwrap_or(0),
 						GenericEventType::AddReadET,
 					));
 				}
@@ -1525,14 +1534,12 @@ where
 		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
-		selector: i32,
+		selector: u64,
 		win_selector: *mut c_void,
 	) -> Result<(), Error> {
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(4)?;
-
 		let global_lock = Arc::new(RwLock::new(true));
-
 		let mut seqno = 0u128;
 
 		let rx = {
@@ -1543,7 +1550,6 @@ where
 			guarded_data.wakeup_rx
 		};
 		let mut read_fd_type = Vec::new();
-
 		// preallocate some
 		read_fd_type.reserve(INITIAL_MAX_FDS);
 		for _ in 0..INITIAL_MAX_FDS {
@@ -1555,14 +1561,12 @@ where
 			}
 		}
 		read_fd_type[rx as usize] = FdType::Wakeup;
-
 		let mut use_on_client_read = Vec::new();
 		// preallocate some
 		use_on_client_read.reserve(INITIAL_MAX_FDS);
 		for _ in 0..INITIAL_MAX_FDS {
 			use_on_client_read.push(false);
 		}
-
 		if rx >= INITIAL_MAX_FDS.try_into().unwrap_or(0) {
 			for _ in INITIAL_MAX_FDS..(rx + 1) as usize {
 				use_on_client_read.push(false);
@@ -1613,11 +1617,11 @@ where
 					thread_pool.stop()?;
 					#[cfg(unix)]
 					{
-						let res = unsafe { close(selector) };
+						let res = unsafe { close(selector.try_into().unwrap_or(0)) };
 						if res != 0 {
 							info!("Error closing selector: {}", errno().to_string());
 						}
-						let res = unsafe { close(guarded_data.wakeup_fd) };
+						let res = unsafe { close(guarded_data.wakeup_fd.try_into().unwrap_or(0)) };
 						if res != 0 {
 							info!("Error closing selector: {}", errno().to_string());
 						}
@@ -1770,7 +1774,7 @@ where
 			for event in output_events {
 				if event.etype == GenericEventType::AddWriteET {
 					let res = Self::process_event_write(
-						event.fd as i32,
+						event.fd as u64,
 						&thread_pool,
 						guarded_data,
 						&global_lock,
@@ -1787,7 +1791,7 @@ where
 					|| event.etype == GenericEventType::AddReadLT
 				{
 					let res = Self::process_event_read(
-						event.fd as i32,
+						event.fd as u64,
 						&mut read_fd_type,
 						&thread_pool,
 						guarded_data,
@@ -1815,7 +1819,7 @@ where
 		Ok(())
 	}
 
-	fn write_loop(fd: i32, statefd: i32, write_buffer: &mut WriteBuffer) -> Result<u16, Error> {
+	fn write_loop(fd: u64, statefd: u64, write_buffer: &mut WriteBuffer) -> Result<u16, Error> {
 		let initial_len = write_buffer.len;
 		loop {
 			if statefd != fd {
@@ -1831,7 +1835,7 @@ where
 					..(write_buffer.offset as usize + write_buffer.len as usize)]
 					as *mut _ as *mut c_void;
 
-				unsafe { write(fd, buf, write_buffer.len.into()) }
+				unsafe { write(fd.try_into().unwrap_or(0), buf, write_buffer.len.into()) }
 			};
 			#[cfg(target_os = "windows")]
 			let len = {
@@ -1877,7 +1881,7 @@ where
 	}
 
 	fn do_close(
-		fd: i32,
+		fd: u64,
 		seqno: u128,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
@@ -1887,7 +1891,7 @@ where
 				if state.fd == fd {
 					if state.state == State::Closing {
 						#[cfg(unix)]
-						let res = unsafe { close(state.fd) };
+						let res = unsafe { close(state.fd.try_into().unwrap_or(0)) };
 						#[cfg(target_os = "windows")]
 						let res = unsafe { ws2_32::closesocket(state.fd.try_into().unwrap_or(0)) };
 						if res == 0 {
@@ -1920,7 +1924,7 @@ where
 	}
 
 	fn write_until_block(
-		fd: i32,
+		fd: u64,
 		state_info: &mut StateInfo,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 	) -> Result<bool, Error> {
@@ -1982,7 +1986,7 @@ where
 	}
 
 	fn process_event_write(
-		fd: i32,
+		fd: u64,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		global_lock: &Arc<RwLock<bool>>,
@@ -2096,7 +2100,7 @@ where
 	}
 
 	fn ensure_allocations(
-		fd: i32,
+		fd: u64,
 		read_fd_type: &mut Vec<FdType>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
@@ -2153,7 +2157,7 @@ where
 	}
 
 	fn process_event_read(
-		fd: i32,
+		fd: u64,
 		read_fd_type: &mut Vec<FdType>,
 		thread_pool: &StaticThreadPool,
 		guarded_data: &Arc<Mutex<GuardedData>>,
@@ -2328,7 +2332,7 @@ where
 								#[cfg(unix)]
 								let len = {
 									let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
-									unsafe { read(fd, cbuf, BUFFER_SIZE) }
+									unsafe { read(fd.try_into().unwrap_or(0), cbuf, BUFFER_SIZE) }
 								};
 								#[cfg(target_os = "windows")]
 								let len = {
@@ -2414,7 +2418,7 @@ where
 				#[cfg(unix)]
 				{
 					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-					unsafe { read(fd, cbuf, 1) }
+					unsafe { read(fd.try_into().unwrap_or(0), cbuf, 1) }
 				};
 				#[cfg(target_os = "windows")]
 				{
@@ -2441,7 +2445,7 @@ where
 	}
 
 	fn process_read_result(
-		fd: i32,
+		fd: u64,
 		len: usize,
 		buf: [u8; BUFFER_SIZE],
 		guarded_data: &Arc<Mutex<GuardedData>>,
@@ -2486,7 +2490,7 @@ where
 	}
 
 	fn process_read_err(
-		fd: i32,
+		fd: u64,
 		_error: String,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
@@ -2504,8 +2508,8 @@ where
 	}
 
 	fn process_accept_result(
-		_acceptor: i32,
-		nfd: i32,
+		_acceptor: u64,
+		nfd: u64,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
 	) -> Result<(), Error> {
@@ -2526,13 +2530,13 @@ where
 		Ok(())
 	}
 
-	fn process_accept_err(_acceptor: i32, error: String) -> Result<(), Error> {
+	fn process_accept_err(_acceptor: u64, error: String) -> Result<(), Error> {
 		info!("error on acceptor: {}", error);
 		Ok(())
 	}
 
 	fn push_handler_event_with_fd_lock(
-		fd: i32,
+		fd: u64,
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		state: &mut StateInfo,
@@ -2552,7 +2556,7 @@ where
 	}
 
 	fn push_handler_event(
-		fd: i32,
+		fd: u64,
 		event_type: HandlerEventType,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
@@ -2589,7 +2593,7 @@ where
 	}
 
 	fn generic_handler_complete(
-		fd: i32,
+		fd: u64,
 		guarded_data: &Arc<Mutex<GuardedData>>,
 		event_type: HandlerEventType,
 		seqno: u128,
@@ -2621,7 +2625,7 @@ where
 				{
 					let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
 					unsafe {
-						write(wakeup_fd, buf, 1);
+						write(wakeup_fd.try_into().unwrap_or(0), buf, 1);
 					}
 				}
 				#[cfg(target_os = "windows")]
