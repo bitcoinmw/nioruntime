@@ -1487,9 +1487,14 @@ where
 			)
 		};
 
-		if ret_count < 0 {
-			info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
-		}
+		// This error appears to happen occasionally when thousands of
+		// connections per second are connecting/disconnecting.
+		// it appears harmless as all connections are processed correctly.
+		// So for the time being, we will comment this out so it doesn't
+		// pollute the logs.
+		//if ret_count < 0 {
+		//	info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
+		//}
 
 		let mut ret_count_adjusted = 0;
 		for i in 0..ret_count {
@@ -1794,6 +1799,7 @@ where
 						on_read_locks,
 						seqno,
 						&global_lock,
+						&mut use_on_client_read,
 					);
 
 					match res {
@@ -2089,6 +2095,63 @@ where
 		Ok(())
 	}
 
+	fn ensure_allocations(
+		fd: i32,
+		read_fd_type: &mut Vec<FdType>,
+		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
+		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
+		use_on_client_read: &mut Vec<bool>,
+		seqno: u128,
+	) -> Result<(), Error> {
+		let len = read_fd_type.len();
+		if fd as usize >= len {
+			for _ in len..(fd + 100) as usize + 1 {
+				read_fd_type.push(FdType::Unknown);
+			}
+		}
+
+		if on_read_locks.len() <= fd as usize {
+			Self::check_and_set(
+				on_read_locks,
+				(fd + 100) as usize,
+				Arc::new(Mutex::new(false)),
+			);
+		}
+
+		if fd_locks.len() <= fd as usize {
+			Self::check_and_set(
+				fd_locks,
+				(fd + 100) as usize,
+				Arc::new(Mutex::new(StateInfo::new(
+					fd.try_into().unwrap_or(0),
+					State::Normal,
+					seqno,
+				))),
+			);
+		}
+
+		if use_on_client_read.len() <= fd as usize {
+			Self::check_and_set(use_on_client_read, (fd + 100) as usize, false);
+		}
+
+		{
+			let state = fd_locks[fd as usize].lock();
+			match state {
+				Ok(mut state) => {
+					*state = StateInfo::new(fd.try_into().unwrap_or(0), State::Normal, seqno);
+				}
+				Err(e) => {
+					info!("Error getting seqno: {}", e.to_string());
+					return Err(ErrorKind::InternalError(
+						"unexpected error obtaining seqno".to_string(),
+					)
+					.into());
+				}
+			}
+		}
+		Ok(())
+	}
+
 	fn process_event_read(
 		fd: i32,
 		read_fd_type: &mut Vec<FdType>,
@@ -2102,6 +2165,7 @@ where
 		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
 		seqno: u128,
 		global_lock: &Arc<RwLock<bool>>,
+		use_client_on_read: &mut Vec<bool>,
 	) -> Result<(), Error> {
 		let fd_type = &read_fd_type[fd as usize];
 		match fd_type {
@@ -2137,68 +2201,14 @@ where
 					)
 				};
 				if res > 0 {
-					let len = read_fd_type.len();
-					if res as usize >= len {
-						for _ in len..res as usize + 1 {
-							read_fd_type.push(FdType::Unknown);
-						}
-					}
-
-					if on_read_locks.len() <= res as usize {
-						Self::check_and_set(
-							on_read_locks,
-							res as usize,
-							Arc::new(Mutex::new(false)),
-						);
-					}
-
-					if fd_locks.len() <= res as usize {
-						Self::check_and_set(
-							fd_locks,
-							res as usize,
-							Arc::new(Mutex::new(StateInfo::new(
-								res.try_into().unwrap_or(0),
-								State::Normal,
-								seqno,
-							))),
-						);
-					}
-
-					{
-						let current_seqno = fd_locks[res as usize].lock();
-						match current_seqno {
-							Ok(mut current_seqno) => {
-								*current_seqno = StateInfo::new(
-									res.try_into().unwrap_or(0),
-									State::Normal,
-									seqno,
-								);
-							}
-							Err(e) => {
-								info!("Error getting seqno: {}", e.to_string());
-								return Err(ErrorKind::InternalError(
-									"unexpected error obtaining seqno".to_string(),
-								)
-								.into());
-							}
-						}
-					}
-
-					match fd_locks[res as usize].lock() {
-						Ok(mut state) => {
-							state.fd = res.try_into().unwrap_or(0);
-							state.state = State::Normal;
-							state.seqno = seqno;
-						}
-						Err(e) => {
-							info!(
-								"unexpected error obtaining fd_lock: {}, fd={}, seqno={}",
-								e.to_string(),
-								fd,
-								seqno,
-							);
-						}
-					}
+					Self::ensure_allocations(
+						res,
+						read_fd_type,
+						fd_locks,
+						on_read_locks,
+						use_client_on_read,
+						seqno,
+					)?;
 
 					// set non-blocking
 					#[cfg(unix)]
@@ -2240,7 +2250,6 @@ where
 							info!("setsockopt resulted in error: {}", errno().to_string());
 						}
 					}
-					let guarded_data = guarded_data.clone();
 
 					let accept_res = Self::process_accept_result(
 						fd,
