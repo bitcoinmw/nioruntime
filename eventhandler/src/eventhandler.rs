@@ -2634,7 +2634,6 @@ where
 
 #[test]
 fn test_echo() -> Result<(), Error> {
-	use std::io::Write;
 	use std::net::TcpListener;
 	use std::net::TcpStream;
 
@@ -2642,8 +2641,7 @@ fn test_echo() -> Result<(), Error> {
 	let x_clone = x.clone();
 
 	let listener = TcpListener::bind("127.0.0.1:9981")?;
-	let mut stream = TcpStream::connect("127.0.0.1:9981")?;
-	let _stream2 = TcpStream::connect("127.0.0.1:9981")?;
+	let stream = TcpStream::connect("127.0.0.1:9981")?;
 	let mut eh = EventHandler::new();
 
 	// echo
@@ -2654,28 +2652,40 @@ fn test_echo() -> Result<(), Error> {
 
 	eh.set_on_accept(|_| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
+	let client_buf = Arc::new(Mutex::new(vec![]));
 	eh.set_on_client_read(move |buf, len, _wh| {
-		assert_eq!(len, 5);
-		assert_eq!(buf[0], 1);
-		assert_eq!(buf[1], 2);
-		assert_eq!(buf[2], 3);
-		assert_eq!(buf[3], 4);
-		assert_eq!(buf[4], 5);
-		let mut x = x.lock().unwrap();
-		(*x) += 5;
+		let mut client_buf = client_buf.lock().unwrap();
+		for i in 0..len {
+			client_buf.push(buf[i]);
+		}
+		let len = client_buf.len();
+		if len == 5 {
+			assert_eq!(len, 5);
+			assert_eq!(client_buf[0], 1);
+			assert_eq!(client_buf[1], 2);
+			assert_eq!(client_buf[2], 3);
+			assert_eq!(client_buf[3], 4);
+			assert_eq!(client_buf[4], 5);
+			let mut x = x.lock().unwrap();
+			(*x) += 5;
+		}
 		Ok(())
 	})?;
 
 	eh.start()?;
 
 	eh.add_tcp_listener(&listener)?;
-	eh.add_tcp_stream(&stream)?;
-	std::thread::sleep(std::time::Duration::from_millis(1000));
-	stream.write(&[1, 2, 3, 4, 5])?;
-	// wait long enough to make sure the client got the message
-	std::thread::sleep(std::time::Duration::from_millis(100));
-	let x = x_clone.lock().unwrap();
-	assert_eq!((*x), 5);
+	let wh = eh.add_tcp_stream(&stream)?;
+	wh.write(&[1, 2, 3, 4, 5], 0, 5, false)?;
+	loop {
+		let x = x_clone.lock().unwrap();
+		if *x == 0 {
+			std::thread::sleep(std::time::Duration::from_millis(10));
+			continue;
+		}
+		assert_eq!((*x), 5);
+		break;
+	}
 	Ok(())
 }
 
