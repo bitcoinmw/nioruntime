@@ -669,7 +669,10 @@ where
 		))]
 		self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
-		self.add_socket(listener.as_raw_socket(), ActionType::AddListener)?;
+		self.add_socket(
+			listener.as_raw_socket().try_into().unwrap_or(0),
+			ActionType::AddListener,
+		)?;
 		Ok(())
 	}
 
@@ -1043,7 +1046,7 @@ where
 		};
 		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
 		fds[0] = res as i32;
-		fds[1] = stream.as_raw_socket();
+		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
 		Ok((listener, stream))
 	}
 
@@ -1226,7 +1229,9 @@ where
 					EPOLL_CTL_ADD
 				};
 				filter_set.insert(evt.fd);
-				let data = epoll_data_t { fd: evt.fd };
+				let data = epoll_data_t {
+					fd: evt.fd.try_into().unwrap_or(0),
+				};
 				let mut event = epoll_event {
 					events: EPOLLIN | EPOLLRDHUP,
 					data,
@@ -1251,13 +1256,20 @@ where
 					EPOLL_CTL_ADD
 				};
 				filter_set.insert(evt.fd);
-				let data = epoll_data_t { fd: evt.fd };
+				let data = epoll_data_t {
+					fd: evt.fd.try_into().unwrap_or(0),
+				};
 				let mut event = epoll_event {
 					events: EPOLLIN | EPOLLOUT | EPOLLRDHUP,
 					data,
 				};
 				let res = unsafe {
-					epoll_ctl(win_selector, op.try_into().unwrap_or(0), evt.fd, &mut event)
+					epoll_ctl(
+						win_selector,
+						op.try_into().unwrap_or(0),
+						evt.fd.try_into().unwrap_or(0),
+						&mut event,
+					)
 				};
 				if res != 0 {
 					filter_set.remove(&evt.fd);
@@ -1268,7 +1280,9 @@ where
 				}
 			} else if evt.etype == GenericEventType::DelRead {
 				filter_set.remove(&evt.fd);
-				let data = epoll_data_t { fd: evt.fd };
+				let data = epoll_data_t {
+					fd: evt.fd.try_into().unwrap_or(0),
+				};
 				let mut event = epoll_event {
 					events: 0, // not used for del
 					data,
@@ -1277,8 +1291,8 @@ where
 				let res = unsafe {
 					epoll_ctl(
 						win_selector,
-						EPOLL_CTL_DEL.try_into_unwrap_or(0),
-						evt.fd,
+						EPOLL_CTL_DEL,
+						evt.fd.try_into().unwrap_or(0),
 						&mut event,
 					)
 				};
@@ -1318,7 +1332,9 @@ where
 				}
 				if events[i as usize].events & (EPOLLIN | EPOLLOUT) == 0 {
 					let fd = unsafe { events[i as usize].data.fd };
-					let data = epoll_data_t { fd };
+					let data = epoll_data_t {
+						fd: fd.try_into().unwrap_or(0),
+					};
 					let mut event = epoll_event {
 						events: 0, // not used for del
 						data,
@@ -1327,7 +1343,7 @@ where
 						epoll_ctl(
 							win_selector,
 							EPOLL_CTL_DEL.try_into().unwrap_or(0),
-							fd,
+							fd.try_into().unwrap_or(0),
 							&mut event,
 						)
 					};
