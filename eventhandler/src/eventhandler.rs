@@ -1035,7 +1035,7 @@ where
 		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
 		let res = unsafe {
 			accept(
-				listener.as_raw_socket(),
+				listener.as_raw_socket().try_into().unwrap_or(0),
 				&mut libc::sockaddr {
 					..std::mem::zeroed()
 				},
@@ -1291,7 +1291,7 @@ where
 				let res = unsafe {
 					epoll_ctl(
 						win_selector,
-						EPOLL_CTL_DEL,
+						EPOLL_CTL_DEL.try_into().unwrap_or(0),
 						evt.fd.try_into().unwrap_or(0),
 						&mut event,
 					)
@@ -1863,7 +1863,7 @@ where
 				unsafe { ws2_32::send(fd, buf, (write_buffer.len - write_buffer.offset).into(), 0) }
 			};
 			if len >= 0 {
-				if len == (write_buffer.len as isize) {
+				if len == (write_buffer.len as i32).try_into().unwrap_or(0) {
 					// we're done
 					write_buffer.offset += len as u16;
 					write_buffer.len -= len as u16;
