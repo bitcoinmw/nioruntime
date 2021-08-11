@@ -1369,7 +1369,7 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd);
+				let mut event = EpollEvent::new(interest, evt.fd.try_into().unwrap_or(0));
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
@@ -1388,7 +1388,7 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd);
+				let mut event = EpollEvent::new(interest, evt.fd.try_into().unwrap_or(0));
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
@@ -1408,7 +1408,7 @@ where
 				};
 				filter_set.insert(fd);
 
-				let mut event = EpollEvent::new(interest, evt.fd);
+				let mut event = EpollEvent::new(interest, evt.fd.try_into().unwrap_or(0));
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
