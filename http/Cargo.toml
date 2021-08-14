@@ -1,0 +1,21 @@
+[package]
+name = "nioruntime_http"
+version = "0.0.1"
+authors = ["BMW Developers"]
+description = "http library for nioruntime"
+license = "Apache-2.0"
+repository = "https://github.com/bitcoinmw/nioruntime"
+keywords = [ "crypto", "nioruntime", "mimblewimble" ]
+exclude = ["**/*.nio"]
+edition = "2018"
+
+[dependencies]
+
+nioruntime_util = { path = "../util"         }
+nioruntime_evh  = { path = "../eventhandler" }
+log =             { path = "../log"          }
+
+rand = "0.8.4"
+chrono = "0.4.7"
+dirs = "3.0.2"
+fsutils = "0.1.0"

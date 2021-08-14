@@ -7,6 +7,11 @@ args:
         short: c
         long: client
         takes_value: false
+    - http:
+        help: Run the http server
+        short: s
+        long: http
+        takes_value: false
     - count:
         help: Number of iterations to run per thread
         short: x

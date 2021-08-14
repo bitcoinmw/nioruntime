@@ -30,6 +30,8 @@ use clap::App;
 use errno::errno;
 use log::*;
 use nioruntime_evh::eventhandler::EventHandler;
+use nioruntime_http::HttpConfig;
+use nioruntime_http::HttpServer;
 use nioruntime_util::Error;
 use rand::Rng;
 use std::collections::HashMap;
@@ -206,6 +208,7 @@ fn real_main() -> Result<(), Error> {
 	let itt = args.is_present("itt");
 	let max = args.is_present("max");
 	let min = args.is_present("min");
+	let http = args.is_present("http");
 
 	let threads = match threads {
 		true => args.value_of("threads").unwrap().parse().unwrap(),
@@ -232,7 +235,14 @@ fn real_main() -> Result<(), Error> {
 		false => 1,
 	};
 
-	if client {
+	if http {
+		let config = HttpConfig {
+			..Default::default()
+		};
+		let mut http_server: HttpServer = HttpServer::new(config);
+		http_server.start()?;
+		std::thread::park();
+	} else if client {
 		info!("Running client");
 		info!("Threads={}", threads);
 		info!("Iterations={}", itt);

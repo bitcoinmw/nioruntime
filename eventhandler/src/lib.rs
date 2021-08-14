@@ -21,7 +21,7 @@ pub mod eventhandler;
 
 pub use nioruntime_util as util;
 
-pub use crate::eventhandler::EventHandler;
+pub use crate::eventhandler::{EventHandler, WriteHandle};
 
 // Some needed timespec code
 
