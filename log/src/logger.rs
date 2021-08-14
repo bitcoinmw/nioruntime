@@ -636,6 +636,8 @@ macro_rules! do_log {
                                                 $log.config_with_object(LogConfig::default()).unwrap();
                                         }
 
+					let _ = $log.update_show_timestamp($show_ts);
+
 					if $level >= LOG_LEVEL {
                                         	match $log.log(&format!($a, $($b)*)) {
                                                 	Ok(_) => {},
@@ -755,6 +757,13 @@ struct LogParams {
 	cur_size: u64,
 	init_age_millis: u128,
 	config: LogConfig,
+	has_rotated: bool,
+}
+
+pub enum RotationStatus {
+	NotNeeded,
+	Needed,
+	AutoRotated,
 }
 
 /// Log Config object.
@@ -798,7 +807,7 @@ impl Default for LogConfig {
 
 impl LogParams {
 	/// This function rotates logs
-	fn rotate(&mut self) -> Result<(), Error> {
+	pub fn rotate(&mut self) -> Result<(), Error> {
 		let now: DateTime<Utc> = Utc::now();
 		let rotation_string = now.format(".r_%m_%e_%Y_%T").to_string().replace(":", "-");
 		let file_path = match self.config.file_path.rfind(".") {
@@ -818,7 +827,41 @@ impl LogParams {
 				.create(true)
 				.open(&self.config.file_path)?,
 		);
+
+		let time_now = SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("Time went backwards")
+			.as_millis();
+
+		let mut file = self.file.as_ref().unwrap();
+		let line_bytes = self.config.file_header.as_bytes();
+		if line_bytes.len() > 0 {
+			file.write(line_bytes)?;
+			file.write(&[10u8])?; // new line
+		}
+		self.init_age_millis = time_now;
+		self.cur_size = self.config.file_header.len() as u64 + 1;
+
 		Ok(())
+	}
+
+	pub fn rotation_status(&mut self) -> Result<RotationStatus, Error> {
+		// get current time
+		let time_now = SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.expect("Time went backwards")
+			.as_millis();
+		if self.file.is_some()
+			&& (self.cur_size >= self.config.max_size
+				|| time_now.saturating_sub(self.init_age_millis) > self.config.max_age_millis)
+		{
+			Ok(RotationStatus::Needed)
+		} else if self.has_rotated {
+			self.has_rotated = false;
+			Ok(RotationStatus::AutoRotated)
+		} else {
+			Ok(RotationStatus::NotNeeded)
+		}
 	}
 
 	/// The actual logging function, handles rotation if needed
@@ -840,15 +883,8 @@ impl LogParams {
 			&& (self.cur_size >= self.config.max_size
 				|| time_now.saturating_sub(self.init_age_millis) > self.config.max_age_millis)
 		{
+			self.has_rotated = true;
 			self.rotate()?;
-			let mut file = self.file.as_ref().unwrap();
-			let line_bytes = self.config.file_header.as_bytes();
-			if line_bytes.len() > 0 {
-				file.write(line_bytes)?;
-				file.write(&[10u8])?; // new line
-			}
-			self.init_age_millis = time_now;
-			self.cur_size = self.config.file_header.len() as u64 + 1;
 		}
 
 		// if we're showing the timestamp, print it
@@ -972,9 +1008,26 @@ impl Log {
 				file_header,
 				show_stdout,
 			},
+			has_rotated: false,
 		});
 
 		Ok(())
+	}
+
+	// rotate the log
+	pub fn rotate(&mut self) -> Result<(), Error> {
+		match self.params.as_mut() {
+			Some(params) => params.rotate(),
+			None => Err(ErrorKind::LogNotConfigured("log params None".to_string()).into()),
+		}
+	}
+
+	// check if a rotation is needed
+	pub fn rotation_status(&mut self) -> Result<RotationStatus, Error> {
+		match self.params.as_mut() {
+			Some(params) => params.rotation_status(),
+			None => Err(ErrorKind::LogNotConfigured("log params None".to_string()).into()),
+		}
 	}
 
 	/// Entry point for logging

@@ -237,6 +237,7 @@ fn real_main() -> Result<(), Error> {
 
 	if http {
 		let config = HttpConfig {
+			//request_log_max_age_millis: 30_000,
 			..Default::default()
 		};
 		let mut http_server: HttpServer = HttpServer::new(config);

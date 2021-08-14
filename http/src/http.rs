@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytefmt;
 use dirs;
 use log::*;
 use nioruntime_evh::{EventHandler, WriteHandle};
@@ -19,6 +20,7 @@ use nioruntime_util::threadpool::StaticThreadPool;
 use nioruntime_util::{Error, ErrorKind};
 use rand::Rng;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs::metadata;
 use std::fs::File;
@@ -27,11 +29,46 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 debug!();
 
+const MAIN_LOG: &str = "mainlog";
+const STATS_LOG: &str = "statslog";
+const HEADER: &str =
+	"--------------------------------------------------------------------------------------------------";
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+
+#[derive(Clone)]
+struct RequestLogItem {
+	uri: String,
+	query: String,
+	headers: Vec<(Vec<u8>, Vec<u8>)>,
+	method: HttpMethod,
+}
+
+impl RequestLogItem {
+	fn new(
+		uri: String,
+		query: String,
+		headers: Vec<(Vec<u8>, Vec<u8>)>,
+		method: HttpMethod,
+	) -> Self {
+		RequestLogItem {
+			uri,
+			query,
+			headers,
+			method,
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum HttpMethod {
+	Get,
+	Post,
+}
 
 #[derive(Debug)]
 enum HttpVersion {
@@ -46,6 +83,14 @@ pub struct HttpConfig {
 	pub root_dir: String,
 	pub thread_pool_size: usize,
 	pub server_name: String,
+	pub request_log_params: Vec<String>,
+	pub request_log_separator_char: char,
+	pub request_log_max_size: u64,
+	pub request_log_max_age_millis: u128,
+	pub main_log_max_size: u64,
+	pub main_log_max_age_millis: u128,
+	pub stats_log_max_size: u64,
+	pub stats_log_max_age_millis: u128,
 }
 
 impl Default for HttpConfig {
@@ -56,24 +101,20 @@ impl Default for HttpConfig {
 			root_dir: "~/.niohttpd".to_string(),
 			thread_pool_size: 6,
 			server_name: "NIORuntime Httpd".to_string(),
-		}
-	}
-}
-
-impl HttpConfig {
-	pub fn new(
-		host: String,
-		port: u16,
-		root_dir: String,
-		thread_pool_size: usize,
-		server_name: String,
-	) -> Self {
-		HttpConfig {
-			root_dir,
-			port,
-			host,
-			thread_pool_size,
-			server_name,
+			request_log_params: vec![
+				"method".to_string(),
+				"uri".to_string(),
+				"query".to_string(),
+				"User-Agent".to_string(),
+				"Referer".to_string(),
+			],
+			request_log_separator_char: '|',
+			request_log_max_size: 10 * 1024 * 1024,     // 10 mb
+			request_log_max_age_millis: 1000 * 60 * 60, // 1 hr
+			main_log_max_size: 10 * 1024 * 1024,        // 10 mb
+			main_log_max_age_millis: 1000 * 60 * 60,    // 1 hr
+			stats_log_max_size: 10 * 1024 * 1024,       // 10 mb
+			stats_log_max_age_millis: 1000 * 60 * 60,   // 1 hr
 		}
 	}
 }
@@ -88,9 +129,27 @@ impl ConnData {
 	}
 }
 
+struct HttpStats {
+	requests: u64,
+	conns: u64,
+	connects: u64,
+}
+
+impl HttpStats {
+	fn new() -> Self {
+		HttpStats {
+			requests: 0,
+			conns: 0,
+			connects: 0,
+		}
+	}
+}
+
 struct HttpContext {
 	stop: bool,
 	map: Arc<RwLock<HashMap<u128, Arc<RwLock<ConnData>>>>>,
+	log_queue: Vec<RequestLogItem>,
+	stats: HttpStats,
 }
 
 impl HttpContext {
@@ -98,6 +157,8 @@ impl HttpContext {
 		HttpContext {
 			stop: false,
 			map: Arc::new(RwLock::new(HashMap::new())),
+			log_queue: vec![],
+			stats: HttpStats::new(),
 		}
 	}
 }
@@ -130,7 +191,12 @@ impl HttpServer {
 			match Self::build_webroot(cloned_config.root_dir.clone()) {
 				Ok(_) => {}
 				Err(e) => {
-					error!("building webroot generated error: {}", e.to_string());
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"building webroot generated error: {}",
+						e.to_string()
+					);
 				}
 			}
 		}
@@ -148,22 +214,130 @@ impl HttpServer {
 		root_dir: String,
 		bytes: &[u8],
 	) -> Result<(), Error> {
-		//let bytes = include_bytes!(format!("resources/{}", resource));
 		let path = format!("{}/www/{}", root_dir, resource);
 		let mut file = File::create(&path)?;
 		file.write_all(bytes)?;
 		Ok(())
 	}
 
+	fn format_bytes(n: u64) -> String {
+		if n >= 1_000_000 {
+			bytefmt::format_to(n, bytefmt::Unit::MB)
+		} else if n >= 1_000 {
+			bytefmt::format_to(n, bytefmt::Unit::KB)
+		} else {
+			bytefmt::format_to(n, bytefmt::Unit::B)
+		}
+	}
+
+	fn format_time(n: u128) -> String {
+		let duration = std::time::Duration::from_millis(n.try_into().unwrap_or(u64::MAX));
+		if n >= 1000 * 60 {
+			format!("{} Minutes", (duration.as_secs() / 60))
+		} else if n >= 1000 {
+			format!("{} Seconds", duration.as_secs())
+		} else {
+			format!("{} Milliseconds", duration.as_millis())
+		}
+	}
+
 	pub fn start(&mut self) -> Result<(), Error> {
 		let addr = format!("{}:{}", self.config.host, self.config.port,);
+
+		log_config_multi!(
+			MAIN_LOG,
+			LogConfig {
+				file_path: format!("{}/logs/mainlog.log", self.config.root_dir),
+				..Default::default()
+			}
+		)?;
+
+		log_multi!(INFO, MAIN_LOG, "{} {}", self.config.server_name, VERSION);
+		log_no_ts_multi!(INFO, MAIN_LOG, "{}", HEADER);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"root_dir:             '{}'",
+			self.config.root_dir
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"webroot:              '{}/www'",
+			self.config.root_dir
+		);
+		log_multi!(INFO, MAIN_LOG, "bind address:         '{}'", addr);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"thread pool size:     '{}'",
+			self.config.thread_pool_size
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"request_log_location: '{}/logs/request.log'",
+			self.config.root_dir
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"request_log_max_size: '{}'",
+			Self::format_bytes(self.config.request_log_max_size)
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"request_log_max_age:  '{}'",
+			Self::format_time(self.config.request_log_max_age_millis)
+		);
+
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"mainlog_location:     '{}/logs/mainlog.log'",
+			self.config.root_dir
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"mainlog_max_size:     '{}'",
+			Self::format_bytes(self.config.main_log_max_size)
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"mainlog_max_age:      '{}'",
+			Self::format_time(self.config.main_log_max_age_millis)
+		);
+
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"stats_log_location:   '{}/logs/stats.log'",
+			self.config.root_dir
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"stats_log_max_size:   '{}'",
+			Self::format_bytes(self.config.stats_log_max_size)
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"stats_log_max_age:    '{}'",
+			Self::format_time(self.config.stats_log_max_age_millis)
+		);
+		log_no_ts_multi!(INFO, MAIN_LOG, "{}", HEADER);
+
 		let listener = TcpListener::bind(addr.clone())?;
-		info!("Server Started on: {}", addr);
-		info!("root_dir: {}", self.config.root_dir);
 
 		let http_config = self.config.clone();
 		let http_config_clone = http_config.clone();
 		let http_config_clone2 = http_config.clone();
+		let http_config_clone3 = http_config.clone();
+		let http_config_clone4 = http_config.clone();
 
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(self.config.thread_pool_size)?;
@@ -179,6 +353,8 @@ impl HttpServer {
 		let http_context_clone2 = http_context.clone();
 		let http_context_clone3 = http_context.clone();
 		let http_context_clone4 = http_context.clone();
+		let http_context_clone5 = http_context.clone();
+		let http_context_clone6 = http_context.clone();
 		let mut eh = EventHandler::new();
 
 		eh.set_on_read(move |buf, len, wh| {
@@ -221,7 +397,9 @@ impl HttpServer {
 				let http_context = match http_context_clone4.read() {
 					Ok(http_context) => http_context,
 					Err(e) => {
-						error!(
+						log_multi!(
+							ERROR,
+							MAIN_LOG,
 							"unexpected error obtaining lock on http_context: {}",
 							e.to_string()
 						);
@@ -230,18 +408,42 @@ impl HttpServer {
 				};
 
 				if http_context.stop {
-					info!("Stopping HttpServer");
+					log_multi!(INFO, MAIN_LOG, "Stopping HttpServer");
 					let stop_res = eh.stop();
 					match stop_res {
 						Ok(_) => {}
 						Err(e) => {
-							error!("unexpected error stopping eventhandler: {}", e.to_string())
+							log_multi!(
+								ERROR,
+								MAIN_LOG,
+								"unexpected error stopping eventhandler: {}",
+								e.to_string()
+							);
 						}
 					}
 					break;
 				}
 			}
 		});
+
+		std::thread::spawn(move || {
+			Self::request_log(http_context_clone5, http_config_clone3.clone())
+		});
+
+		std::thread::spawn(move || {
+			Self::stats_log(http_context_clone6, http_config_clone4.clone())
+		});
+
+		log_multi!(INFO, MAIN_LOG, "Server Started");
+
+		log_config_multi!(
+			MAIN_LOG,
+			LogConfig {
+				file_path: format!("{}/logs/mainlog.log", self.config.root_dir),
+				show_stdout: false,
+				..Default::default()
+			}
+		)?;
 
 		Ok(())
 	}
@@ -259,7 +461,11 @@ impl HttpServer {
 				http_context.stop = true;
 			}
 			None => {
-				warn!("Tried to stop an HttpServer that never started.");
+				log_multi!(
+					WARN,
+					MAIN_LOG,
+					"Tried to stop an HttpServer that never started."
+				);
 			}
 		}
 
@@ -271,17 +477,291 @@ impl HttpServer {
 		Ok(())
 	}
 
+	fn stats_log(
+		http_context: Arc<RwLock<HttpContext>>,
+		http_config: HttpConfig,
+	) -> Result<(), Error> {
+		let start = Instant::now();
+		let header_titles =
+			" Statistical Log V1  |     REQUESTS       CONNS    CONNECTS         QPS".to_string();
+		let file_header = format!("{}\n{}", header_titles, HEADER);
+		log_config_multi!(
+			STATS_LOG,
+			LogConfig {
+				file_path: format!("{}/logs/statslog.log", http_config.root_dir),
+				show_stdout: false,
+				file_header: file_header.clone(),
+				..Default::default()
+			}
+		)?;
+
+		let mut itt = 1;
+		let mut last_requests = 0;
+		let mut last_connects = 0;
+		loop {
+			std::thread::sleep(std::time::Duration::from_millis(5000));
+
+			let http_context = http_context.read().map_err(|_| {
+				let error: Error =
+					ErrorKind::InternalError("http_context lock err".to_string()).into();
+				error
+			})?;
+
+			if itt % 6 == 0 {
+				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
+				log_no_ts_multi!(INFO, STATS_LOG, "{}", header_titles);
+				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
+
+				let secs = start.elapsed().as_secs();
+
+				log_no_ts_multi!(
+					INFO,
+					STATS_LOG,
+					"      Cumulative     | {:12}{:12}{:12}   {:.7}",
+					http_context.stats.requests,
+					http_context.stats.conns,
+					http_context.stats.connects,
+					http_context.stats.requests as f64 / secs as f64,
+				);
+				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
+			}
+			let qps = (http_context.stats.requests - last_requests) as f64 / 5 as f64;
+			log_multi!(
+				INFO,
+				STATS_LOG,
+				"{:12}{:12}{:12}   {:.7}",
+				http_context.stats.requests - last_requests,
+				http_context.stats.conns,
+				http_context.stats.connects - last_connects,
+				qps,
+			);
+
+			if http_context.stop {
+				break;
+			}
+
+			itt += 1;
+			last_requests = http_context.stats.requests;
+			last_connects = http_context.stats.connects;
+		}
+
+		Ok(())
+	}
+
+	fn request_log(
+		http_context: Arc<RwLock<HttpContext>>,
+		http_config: HttpConfig,
+	) -> Result<(), Error> {
+		let mut log = Log::new();
+
+		let mut header = format!("");
+		let len = http_config.request_log_params.len();
+		for i in 0..len {
+			header = format!(
+				"{}{}{}",
+				header, http_config.request_log_separator_char, http_config.request_log_params[i],
+			);
+		}
+		log.config(
+			Some(format!("{}/logs/request.log", http_config.root_dir)),
+			http_config.request_log_max_size,
+			http_config.request_log_max_age_millis,
+			true,
+			&header,
+			false,
+		)?;
+
+		let len = http_config.request_log_params.len();
+		let mut hash_set = HashSet::new();
+		let mut header_map = HashMap::new();
+		for i in 0..len {
+			hash_set.insert(http_config.request_log_params[i].clone());
+		}
+
+		let mut to_log;
+		loop {
+			std::thread::sleep(std::time::Duration::from_millis(100));
+			let stop = {
+				let mut http_context = http_context.write().map_err(|_e| {
+					let error: Error = ErrorKind::InternalError(
+						"unexpected error obtaining http_context lock".to_string(),
+					)
+					.into();
+					error
+				})?;
+
+				to_log = http_context.log_queue.clone();
+				http_context.log_queue.clear();
+
+				http_context.stop
+			};
+
+			for item in to_log {
+				let res = Self::log_item(item, &mut log, &hash_set, &http_config, &mut header_map);
+
+				match res {
+					Ok(_) => {}
+					Err(e) => {
+						log_multi!(
+							ERROR,
+							MAIN_LOG,
+							"Unexpected error with request log: {}",
+							e.to_string()
+						);
+					}
+				}
+			}
+
+			if stop {
+				break;
+			}
+
+			// check if rotation is needed
+			let status = log.rotation_status();
+			match status {
+				Ok(status) => match status {
+					RotationStatus::Needed => match log.rotate() {
+						Ok(_) => {
+							log_multi!(INFO, MAIN_LOG, "Request log rotated.");
+						}
+						Err(e) => {
+							log_multi!(
+								ERROR,
+								MAIN_LOG,
+								"Unexpected error with request log rotation: {}",
+								e.to_string(),
+							);
+						}
+					},
+					RotationStatus::NotNeeded => {}
+					RotationStatus::AutoRotated => {
+						log_multi!(INFO, MAIN_LOG, "Request log was auto-rotated.");
+					}
+				},
+				Err(e) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"Unexpected error with request log rotation: {}",
+						e.to_string()
+					);
+				}
+			}
+
+			// check rotation of mainlog:
+			let static_log = &LOG;
+			let log_map = static_log.lock();
+			match log_map {
+				Ok(mut log_map) => {
+					let log = log_map.get_mut(MAIN_LOG);
+					match log {
+						Some(log) => {
+							match log.rotation_status()? {
+								RotationStatus::Needed => match log.rotate() {
+									Ok(_) => {
+										log_multi!(INFO, MAIN_LOG, "mainlog rotated.");
+									}
+									Err(e) => {
+										println!("unexpected mainlog err: {}", e.to_string());
+									}
+								},
+								RotationStatus::AutoRotated => {
+									log_multi!(INFO, MAIN_LOG, "mainlog was auto-rotated.");
+								}
+								RotationStatus::NotNeeded => {}
+							};
+						}
+						None => {}
+					}
+				}
+				Err(e) => {
+					println!("Unexpected error rotate mainlog: {}", e.to_string());
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	fn log_item(
+		item: RequestLogItem,
+		log: &mut Log,
+		hash_set: &HashSet<String>,
+		http_config: &HttpConfig,
+		header_map: &mut HashMap<Vec<u8>, Vec<u8>>,
+	) -> Result<(), Error> {
+		let len = http_config.request_log_params.len();
+		let mut log_line = "".to_string();
+		if hash_set.get("method").is_some() {
+			log_line = format!(
+				"{}{}{}",
+				log_line,
+				http_config.request_log_separator_char,
+				if item.method == HttpMethod::Get {
+					"GET"
+				} else {
+					"POST"
+				},
+			);
+		}
+		if hash_set.get("uri").is_some() {
+			log_line = format!(
+				"{}{}{}",
+				log_line, http_config.request_log_separator_char, item.uri
+			);
+		}
+		if hash_set.get("query").is_some() {
+			log_line = format!(
+				"{}{}{}",
+				log_line, http_config.request_log_separator_char, item.query
+			);
+		}
+
+		header_map.clear();
+		for header in item.headers {
+			header_map.insert(header.0, header.1);
+		}
+
+		for i in 0..len {
+			let config_name = &http_config.request_log_params[i];
+			if config_name != "query" && config_name != "method" && config_name != "uri" {
+				let config_value = header_map.get(config_name.as_bytes());
+				match config_value {
+					Some(config_value) => {
+						log_line = format!(
+							"{}{}{}",
+							log_line,
+							http_config.request_log_separator_char,
+							std::str::from_utf8(&config_value)?
+						);
+					}
+					None => {
+						log_line =
+							format!("{}{}", log_line, http_config.request_log_separator_char,);
+					}
+				}
+			}
+		}
+
+		log.log(&log_line)?;
+
+		Ok(())
+	}
+
 	fn process_accept(
 		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
 		_http_config: HttpConfig,
 		id: u128,
 	) -> Result<(), Error> {
-		let http_context = http_context.write().map_err(|e| {
+		let mut http_context = http_context.write().map_err(|e| {
 			let error: Error =
 				ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
 			error
 		})?;
+
+		http_context.stats.conns += 1;
+		http_context.stats.connects += 1;
 
 		let mut map = http_context.map.write().map_err(|e| {
 			let error: Error =
@@ -319,7 +799,9 @@ impl HttpServer {
 			match conn_context {
 				Some(context) => context.clone(),
 				None => {
-					error!(
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
 						"unexpected error getting ConnData for {}",
 						wh.get_connection_id()
 					);
@@ -350,10 +832,15 @@ impl HttpServer {
 		}
 
 		thread_pool.execute(async move {
-			match Self::process_request(&http_config, conn_context, wh) {
+			match Self::process_request(&http_config, conn_context, wh, http_context) {
 				Ok(_) => {}
 				Err(e) => {
-					error!("unexpected error processing request: {}", e.to_string());
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"unexpected error processing request: {}",
+						e.to_string()
+					);
 				}
 			}
 		})?;
@@ -365,6 +852,7 @@ impl HttpServer {
 		config: &HttpConfig,
 		conn_context: Arc<RwLock<ConnData>>,
 		wh: WriteHandle,
+		http_context: Arc<RwLock<HttpContext>>,
 	) -> Result<(), Error> {
 		let mut conn_context = conn_context
 			.write()
@@ -398,8 +886,14 @@ impl HttpServer {
 							&& (buffer[0..5]
 								!= ['P' as u8, 'O' as u8, 'S' as u8, 'T' as u8, ' ' as u8]))
 					{
+						// only accept GET/POST for now
 						Self::send_bad_request_error(&wh)?;
 					} else {
+						let method = if buffer[0] == 'G' as u8 {
+							HttpMethod::Get
+						} else {
+							HttpMethod::Post
+						};
 						let mut space_count = 0;
 						let mut uri = vec![];
 						let mut http_ver_string = vec![];
@@ -480,15 +974,41 @@ impl HttpServer {
 								keep_alive = false;
 								HttpVersion::V10
 							};
-						info!("uri = {}", std::str::from_utf8(&uri[..])?);
-						Self::send_response(
-							&config,
-							&wh,
-							http_version,
-							std::str::from_utf8(&uri[..])?,
+
+						let mut query_string = vec![];
+						let mut uri_path = vec![];
+						let mut start_query = false;
+						for j in 0..uri.len() {
+							if !start_query && uri[j] != '?' as u8 {
+								uri_path.push(uri[j]);
+							} else if !start_query && uri[j] == '?' as u8 {
+								start_query = true;
+							} else {
+								query_string.push(uri[j]);
+							}
+						}
+						let uri = std::str::from_utf8(&uri_path[..])?;
+						let query = std::str::from_utf8(&query_string[..])?;
+
+						Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
+
+						let mut http_context = http_context.write().map_err(|e| {
+							let error: Error = ErrorKind::PoisonError(format!(
+								"unexpected error: {}",
+								e.to_string()
+							))
+							.into();
+							error
+						})?;
+
+						http_context.log_queue.push(RequestLogItem::new(
+							uri.to_string(),
+							query.to_string(),
 							sep_headers_vec,
-							keep_alive,
-						)?;
+							method,
+						));
+
+						http_context.stats.requests += 1;
 					}
 
 					for _ in 0..i + 1 {
@@ -519,27 +1039,10 @@ impl HttpServer {
 	fn send_response(
 		config: &HttpConfig,
 		wh: &WriteHandle,
-		version: HttpVersion,
+		_version: HttpVersion,
 		uri: &str,
-		headers: Vec<(Vec<u8>, Vec<u8>)>,
 		keep_alive: bool,
 	) -> Result<(), Error> {
-		let mut uri_path = vec![];
-		let mut query_string = vec![];
-		let mut start_query = false;
-		let uri = uri.as_bytes();
-		for i in 0..uri.len() {
-			if !start_query && uri[i] != '?' as u8 {
-				uri_path.push(uri[i]);
-			} else if !start_query && uri[i] == '?' as u8 {
-				start_query = true;
-			} else {
-				query_string.push(uri[i]);
-			}
-		}
-		let uri = std::str::from_utf8(&uri_path[..])?;
-		let query = std::str::from_utf8(&query_string[..])?;
-
 		let mut path = format!("{}/www{}", config.root_dir, uri);
 		let mut flen = match metadata(path.clone()) {
 			Ok(md) => {
@@ -607,7 +1110,7 @@ impl HttpServer {
 							}
 							flen -= amt.try_into().unwrap_or(0);
 						}
-						Err(e) => {
+						Err(_) => {
 							// directory
 							Self::write_headers(wh, config, false, keep_alive)?;
 							break;
@@ -683,11 +1186,13 @@ impl HttpServer {
 		_http_config: HttpConfig,
 		id: u128,
 	) -> Result<(), Error> {
-		let http_context = http_context.write().map_err(|e| {
+		let mut http_context = http_context.write().map_err(|e| {
 			let error: Error =
 				ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
 			error
 		})?;
+
+		http_context.stats.conns -= 1;
 
 		let mut map = http_context.map.write().map_err(|e| {
 			let error: Error =
@@ -708,7 +1213,12 @@ impl HttpServer {
 		match Self::create_file_from_bytes("DERP.jpeg".to_string(), root_dir.clone(), bytes) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -716,7 +1226,12 @@ impl HttpServer {
 		match Self::create_file_from_bytes("index.html".to_string(), root_dir.clone(), bytes) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -724,7 +1239,12 @@ impl HttpServer {
 		match Self::create_file_from_bytes("404.html".to_string(), root_dir.clone(), bytes) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -732,7 +1252,12 @@ impl HttpServer {
 		match Self::create_file_from_bytes("favicon.ico".to_string(), root_dir.clone(), bytes) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -741,7 +1266,12 @@ impl HttpServer {
 		{
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -750,7 +1280,12 @@ impl HttpServer {
 		{
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -758,7 +1293,12 @@ impl HttpServer {
 		match Self::create_file_from_bytes("about.txt".to_string(), root_dir.clone(), bytes) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -770,7 +1310,12 @@ impl HttpServer {
 		) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -782,7 +1327,12 @@ impl HttpServer {
 		) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -794,7 +1344,12 @@ impl HttpServer {
 		) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
@@ -806,7 +1361,12 @@ impl HttpServer {
 		) {
 			Ok(_) => {}
 			Err(e) => {
-				error!("Creating file resulted in error: {}", e.to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Creating file resulted in error: {}",
+					e.to_string()
+				);
 			}
 		}
 
