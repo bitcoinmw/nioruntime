@@ -28,6 +28,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
+use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -1152,6 +1153,7 @@ impl HttpServer {
 				error
 			})
 			.unwrap();
+		let _connection_id = conn_context.wh.get_connection_id();
 		let buffer = &mut conn_context.buffer;
 		// iterate through and try to find a double line break. If we find it,
 		// send to next function for processing and delete the data that we send.
@@ -1161,7 +1163,9 @@ impl HttpServer {
 				break;
 			}
 			let mut response_sent = false;
+			let mut end_buf;
 			for i in 3..len {
+				end_buf = i;
 				if (buffer[i - 3] == '\r' as u8
 				&& buffer[i - 2] == '\n' as u8
 				&& buffer[i - 1] == '\r' as u8
@@ -1254,6 +1258,29 @@ impl HttpServer {
 							if header == "Connection" && value == "keep-alive" {
 								keep_alive = true;
 							}
+
+							if header == "Content-Length" {
+								let content_len: Result<usize, ParseIntError> = value.parse();
+								match content_len {
+									Ok(content_len) => {
+										end_buf += content_len;
+										if end_buf >= len {
+											// we don't have enough data
+											// return here and wait for more
+											return Ok(());
+										}
+									}
+									Err(e) => {
+										log_multi!(
+											ERROR,
+											MAIN_LOG,
+											"Invalid content-len: {}, value={}",
+											e.to_string(),
+											value,
+										);
+									}
+								}
+							}
 						}
 
 						let http_ver_string = std::str::from_utf8(&http_ver_string[..])?;
@@ -1305,7 +1332,7 @@ impl HttpServer {
 						http_context.stats.requests += 1;
 					}
 
-					for _ in 0..i + 1 {
+					for _ in 0..end_buf + 1 {
 						buffer.remove(0);
 					}
 
