@@ -38,7 +38,7 @@ debug!();
 const MAIN_LOG: &str = "mainlog";
 const STATS_LOG: &str = "statslog";
 const HEADER: &str =
-	"--------------------------------------------------------------------------------------------------";
+	"-----------------------------------------------------------------------------------------------";
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -167,6 +167,8 @@ struct HttpStats {
 	requests: u64,
 	conns: u64,
 	connects: u64,
+	idledisc: u64,
+	rtimeout: u64,
 }
 
 impl HttpStats {
@@ -175,6 +177,8 @@ impl HttpStats {
 			requests: 0,
 			conns: 0,
 			connects: 0,
+			idledisc: 0,
+			rtimeout: 0,
 		}
 	}
 }
@@ -568,7 +572,8 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		let start = Instant::now();
 		let header_titles =
-			"Statistical Log V1.0 |     REQUESTS       CONNS    CONNECTS         QPS".to_string();
+"Statistical Log V_1.0:     REQUESTS       CONNS    CONNECTS         QPS   IDLE_DISC    RTIMEOUT"
+.to_string();
 		let file_header = format!("{}\n{}", header_titles, HEADER);
 		log_config_multi!(
 			STATS_LOG,
@@ -585,6 +590,8 @@ impl HttpServer {
 		let mut itt = 1;
 		let mut last_requests = 0;
 		let mut last_connects = 0;
+		let mut last_idledisc = 0;
+		let mut last_rtimeout = 0;
 		loop {
 			std::thread::sleep(std::time::Duration::from_millis(5000));
 
@@ -606,7 +613,7 @@ impl HttpServer {
 				let fhours = (secs / (60 * 60)) % 24;
 				let format_elapsed_time = if days > 10_000 {
 					format!(
-						"{} Days {:02}:{:02}:{:02}",
+						" {} Days {:02}:{:02}:{:02}",
 						days.to_formatted_string(&Locale::en),
 						fhours,
 						fmins,
@@ -614,29 +621,34 @@ impl HttpServer {
 					)
 				} else if days > 1_000 {
 					format!(
-						" {} Days {:02}:{:02}:{:02}",
+						"  {} Days {:02}:{:02}:{:02}",
 						days.to_formatted_string(&Locale::en),
 						fhours,
 						fmins,
 						fsecs,
 					)
 				} else if days > 100 {
-					format!("   {} Days {:02}:{:02}:{:02}", days, fhours, fmins, fsecs,)
-				} else if days > 10 {
 					format!("    {} Days {:02}:{:02}:{:02}", days, fhours, fmins, fsecs,)
-				} else {
+				} else if days > 10 {
 					format!("     {} Days {:02}:{:02}:{:02}", days, fhours, fmins, fsecs,)
+				} else {
+					format!(
+						"      {} Days {:02}:{:02}:{:02}",
+						days, fhours, fmins, fsecs,
+					)
 				};
 
 				log_no_ts_multi!(
 					INFO,
 					STATS_LOG,
-					"{} | {:12}{:12}{:12}   {}",
+					"{}: {:12}{:12}{:12}   {}{:12}{:12}",
 					format_elapsed_time,
 					http_context.stats.requests,
 					http_context.stats.conns,
 					http_context.stats.connects,
 					Self::format_qps(http_context.stats.requests as f64 / secs as f64),
+					http_context.stats.idledisc,
+					http_context.stats.rtimeout,
 				);
 				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
 			}
@@ -644,11 +656,13 @@ impl HttpServer {
 			log_multi!(
 				INFO,
 				STATS_LOG,
-				"{:12}{:12}{:12}   {}",
+				"{:12}{:12}{:12}   {}{:12}{:12}",
 				http_context.stats.requests - last_requests,
 				http_context.stats.conns,
 				http_context.stats.connects - last_connects,
 				Self::format_qps(qps),
+				http_context.stats.idledisc - last_idledisc,
+				http_context.stats.rtimeout - last_rtimeout,
 			);
 
 			if http_context.stop {
@@ -700,6 +714,8 @@ impl HttpServer {
 			itt += 1;
 			last_requests = http_context.stats.requests;
 			last_connects = http_context.stats.connects;
+			last_rtimeout = http_context.stats.rtimeout;
+			last_idledisc = http_context.stats.idledisc;
 		}
 
 		Ok(())
@@ -922,41 +938,69 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		loop {
 			std::thread::sleep(std::time::Duration::from_millis(1000));
-			let http_context = http_context.write().map_err(|e| {
-				let error: Error =
-					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
-				error
-			})?;
 
-			let map = http_context.map.write().map_err(|e| {
-				let error: Error =
-					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
-				error
-			})?;
+			let mut idledisc_incr = 0;
+			let mut rtimeout_incr = 0;
 
-			let now = SystemTime::now();
-			let since_the_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
-			let time_now = since_the_epoch.as_millis();
-			let last_request_timeout = http_config.last_request_timeout;
-			let read_timeout = http_config.read_timeout;
+			{
+				let http_context = http_context.write().map_err(|e| {
+					let error: Error =
+						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+							.into();
+					error
+				})?;
 
-			for (k, v) in &*map {
-				match Self::check_idle(time_now, v, last_request_timeout, read_timeout) {
-					Ok(_) => {}
-					Err(e) => {
-						log_multi!(
-							ERROR,
-							MAIN_LOG,
-							"unexpected error in check_idle ConnData for {}, err={}",
-							k,
-							e.to_string(),
-						);
+				let map = http_context.map.write().map_err(|e| {
+					let error: Error =
+						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+							.into();
+					error
+				})?;
+
+				let now = SystemTime::now();
+				let since_the_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
+				let time_now = since_the_epoch.as_millis();
+				let last_request_timeout = http_config.last_request_timeout;
+				let read_timeout = http_config.read_timeout;
+
+				for (k, v) in &*map {
+					let (idledisc, rtimeout) =
+						match Self::check_idle(time_now, v, last_request_timeout, read_timeout) {
+							Ok(x) => x,
+							Err(e) => {
+								log_multi!(
+									ERROR,
+									MAIN_LOG,
+									"unexpected error in check_idle ConnData for {}, err={}",
+									k,
+									e.to_string(),
+								);
+								(false, false)
+							}
+						};
+
+					if idledisc {
+						idledisc_incr += 1;
 					}
+					if rtimeout {
+						rtimeout_incr += 1;
+					}
+				}
+
+				if http_context.stop {
+					break;
 				}
 			}
 
-			if http_context.stop {
-				break;
+			if idledisc_incr > 0 || rtimeout_incr > 0 {
+				let mut http_context = http_context.write().map_err(|e| {
+					let error: Error =
+						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+							.into();
+					error
+				})?;
+				http_context.stats.idledisc += idledisc_incr;
+				http_context.stats.rtimeout += rtimeout_incr;
 			}
 		}
 		Ok(())
@@ -967,19 +1011,23 @@ impl HttpServer {
 		conn_data: &Arc<RwLock<ConnData>>,
 		last_request_timeout: u128,
 		read_timeout: u128,
-	) -> Result<(), Error> {
+	) -> Result<(bool, bool), Error> {
 		let conn_data = conn_data.write().unwrap();
+		let mut idledisc = false;
+		let mut rtimeout = false;
 		if conn_data.last_request_time != 0
 			&& time_now - conn_data.last_request_time > last_request_timeout
 		{
 			conn_data.wh.close()?;
+			idledisc = true;
 		}
 
 		if conn_data.last_request_time == 0 && time_now - conn_data.create_time > read_timeout {
 			conn_data.wh.close()?;
+			rtimeout = true;
 		}
 
-		Ok(())
+		Ok((idledisc, rtimeout))
 	}
 
 	fn process_accept(
