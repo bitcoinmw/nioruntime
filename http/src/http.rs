@@ -18,6 +18,7 @@ use log::*;
 use nioruntime_evh::{EventHandler, WriteHandle};
 use nioruntime_util::threadpool::StaticThreadPool;
 use nioruntime_util::{Error, ErrorKind};
+use num_format::{Locale, ToFormattedString};
 use rand::Rng;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -72,9 +73,21 @@ enum HttpMethod {
 }
 
 #[derive(Debug)]
-enum HttpVersion {
+pub enum HttpVersion {
 	V10,
 	V11,
+}
+
+type Callback = fn(&HttpConfig, &WriteHandle, HttpVersion, &str, bool) -> Result<(), Error>;
+
+fn empty_callback(
+	_: &HttpConfig,
+	_: &WriteHandle,
+	_: HttpVersion,
+	_: &str,
+	_: bool,
+) -> Result<(), Error> {
+	Ok(())
 }
 
 #[derive(Clone)]
@@ -92,6 +105,9 @@ pub struct HttpConfig {
 	pub main_log_max_age_millis: u128,
 	pub stats_log_max_size: u64,
 	pub stats_log_max_age_millis: u128,
+	pub last_request_timeout: u128,
+	pub read_timeout: u128,
+	pub callback: Callback,
 	pub debug: bool,
 }
 
@@ -111,12 +127,15 @@ impl Default for HttpConfig {
 				"Referer".to_string(),
 			],
 			request_log_separator_char: '|',
-			request_log_max_size: 10 * 1024 * 1024,     // 10 mb
-			request_log_max_age_millis: 1000 * 60 * 60, // 1 hr
-			main_log_max_size: 10 * 1024 * 1024,        // 10 mb
-			main_log_max_age_millis: 1000 * 60 * 60,    // 1 hr
-			stats_log_max_size: 10 * 1024 * 1024,       // 10 mb
-			stats_log_max_age_millis: 1000 * 60 * 60,   // 1 hr
+			request_log_max_size: 10 * 1024 * 1024,       // 10 mb
+			request_log_max_age_millis: 1000 * 60 * 60,   // 1 hr
+			main_log_max_size: 10 * 1024 * 1024,          // 10 mb
+			main_log_max_age_millis: 6 * 1000 * 60 * 60,  // 6 hr
+			stats_log_max_size: 10 * 1024 * 1024,         // 10 mb
+			stats_log_max_age_millis: 6 * 1000 * 60 * 60, // 6 hr
+			last_request_timeout: 1000 * 120,             // 2 mins
+			read_timeout: 1000 * 30,                      // 30 seconds
+			callback: empty_callback,
 			debug: false,
 		}
 	}
@@ -165,6 +184,7 @@ struct HttpContext {
 	map: Arc<RwLock<HashMap<u128, Arc<RwLock<ConnData>>>>>,
 	log_queue: Vec<RequestLogItem>,
 	stats: HttpStats,
+	api_mappings: HashSet<String>,
 }
 
 impl HttpContext {
@@ -174,6 +194,7 @@ impl HttpContext {
 			map: Arc::new(RwLock::new(HashMap::new())),
 			log_queue: vec![],
 			stats: HttpStats::new(),
+			api_mappings: HashSet::new(),
 		}
 	}
 }
@@ -222,6 +243,28 @@ impl HttpServer {
 			context: None,
 			thread_pool: None,
 		}
+	}
+
+	pub fn add_mapping(&self, path: String) -> Result<(), Error> {
+		match &self.context {
+			Some(context) => {
+				let mut context = context.write().map_err(|e| {
+					let error: Error =
+						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+							.into();
+					error
+				})?;
+				context.api_mappings.insert(path);
+			}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"Context not set, must call start first.".to_string(),
+				)
+				.into());
+			}
+		}
+
+		Ok(())
 	}
 
 	fn create_file_from_bytes(
@@ -306,7 +349,6 @@ impl HttpServer {
 			"request_log_max_age:  '{}'",
 			Self::format_time(self.config.request_log_max_age_millis)
 		);
-
 		log_multi!(
 			INFO,
 			MAIN_LOG,
@@ -325,7 +367,6 @@ impl HttpServer {
 			"mainlog_max_age:      '{}'",
 			Self::format_time(self.config.main_log_max_age_millis)
 		);
-
 		log_multi!(
 			INFO,
 			MAIN_LOG,
@@ -344,6 +385,12 @@ impl HttpServer {
 			"stats_log_max_age:    '{}'",
 			Self::format_time(self.config.stats_log_max_age_millis)
 		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"debug:                '{}'",
+			self.config.debug
+		);
 		log_no_ts_multi!(INFO, MAIN_LOG, "{}", HEADER);
 
 		let listener = TcpListener::bind(addr.clone())?;
@@ -353,6 +400,7 @@ impl HttpServer {
 		let http_config_clone2 = http_config.clone();
 		let http_config_clone3 = http_config.clone();
 		let http_config_clone4 = http_config.clone();
+		let http_config_clone5 = http_config.clone();
 
 		let thread_pool = StaticThreadPool::new()?;
 		thread_pool.start(self.config.thread_pool_size)?;
@@ -370,6 +418,7 @@ impl HttpServer {
 		let http_context_clone4 = http_context.clone();
 		let http_context_clone5 = http_context.clone();
 		let http_context_clone6 = http_context.clone();
+		let http_context_clone7 = http_context.clone();
 		let mut eh = EventHandler::new();
 
 		eh.set_on_read(move |buf, len, wh| {
@@ -450,6 +499,8 @@ impl HttpServer {
 			Self::stats_log(http_context_clone6, http_config_clone4.clone())
 		});
 
+		std::thread::spawn(move || Self::house_keeper(http_context_clone7, &http_config_clone5));
+
 		log_multi!(INFO, MAIN_LOG, "Server Started");
 
 		log_config_multi!(
@@ -517,7 +568,7 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		let start = Instant::now();
 		let header_titles =
-			" Statistical Log V1  |     REQUESTS       CONNS    CONNECTS         QPS".to_string();
+			"Statistical Log V1.0 |     REQUESTS       CONNS    CONNECTS         QPS".to_string();
 		let file_header = format!("{}\n{}", header_titles, HEADER);
 		log_config_multi!(
 			STATS_LOG,
@@ -549,11 +600,39 @@ impl HttpServer {
 				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
 
 				let secs = start.elapsed().as_secs();
+				let days = secs / 86400;
+				let fsecs = secs % 60;
+				let fmins = (secs / 60) % 60;
+				let fhours = (secs / (60 * 60)) % 24;
+				let format_elapsed_time = if days > 10_000 {
+					format!(
+						"{} Days {:02}:{:02}:{:02}",
+						days.to_formatted_string(&Locale::en),
+						fhours,
+						fmins,
+						fsecs,
+					)
+				} else if days > 1_000 {
+					format!(
+						" {} Days {:02}:{:02}:{:02}",
+						days.to_formatted_string(&Locale::en),
+						fhours,
+						fmins,
+						fsecs,
+					)
+				} else if days > 100 {
+					format!("   {} Days {:02}:{:02}:{:02}", days, fhours, fmins, fsecs,)
+				} else if days > 10 {
+					format!("    {} Days {:02}:{:02}:{:02}", days, fhours, fmins, fsecs,)
+				} else {
+					format!("     {} Days {:02}:{:02}:{:02}", days, fhours, fmins, fsecs,)
+				};
 
 				log_no_ts_multi!(
 					INFO,
 					STATS_LOG,
-					"      Cumulative     | {:12}{:12}{:12}   {}",
+					"{} | {:12}{:12}{:12}   {}",
+					format_elapsed_time,
 					http_context.stats.requests,
 					http_context.stats.conns,
 					http_context.stats.connects,
@@ -574,6 +653,48 @@ impl HttpServer {
 
 			if http_context.stop {
 				break;
+			}
+
+			// check rotation of mainlog:
+			let mut rotate_complete = false;
+			let mut auto_rotate_complete = false;
+			{
+				let static_log = &LOG;
+				let log_map = static_log.lock();
+
+				match log_map {
+					Ok(mut log_map) => {
+						let log = log_map.get_mut(STATS_LOG);
+						match log {
+							Some(log) => {
+								match log.rotation_status()? {
+									RotationStatus::Needed => match log.rotate() {
+										Ok(_) => {
+											rotate_complete = true;
+										}
+										Err(e) => {
+											println!("unexpected stats log err: {}", e.to_string());
+										}
+									},
+									RotationStatus::AutoRotated => {
+										auto_rotate_complete = true;
+									}
+									RotationStatus::NotNeeded => {}
+								};
+							}
+							None => {}
+						}
+					}
+					Err(e) => {
+						println!("Unexpected error rotate statslog: {}", e.to_string());
+					}
+				}
+			}
+
+			if auto_rotate_complete {
+				log_multi!(INFO, MAIN_LOG, "statslog rotated.");
+			} else if rotate_complete {
+				log_multi!(INFO, MAIN_LOG, "statslog rotated.");
 			}
 
 			itt += 1;
@@ -658,7 +779,7 @@ impl HttpServer {
 				Ok(status) => match status {
 					RotationStatus::Needed => match log.rotate() {
 						Ok(_) => {
-							log_multi!(INFO, MAIN_LOG, "Request log rotated.");
+							log_multi!(INFO, MAIN_LOG, "requestlog rotated.");
 						}
 						Err(e) => {
 							log_multi!(
@@ -671,7 +792,7 @@ impl HttpServer {
 					},
 					RotationStatus::NotNeeded => {}
 					RotationStatus::AutoRotated => {
-						log_multi!(INFO, MAIN_LOG, "Request log was auto-rotated.");
+						log_multi!(INFO, MAIN_LOG, "requestlog rotated.");
 					}
 				},
 				Err(e) => {
@@ -721,7 +842,7 @@ impl HttpServer {
 			}
 
 			if auto_rotate_complete {
-				log_multi!(INFO, MAIN_LOG, "mainlog was auto-rotated.");
+				log_multi!(INFO, MAIN_LOG, "mainlog rotated.");
 			} else if rotate_complete {
 				log_multi!(INFO, MAIN_LOG, "mainlog rotated.");
 			}
@@ -795,6 +916,72 @@ impl HttpServer {
 		Ok(())
 	}
 
+	fn house_keeper(
+		http_context: Arc<RwLock<HttpContext>>,
+		http_config: &HttpConfig,
+	) -> Result<(), Error> {
+		loop {
+			std::thread::sleep(std::time::Duration::from_millis(1000));
+			let http_context = http_context.write().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
+				error
+			})?;
+
+			let map = http_context.map.write().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
+				error
+			})?;
+
+			let now = SystemTime::now();
+			let since_the_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
+			let time_now = since_the_epoch.as_millis();
+			let last_request_timeout = http_config.last_request_timeout;
+			let read_timeout = http_config.read_timeout;
+
+			for (k, v) in &*map {
+				match Self::check_idle(time_now, v, last_request_timeout, read_timeout) {
+					Ok(_) => {}
+					Err(e) => {
+						log_multi!(
+							ERROR,
+							MAIN_LOG,
+							"unexpected error in check_idle ConnData for {}, err={}",
+							k,
+							e.to_string(),
+						);
+					}
+				}
+			}
+
+			if http_context.stop {
+				break;
+			}
+		}
+		Ok(())
+	}
+
+	fn check_idle(
+		time_now: u128,
+		conn_data: &Arc<RwLock<ConnData>>,
+		last_request_timeout: u128,
+		read_timeout: u128,
+	) -> Result<(), Error> {
+		let conn_data = conn_data.write().unwrap();
+		if conn_data.last_request_time != 0
+			&& time_now - conn_data.last_request_time > last_request_timeout
+		{
+			conn_data.wh.close()?;
+		}
+
+		if conn_data.last_request_time == 0 && time_now - conn_data.create_time > read_timeout {
+			conn_data.wh.close()?;
+		}
+
+		Ok(())
+	}
+
 	fn process_accept(
 		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
@@ -829,7 +1016,7 @@ impl HttpServer {
 		len: usize,
 		wh: WriteHandle,
 	) -> Result<(), Error> {
-		let conn_context = {
+		let (conn_context, mappings) = {
 			let http_context = http_context.write().map_err(|e| {
 				let error: Error =
 					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
@@ -845,7 +1032,7 @@ impl HttpServer {
 			let conn_context = map.get_mut(&wh.get_connection_id());
 
 			match conn_context {
-				Some(context) => context.clone(),
+				Some(context) => (context.clone(), http_context.api_mappings.clone()),
 				None => {
 					log_multi!(
 						ERROR,
@@ -874,13 +1061,19 @@ impl HttpServer {
 				error
 			})?;
 
+			let start = SystemTime::now();
+			let since_the_epoch = start
+				.duration_since(UNIX_EPOCH)
+				.expect("Time went backwards");
+			conn_context.last_request_time = since_the_epoch.as_millis();
+
 			for i in 0..len {
 				conn_context.buffer.push(buf[i]);
 			}
 		}
 
 		thread_pool.execute(async move {
-			match Self::process_request(&http_config, conn_context, wh, http_context) {
+			match Self::process_request(&http_config, conn_context, wh, http_context, mappings) {
 				Ok(_) => {}
 				Err(e) => {
 					log_multi!(
@@ -901,6 +1094,7 @@ impl HttpServer {
 		conn_context: Arc<RwLock<ConnData>>,
 		wh: WriteHandle,
 		http_context: Arc<RwLock<HttpContext>>,
+		mappings: HashSet<String>,
 	) -> Result<(), Error> {
 		let mut conn_context = conn_context
 			.write()
@@ -1038,7 +1232,11 @@ impl HttpServer {
 						let uri = std::str::from_utf8(&uri_path[..])?;
 						let query = std::str::from_utf8(&query_string[..])?;
 
-						Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
+						if mappings.get(uri).is_some() {
+							(config.callback)(&config, &wh, http_version, uri, keep_alive)?;
+						} else {
+							Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
+						}
 
 						let mut http_context = http_context.write().map_err(|e| {
 							let error: Error = ErrorKind::PoisonError(format!(
