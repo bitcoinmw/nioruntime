@@ -477,6 +477,22 @@ impl HttpServer {
 		Ok(())
 	}
 
+	fn format_qps(num: f64) -> String {
+		if num < 10.0 {
+			format!("{:.7}", num)
+		} else if num < 100.0 {
+			format!("{:.6}", num)
+		} else if num < 1_000.0 {
+			format!("{:.5}", num)
+		} else if num < 10_000.0 {
+			format!("{:.4}", num)
+		} else if num < 100_000.0 {
+			format!("{:.3}", num)
+		} else {
+			format!("{:.2}", num)
+		}
+	}
+
 	fn stats_log(
 		http_context: Arc<RwLock<HttpContext>>,
 		http_config: HttpConfig,
@@ -517,11 +533,11 @@ impl HttpServer {
 				log_no_ts_multi!(
 					INFO,
 					STATS_LOG,
-					"      Cumulative     | {:12}{:12}{:12}   {:.7}",
+					"      Cumulative     | {:12}{:12}{:12}   {}",
 					http_context.stats.requests,
 					http_context.stats.conns,
 					http_context.stats.connects,
-					http_context.stats.requests as f64 / secs as f64,
+					Self::format_qps(http_context.stats.requests as f64 / secs as f64),
 				);
 				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
 			}
@@ -529,11 +545,11 @@ impl HttpServer {
 			log_multi!(
 				INFO,
 				STATS_LOG,
-				"{:12}{:12}{:12}   {:.7}",
+				"{:12}{:12}{:12}   {}",
 				http_context.stats.requests - last_requests,
 				http_context.stats.conns,
 				http_context.stats.connects - last_connects,
-				qps,
+				Self::format_qps(qps),
 			);
 
 			if http_context.stop {
