@@ -30,6 +30,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 debug!();
 
@@ -91,6 +92,7 @@ pub struct HttpConfig {
 	pub main_log_max_age_millis: u128,
 	pub stats_log_max_size: u64,
 	pub stats_log_max_age_millis: u128,
+	pub debug: bool,
 }
 
 impl Default for HttpConfig {
@@ -115,17 +117,30 @@ impl Default for HttpConfig {
 			main_log_max_age_millis: 1000 * 60 * 60,    // 1 hr
 			stats_log_max_size: 10 * 1024 * 1024,       // 10 mb
 			stats_log_max_age_millis: 1000 * 60 * 60,   // 1 hr
+			debug: false,
 		}
 	}
 }
 
 struct ConnData {
 	buffer: Vec<u8>,
+	wh: WriteHandle,
+	create_time: u128,
+	last_request_time: u128,
 }
 
 impl ConnData {
-	fn new() -> Self {
-		ConnData { buffer: vec![] }
+	fn new(wh: WriteHandle) -> Self {
+		let start = SystemTime::now();
+		let since_the_epoch = start
+			.duration_since(UNIX_EPOCH)
+			.expect("Time went backwards");
+		ConnData {
+			buffer: vec![],
+			wh,
+			create_time: since_the_epoch.as_millis(),
+			last_request_time: 0,
+		}
 	}
 }
 
@@ -367,12 +382,13 @@ impl HttpServer {
 				wh,
 			)
 		})?;
-		eh.set_on_accept(move |id| {
+		eh.set_on_accept(move |id, wh| {
 			Self::process_accept(
 				thread_pool_clone2.clone(),
 				http_context_clone.clone(),
 				http_config_clone.clone(),
 				id,
+				wh,
 			)
 		})?;
 		eh.set_on_client_read(|_, _, _| Ok(()))?;
@@ -440,7 +456,9 @@ impl HttpServer {
 			MAIN_LOG,
 			LogConfig {
 				file_path: format!("{}/logs/mainlog.log", self.config.root_dir),
-				show_stdout: false,
+				show_stdout: self.config.debug,
+				max_age_millis: self.config.main_log_max_age_millis,
+				max_size: self.config.main_log_max_size,
 				..Default::default()
 			}
 		)?;
@@ -507,6 +525,8 @@ impl HttpServer {
 				file_path: format!("{}/logs/statslog.log", http_config.root_dir),
 				show_stdout: false,
 				file_header: file_header.clone(),
+				max_age_millis: http_config.stats_log_max_age_millis,
+				max_size: http_config.stats_log_max_size,
 				..Default::default()
 			}
 		)?;
@@ -665,34 +685,45 @@ impl HttpServer {
 			}
 
 			// check rotation of mainlog:
-			let static_log = &LOG;
-			let log_map = static_log.lock();
-			match log_map {
-				Ok(mut log_map) => {
-					let log = log_map.get_mut(MAIN_LOG);
-					match log {
-						Some(log) => {
-							match log.rotation_status()? {
-								RotationStatus::Needed => match log.rotate() {
-									Ok(_) => {
-										log_multi!(INFO, MAIN_LOG, "mainlog rotated.");
+			let mut rotate_complete = false;
+			let mut auto_rotate_complete = false;
+			{
+				let static_log = &LOG;
+				let log_map = static_log.lock();
+
+				match log_map {
+					Ok(mut log_map) => {
+						let log = log_map.get_mut(MAIN_LOG);
+						match log {
+							Some(log) => {
+								match log.rotation_status()? {
+									RotationStatus::Needed => match log.rotate() {
+										Ok(_) => {
+											rotate_complete = true;
+										}
+										Err(e) => {
+											println!("unexpected mainlog err: {}", e.to_string());
+										}
+									},
+									RotationStatus::AutoRotated => {
+										auto_rotate_complete = true;
 									}
-									Err(e) => {
-										println!("unexpected mainlog err: {}", e.to_string());
-									}
-								},
-								RotationStatus::AutoRotated => {
-									log_multi!(INFO, MAIN_LOG, "mainlog was auto-rotated.");
-								}
-								RotationStatus::NotNeeded => {}
-							};
+									RotationStatus::NotNeeded => {}
+								};
+							}
+							None => {}
 						}
-						None => {}
+					}
+					Err(e) => {
+						println!("Unexpected error rotate mainlog: {}", e.to_string());
 					}
 				}
-				Err(e) => {
-					println!("Unexpected error rotate mainlog: {}", e.to_string());
-				}
+			}
+
+			if auto_rotate_complete {
+				log_multi!(INFO, MAIN_LOG, "mainlog was auto-rotated.");
+			} else if rotate_complete {
+				log_multi!(INFO, MAIN_LOG, "mainlog rotated.");
 			}
 		}
 
@@ -769,6 +800,7 @@ impl HttpServer {
 		http_context: Arc<RwLock<HttpContext>>,
 		_http_config: HttpConfig,
 		id: u128,
+		wh: WriteHandle,
 	) -> Result<(), Error> {
 		let mut http_context = http_context.write().map_err(|e| {
 			let error: Error =
@@ -785,7 +817,7 @@ impl HttpServer {
 			error
 		})?;
 
-		map.insert(id, Arc::new(RwLock::new(ConnData::new())));
+		map.insert(id, Arc::new(RwLock::new(ConnData::new(wh))));
 		Ok(())
 	}
 

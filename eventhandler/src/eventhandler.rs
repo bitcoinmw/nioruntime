@@ -508,7 +508,7 @@ struct GuardedData {
 ///     })?;
 ///
 ///     // don't do anything with the accept callback for now
-///     eh.set_on_accept(|_| Ok(()))?;
+///     eh.set_on_accept(|_,_| Ok(()))?;
 ///     // don't do anything with the close callback for now
 ///     eh.set_on_close(|_| Ok(()))?;
 ///     // assert that the client receives the echoed message back exactly
@@ -553,7 +553,7 @@ pub struct EventHandler<F, G, H, K> {
 impl<F, G, H, K> EventHandler<F, G, H, K>
 where
 	F: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
-	G: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
+	G: Fn(u128, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	K: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 {
@@ -692,7 +692,7 @@ where
 	///         let _ = wh.write(buf, 0, len, false);
 	///         Ok(())
 	///     })?;
-	///     eh.set_on_accept(|_| Ok(()))?;
+	///     eh.set_on_accept(|_,_| Ok(()))?;
 	///     eh.set_on_client_read(|_,_,_| Ok(()))?;
 	///     eh.set_on_close(|_| Ok(()))?;
 	///     Ok(())
@@ -726,7 +726,7 @@ where
 	/// fn main() -> Result<(), Error> {
 	///     let mut eh = EventHandler::new();
 	///     // print out a message when a new connection is accepted
-	///     eh.set_on_accept(|connection_id| {
+	///     eh.set_on_accept(|connection_id, _| {
 	///         info!("accepted connection with id = {}", connection_id);
 	///         Ok(())
 	///     })?;
@@ -772,7 +772,7 @@ where
 	///     })?;
 	///     eh.set_on_read(|_,_,_|  Ok(()))?;
 	///     eh.set_on_client_read(|_,_,_| Ok(()))?;
-	///     eh.set_on_accept(|_| Ok(()))?;
+	///     eh.set_on_accept(|_,_| Ok(()))?;
 	///     Ok(())
 	/// }
 	/// ```
@@ -813,7 +813,7 @@ where
 	///     })?;
 	///     eh.set_on_close(|_| Ok(()))?;
 	///     eh.set_on_read(|_,_,_|  Ok(()))?;
-	///     eh.set_on_accept(|_| Ok(()))?;
+	///     eh.set_on_accept(|_,_| Ok(()))?;
 	///     Ok(())
 	/// }
 	/// ```
@@ -2258,16 +2258,26 @@ where
 
 					let accept_res = Self::process_accept_result(fd, res, &guarded_data, fd_locks);
 					match accept_res {
-						Ok(_) => {}
+						Ok(_) => {
+							let wh = WriteHandle::new(
+								res,
+								guarded_data.clone(),
+								seqno,
+								Some(fd_locks[res as usize].clone()),
+							);
+							let accept_res = (on_accept)(seqno as u128, wh);
+							match accept_res {
+								Ok(_) => {}
+								Err(e) => {
+									info!("on_accept callback resulted in: {}", e.to_string())
+								}
+							}
+						}
 						Err(e) => {
 							info!("process_accept_result resulted in: {}", e.to_string())
 						}
 					}
-					let accept_res = (on_accept)(seqno as u128);
-					match accept_res {
-						Ok(_) => {}
-						Err(e) => info!("on_accept callback resulted in: {}", e.to_string()),
-					}
+
 					Ok(())
 				} else {
 					Self::process_accept_err(fd, "accept error".to_string())
@@ -2649,7 +2659,7 @@ fn test_echo() -> Result<(), Error> {
 		Ok(())
 	})?;
 
-	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_accept(|_, _| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 	let client_buf = Arc::new(Mutex::new(vec![]));
 	eh.set_on_client_read(move |buf, len, _wh| {
@@ -2733,7 +2743,7 @@ fn test_close() -> Result<(), Error> {
 		Ok(())
 	})?;
 
-	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_accept(|_, _| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 	eh.set_on_client_read(move |_buf, _len, _wh| Ok(()))?;
 
@@ -2786,7 +2796,7 @@ fn test_client() -> Result<(), Error> {
 		Ok(())
 	})?;
 
-	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_accept(|_, _| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 	eh.set_on_client_read(move |buf, len, _wh| {
 		info!("client_read={:?}", &buf[0..len]);
@@ -2822,7 +2832,7 @@ fn test_stop() -> Result<(), Error> {
 		Ok(())
 	})?;
 
-	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_accept(|_, _| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 	eh.set_on_client_read(move |_, _, _| Ok(()))?;
 
@@ -2878,7 +2888,7 @@ fn test_large_messages() -> Result<(), Error> {
 	msgbuf.push(128);
 	let cloned_msgbuf = msgbuf.clone();
 
-	eh.set_on_accept(|_| Ok(()))?;
+	eh.set_on_accept(|_, _| Ok(()))?;
 	eh.set_on_close(|_| Ok(()))?;
 
 	let client_accumulator = Arc::new(Mutex::new(vec![]));

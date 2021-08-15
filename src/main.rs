@@ -238,6 +238,9 @@ fn real_main() -> Result<(), Error> {
 	if http {
 		let config = HttpConfig {
 			//request_log_max_age_millis: 30_000,
+			//main_log_max_age_millis: 30_000,
+			//stats_log_max_age_millis: 30_000,
+			debug: true,
 			..Default::default()
 		};
 		let mut http_server: HttpServer = HttpServer::new(config);
@@ -356,7 +359,7 @@ fn real_main() -> Result<(), Error> {
 			wh.write(&buf.to_vec(), 0, len, false)?;
 			Ok(())
 		})?;
-		eh.set_on_accept(move |connection_id| {
+		eh.set_on_accept(move |connection_id, _wh| {
 			let mut buffers = buffers.lock().unwrap();
 
 			buffers.insert(connection_id, Buffer::new());
