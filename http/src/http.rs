@@ -1277,7 +1277,7 @@ impl HttpServer {
 							let mut found_sep = false;
 							let mut found_sep_plus_1 = false;
 							for k in 0..header_j_len {
-								if headers_vec[j][k] == ':' as u8 {
+								if !found_sep && headers_vec[j][k] == ':' as u8 {
 									found_sep = true;
 								} else if !found_sep {
 									sep_headers_vec[j].0.push(headers_vec[j][k]);
