@@ -208,6 +208,7 @@ struct HttpContext {
 	log_queue: Vec<RequestLogItem>,
 	stats: HttpStats,
 	api_mappings: HashSet<String>,
+	api_extensions: HashSet<String>,
 }
 
 impl HttpContext {
@@ -218,6 +219,7 @@ impl HttpContext {
 			log_queue: vec![],
 			stats: HttpStats::new(),
 			api_mappings: HashSet::new(),
+			api_extensions: HashSet::new(),
 		}
 	}
 }
@@ -268,7 +270,29 @@ impl HttpServer {
 		}
 	}
 
-	pub fn add_mapping(&self, path: String) -> Result<(), Error> {
+	pub fn add_api_extension(&self, extension: String) -> Result<(), Error> {
+		match &self.http_context {
+			Some(http_context) => {
+				let mut context = http_context.write().map_err(|e| {
+					let error: Error =
+						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+							.into();
+					error
+				})?;
+				context.api_extensions.insert(extension.to_lowercase());
+			}
+			None => {
+				return Err(ErrorKind::SetupError(
+					"Context not set, must call start first.".to_string(),
+				)
+				.into());
+			}
+		}
+
+		Ok(())
+	}
+
+	pub fn add_api_mapping(&self, path: String) -> Result<(), Error> {
 		match &self.http_context {
 			Some(http_context) => {
 				let mut context = http_context.write().map_err(|e| {
@@ -1083,7 +1107,7 @@ impl HttpServer {
 		len: usize,
 		wh: WriteHandle,
 	) -> Result<(), Error> {
-		let (conn_data, mappings) = {
+		let (conn_data, mappings, extensions) = {
 			let http_context = http_context.write().map_err(|e| {
 				let error: Error =
 					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
@@ -1099,7 +1123,11 @@ impl HttpServer {
 			let conn_data = map.get_mut(&wh.get_connection_id());
 
 			match conn_data {
-				Some(conn_data) => (conn_data.clone(), http_context.api_mappings.clone()),
+				Some(conn_data) => (
+					conn_data.clone(),
+					http_context.api_mappings.clone(),
+					http_context.api_extensions.clone(),
+				),
 				None => {
 					log_multi!(
 						ERROR,
@@ -1140,7 +1168,14 @@ impl HttpServer {
 		}
 
 		thread_pool.execute(async move {
-			match Self::process_request(&http_config, conn_data, wh, http_context, mappings) {
+			match Self::process_request(
+				&http_config,
+				conn_data,
+				wh,
+				http_context,
+				mappings,
+				extensions,
+			) {
 				Ok(_) => {}
 				Err(e) => {
 					log_multi!(
@@ -1162,6 +1197,7 @@ impl HttpServer {
 		wh: WriteHandle,
 		http_context: Arc<RwLock<HttpContext>>,
 		mappings: HashSet<String>,
+		extensions: HashSet<String>,
 	) -> Result<(), Error> {
 		let mut log_item = None;
 		{
@@ -1362,7 +1398,14 @@ impl HttpServer {
 							info!("method={:?},uri={},query={}", method, uri, query);
 						}
 
-						if mappings.get(uri).is_some() {
+						let last_dot = uri.rfind('.');
+						let extension = match last_dot {
+							Some(pos) => &uri[(pos + 1)..],
+							None => "",
+						}
+						.to_lowercase();
+
+						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
 							(config.callback)(
 								match has_content {
 									true => &buffer[start_buf..end_buf + 1],

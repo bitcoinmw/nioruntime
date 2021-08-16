@@ -245,7 +245,8 @@ fn real_main() -> Result<(), Error> {
 		};
 		let mut http_server: HttpServer = HttpServer::new(config);
 		http_server.start()?;
-		http_server.add_mapping("/rustlet".to_string())?;
+		http_server.add_api_mapping("/rustlet".to_string())?;
+		http_server.add_api_extension("rsp".to_string())?;
 		std::thread::park();
 	} else if client {
 		info!("Running client");
