@@ -225,7 +225,7 @@ impl HttpContext {
 }
 
 pub struct HttpServer {
-	config: HttpConfig,
+	pub config: HttpConfig,
 	listener: Option<TcpListener>,
 	http_context: Option<Arc<RwLock<HttpContext>>>,
 	thread_pool: Option<Arc<RwLock<StaticThreadPool>>>,
