@@ -79,14 +79,24 @@ pub enum HttpVersion {
 	V11,
 }
 
-type Callback = fn(&HttpConfig, &WriteHandle, HttpVersion, &str, bool) -> Result<(), Error>;
+type Callback = fn(
+	&HttpConfig,
+	&WriteHandle,
+	HttpVersion,
+	&str,
+	&str,
+	Vec<(Vec<u8>, Vec<u8>)>,
+	bool,
+) -> Result<(), Error>;
 
 fn empty_callback(
 	_: &HttpConfig,
 	_: &WriteHandle,
 	_: HttpVersion,
-	_: &str,
-	_: bool,
+	_: &str,                    // uri
+	_: &str,                    // query
+	_: Vec<(Vec<u8>, Vec<u8>)>, // headers
+	_: bool,                    // keep-alive
 ) -> Result<(), Error> {
 	Ok(())
 }
@@ -147,6 +157,7 @@ struct ConnData {
 	wh: WriteHandle,
 	create_time: u128,
 	last_request_time: u128,
+	needed_len: usize,
 }
 
 impl ConnData {
@@ -160,6 +171,7 @@ impl ConnData {
 			wh,
 			create_time: since_the_epoch.as_millis(),
 			last_request_time: 0,
+			needed_len: 0,
 		}
 	}
 }
@@ -1153,184 +1165,209 @@ impl HttpServer {
 				error
 			})
 			.unwrap();
-		let _connection_id = conn_context.wh.get_connection_id();
+
+		if conn_context.needed_len != 0 && conn_context.buffer.len() < conn_context.needed_len {
+			// data not sufficient return and wait for more data
+			return Ok(());
+		} else {
+			conn_context.needed_len = 0;
+		}
+
+		let connection_id = conn_context.wh.get_connection_id();
 		let buffer = &mut conn_context.buffer;
 		// iterate through and try to find a double line break. If we find it,
 		// send to next function for processing and delete the data that we send.
-		loop {
-			let len = buffer.len();
-			if len <= 3 {
-				break;
-			}
-			let mut response_sent = false;
-			let mut end_buf;
-			for i in 3..len {
-				end_buf = i;
-				if (buffer[i - 3] == '\r' as u8
+		let len = buffer.len();
+
+		if len <= 3 {
+			// not enough data, go away until more is available
+			return Ok(());
+		}
+		let mut end_buf;
+		let mut update_needed_len = 0;
+		for i in 3..len {
+			end_buf = i;
+			if (buffer[i - 3] == '\r' as u8
 				&& buffer[i - 2] == '\n' as u8
 				&& buffer[i - 1] == '\r' as u8
 				&& buffer[i] == '\n' as u8)
 				// we are tolerant of the incorrect format too
 				|| (buffer[i - 1] == '\n' as u8 && buffer[i] == '\n' as u8)
+			{
+				// end of a request found.
+				if len < 6
+					|| (buffer[0..4] != ['G' as u8, 'E' as u8, 'T' as u8, ' ' as u8]
+						&& (buffer[0..5]
+							!= ['P' as u8, 'O' as u8, 'S' as u8, 'T' as u8, ' ' as u8]))
 				{
-					// end of a request found.
-					response_sent = true;
-					if len < 6
-						|| (buffer[0..4] != ['G' as u8, 'E' as u8, 'T' as u8, ' ' as u8]
-							&& (buffer[0..5]
-								!= ['P' as u8, 'O' as u8, 'S' as u8, 'T' as u8, ' ' as u8]))
-					{
-						// only accept GET/POST for now
-						Self::send_bad_request_error(&wh)?;
+					// only accept GET/POST for now
+					warn!(
+						"invalid request on connection_id = {}, data = '{:?}'",
+						connection_id,
+						std::str::from_utf8(&buffer[0..len]),
+					);
+					Self::send_bad_request_error(&wh)?;
+					break;
+				} else {
+					let method = if buffer[0] == 'G' as u8 {
+						HttpMethod::Get
 					} else {
-						let method = if buffer[0] == 'G' as u8 {
-							HttpMethod::Get
-						} else {
-							HttpMethod::Post
-						};
-						let mut space_count = 0;
-						let mut uri = vec![];
-						let mut http_ver_string = vec![];
+						HttpMethod::Post
+					};
+					let mut space_count = 0;
+					let mut uri = vec![];
+					let mut http_ver_string = vec![];
 
-						for j in 0..len {
-							if buffer[j] == ' ' as u8
-								|| buffer[j] == '\r' as u8 || buffer[j] == '\n' as u8
-							{
-								space_count += 1;
+					for j in 0..len {
+						if buffer[j] == ' ' as u8
+							|| buffer[j] == '\r' as u8 || buffer[j] == '\n' as u8
+						{
+							space_count += 1;
+						}
+						if space_count == 1 {
+							if buffer[j] != ' ' as u8 {
+								uri.push(buffer[j]);
 							}
-							if space_count == 1 {
-								if buffer[j] != ' ' as u8 {
-									uri.push(buffer[j]);
-								}
-							} else if space_count == 2 {
-								if buffer[j] != ' ' as u8 {
-									http_ver_string.push(buffer[j]);
-								}
-							} else if space_count > 2 {
+						} else if space_count == 2 {
+							if buffer[j] != ' ' as u8 {
+								http_ver_string.push(buffer[j]);
+							}
+						} else if space_count > 2 {
+							break;
+						}
+					}
+
+					// get headers
+					let mut nl_count = 0;
+					let mut headers_vec = vec![];
+					for j in 0..len {
+						if buffer[j] == '\n' as u8 {
+							nl_count += 1;
+							if j + 2 < len
+								&& buffer[j + 1] == '\r' as u8 && buffer[j + 2] == '\n' as u8
+							{
 								break;
 							}
+							headers_vec.push(vec![]);
 						}
-
-						// get headers
-						let mut nl_count = 0;
-						let mut headers_vec = vec![];
-						for j in 0..len {
-							if buffer[j] == '\n' as u8 {
-								nl_count += 1;
-								if j + 2 < len
-									&& buffer[j + 1] == '\r' as u8 && buffer[j + 2] == '\n' as u8
-								{
-									break;
-								}
-								headers_vec.push(vec![]);
-							}
-							if buffer[j] != '\n' as u8 && nl_count > 0 {
-								headers_vec[nl_count - 1].push(buffer[j]);
-							}
+						if buffer[j] != '\n' as u8 && nl_count > 0 {
+							headers_vec[nl_count - 1].push(buffer[j]);
 						}
-
-						let mut sep_headers_vec = vec![];
-						let headers_vec_len = headers_vec.len();
-						let mut keep_alive = false;
-						for j in 0..headers_vec_len {
-							let header_j_len = headers_vec[j].len();
-							sep_headers_vec.push((vec![], vec![]));
-							let mut found_sep = false;
-							let mut found_sep_plus_1 = false;
-							for k in 0..header_j_len {
-								if headers_vec[j][k] == ':' as u8 {
-									found_sep = true;
-								} else if !found_sep {
-									sep_headers_vec[j].0.push(headers_vec[j][k]);
-								} else {
-									if found_sep_plus_1 {
-										if headers_vec[j][k] != '\r' as u8
-											&& headers_vec[j][k] != '\n' as u8
-										{
-											sep_headers_vec[j].1.push(headers_vec[j][k]);
-										}
-									}
-									found_sep_plus_1 = true;
-								}
-							}
-							let header = std::str::from_utf8(&sep_headers_vec[j].0[..])?;
-							let value = std::str::from_utf8(&sep_headers_vec[j].1[..])?;
-							if header == "Connection" && value == "keep-alive" {
-								keep_alive = true;
-							}
-
-							if header == "Content-Length" {
-								let content_len: Result<usize, ParseIntError> = value.parse();
-								match content_len {
-									Ok(content_len) => {
-										end_buf += content_len;
-										if end_buf >= len {
-											// we don't have enough data
-											// return here and wait for more
-											return Ok(());
-										}
-									}
-									Err(e) => {
-										log_multi!(
-											ERROR,
-											MAIN_LOG,
-											"Invalid content-len: {}, value={}",
-											e.to_string(),
-											value,
-										);
-									}
-								}
-							}
-						}
-
-						let http_ver_string = std::str::from_utf8(&http_ver_string[..])?;
-						let http_version =
-							if http_ver_string == "HTTP/1.1" || http_ver_string == "HTTP/2.0" {
-								HttpVersion::V11 // we use 1.1 responses for 2.0 for now
-							} else {
-								keep_alive = false;
-								HttpVersion::V10
-							};
-
-						let mut query_string = vec![];
-						let mut uri_path = vec![];
-						let mut start_query = false;
-						for j in 0..uri.len() {
-							if !start_query && uri[j] != '?' as u8 {
-								uri_path.push(uri[j]);
-							} else if !start_query && uri[j] == '?' as u8 {
-								start_query = true;
-							} else {
-								query_string.push(uri[j]);
-							}
-						}
-						let uri = std::str::from_utf8(&uri_path[..])?;
-						let query = std::str::from_utf8(&query_string[..])?;
-
-						if mappings.get(uri).is_some() {
-							(config.callback)(&config, &wh, http_version, uri, keep_alive)?;
-						} else {
-							Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
-						}
-
-						let mut http_context = http_context.write().map_err(|e| {
-							let error: Error = ErrorKind::PoisonError(format!(
-								"unexpected error: {}",
-								e.to_string()
-							))
-							.into();
-							error
-						})?;
-
-						http_context.log_queue.push(RequestLogItem::new(
-							uri.to_string(),
-							query.to_string(),
-							sep_headers_vec,
-							method,
-						));
-
-						http_context.stats.requests += 1;
 					}
+
+					let mut sep_headers_vec = vec![];
+					let headers_vec_len = headers_vec.len();
+					let mut keep_alive = false;
+					let mut content_complete = true;
+					for j in 0..headers_vec_len {
+						let header_j_len = headers_vec[j].len();
+						sep_headers_vec.push((vec![], vec![]));
+						let mut found_sep = false;
+						let mut found_sep_plus_1 = false;
+						for k in 0..header_j_len {
+							if headers_vec[j][k] == ':' as u8 {
+								found_sep = true;
+							} else if !found_sep {
+								sep_headers_vec[j].0.push(headers_vec[j][k]);
+							} else {
+								if found_sep_plus_1 {
+									if headers_vec[j][k] != '\r' as u8
+										&& headers_vec[j][k] != '\n' as u8
+									{
+										sep_headers_vec[j].1.push(headers_vec[j][k]);
+									}
+								}
+								found_sep_plus_1 = true;
+							}
+						}
+						let header = std::str::from_utf8(&sep_headers_vec[j].0[..])?;
+						let value = std::str::from_utf8(&sep_headers_vec[j].1[..])?;
+						if header == "Connection" && value == "keep-alive" {
+							keep_alive = true;
+						}
+
+						if header == "Content-Length" {
+							let content_len: Result<usize, ParseIntError> = value.parse();
+							match content_len {
+								Ok(content_len) => {
+									end_buf += content_len;
+									if end_buf >= len {
+										// we don't have enough data
+										// return here and wait for more
+										update_needed_len = end_buf;
+										content_complete = false;
+									}
+								}
+								Err(e) => {
+									log_multi!(
+										ERROR,
+										MAIN_LOG,
+										"Invalid content-len: {}, value={}",
+										e.to_string(),
+										value,
+									);
+								}
+							}
+						}
+					}
+
+					if !content_complete {
+						break;
+					}
+
+					let http_ver_string = std::str::from_utf8(&http_ver_string[..])?;
+					let http_version =
+						if http_ver_string == "HTTP/1.1" || http_ver_string == "HTTP/2.0" {
+							HttpVersion::V11 // we use 1.1 responses for 2.0 for now
+						} else {
+							keep_alive = false;
+							HttpVersion::V10
+						};
+
+					let mut query_string = vec![];
+					let mut uri_path = vec![];
+					let mut start_query = false;
+					for j in 0..uri.len() {
+						if !start_query && uri[j] != '?' as u8 {
+							uri_path.push(uri[j]);
+						} else if !start_query && uri[j] == '?' as u8 {
+							start_query = true;
+						} else {
+							query_string.push(uri[j]);
+						}
+					}
+					let uri = std::str::from_utf8(&uri_path[..])?;
+					let query = std::str::from_utf8(&query_string[..])?;
+
+					if mappings.get(uri).is_some() {
+						(config.callback)(
+							&config,
+							&wh,
+							http_version,
+							uri,
+							query,
+							sep_headers_vec.clone(),
+							keep_alive,
+						)?;
+					} else {
+						Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
+					}
+
+					let mut http_context = http_context.write().map_err(|e| {
+						let error: Error =
+							ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+								.into();
+						error
+					})?;
+
+					http_context.log_queue.push(RequestLogItem::new(
+						uri.to_string(),
+						query.to_string(),
+						sep_headers_vec,
+						method,
+					));
+
+					http_context.stats.requests += 1;
 
 					for _ in 0..end_buf + 1 {
 						buffer.remove(0);
@@ -1339,10 +1376,12 @@ impl HttpServer {
 					break;
 				}
 			}
-			if !response_sent {
-				break;
-			}
 		}
+
+		if update_needed_len != 0 {
+			conn_context.needed_len = update_needed_len;
+		}
+
 		Ok(())
 	}
 
