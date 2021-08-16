@@ -82,6 +82,7 @@ pub enum HttpVersion {
 }
 
 type Callback = fn(
+	&[u8],
 	HttpMethod,
 	&HttpConfig,
 	&WriteHandle,
@@ -93,6 +94,7 @@ type Callback = fn(
 ) -> Result<(), Error>;
 
 fn empty_callback(
+	_: &[u8],
 	_: HttpMethod,
 	_: &HttpConfig,
 	_: &WriteHandle,
@@ -1191,8 +1193,11 @@ impl HttpServer {
 				return Ok(());
 			}
 			let mut end_buf;
+			let mut start_buf;
 			let mut update_needed_len = 0;
+			let mut has_content = false;
 			for i in 3..len {
+				start_buf = i + 1;
 				end_buf = i;
 				if (buffer[i - 3] == '\r' as u8
 				&& buffer[i - 2] == '\n' as u8
@@ -1294,6 +1299,7 @@ impl HttpServer {
 							}
 
 							if header == "Content-Length" {
+								has_content = true;
 								let content_len: Result<usize, ParseIntError> = value.parse();
 								match content_len {
 									Ok(content_len) => {
@@ -1358,6 +1364,10 @@ impl HttpServer {
 
 						if mappings.get(uri).is_some() {
 							(config.callback)(
+								match has_content {
+									true => &buffer[start_buf..end_buf + 1],
+									false => &[0u8; 0],
+								},
 								method.clone(),
 								&config,
 								&wh,
