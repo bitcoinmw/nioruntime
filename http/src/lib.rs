@@ -14,4 +14,4 @@
 
 mod http;
 
-pub use crate::http::{HttpConfig, HttpServer};
+pub use crate::http::{HttpConfig, HttpMethod, HttpServer, HttpVersion, WriteHandle};

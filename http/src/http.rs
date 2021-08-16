@@ -15,7 +15,7 @@
 use bytefmt;
 use dirs;
 use log::*;
-use nioruntime_evh::{EventHandler, WriteHandle};
+pub use nioruntime_evh::{EventHandler, WriteHandle};
 use nioruntime_util::threadpool::StaticThreadPool;
 use nioruntime_util::{Error, ErrorKind};
 use num_format::{Locale, ToFormattedString};
