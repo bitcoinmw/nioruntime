@@ -73,7 +73,7 @@ pub enum HttpMethod {
 	Post,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum HttpVersion {
 	V20,
 	V11,
