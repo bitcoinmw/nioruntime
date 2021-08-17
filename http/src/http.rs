@@ -85,7 +85,7 @@ type Callback = fn(
 	&[u8],
 	HttpMethod,
 	HttpConfig,
-	&WriteHandle,
+	WriteHandle,
 	HttpVersion,
 	&str,
 	&str,
@@ -97,7 +97,7 @@ fn empty_callback(
 	_: &[u8],
 	_: HttpMethod,
 	_: HttpConfig,
-	_: &WriteHandle,
+	_: WriteHandle,
 	_: HttpVersion,
 	_: &str,                    // uri
 	_: &str,                    // query
@@ -1413,7 +1413,7 @@ impl HttpServer {
 								},
 								method.clone(),
 								config,
-								&wh,
+								wh,
 								http_version,
 								uri,
 								query,
