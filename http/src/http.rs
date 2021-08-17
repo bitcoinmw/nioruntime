@@ -1569,7 +1569,7 @@ impl HttpServer {
 		Ok(())
 	}
 
-	fn write_headers(
+	pub fn write_headers(
 		wh: &WriteHandle,
 		config: &HttpConfig,
 		found: bool,
