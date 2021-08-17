@@ -84,7 +84,7 @@ pub enum HttpVersion {
 type Callback = fn(
 	&[u8],
 	HttpMethod,
-	&HttpConfig,
+	HttpConfig,
 	&WriteHandle,
 	HttpVersion,
 	&str,
@@ -96,7 +96,7 @@ type Callback = fn(
 fn empty_callback(
 	_: &[u8],
 	_: HttpMethod,
-	_: &HttpConfig,
+	_: HttpConfig,
 	_: &WriteHandle,
 	_: HttpVersion,
 	_: &str,                    // uri
@@ -1169,7 +1169,7 @@ impl HttpServer {
 
 		thread_pool.execute(async move {
 			match Self::process_request(
-				&http_config,
+				http_config,
 				conn_data,
 				wh,
 				http_context,
@@ -1192,7 +1192,7 @@ impl HttpServer {
 	}
 
 	fn process_request(
-		config: &HttpConfig,
+		config: HttpConfig,
 		conn_data: Arc<RwLock<ConnData>>,
 		wh: WriteHandle,
 		http_context: Arc<RwLock<HttpContext>>,
@@ -1412,7 +1412,7 @@ impl HttpServer {
 									false => &[0u8; 0],
 								},
 								method.clone(),
-								&config,
+								config,
 								&wh,
 								http_version,
 								uri,
