@@ -62,16 +62,16 @@ lazy_static! {
 #[macro_export]
 macro_rules! fatal {
         () => {
-                do_log!(FATAL);
+                log::do_log!(FATAL);
         };
         ($a:expr) => {
                 {
-                        log!(FATAL, $a);
+                        log::log!(FATAL, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log!(FATAL, $a, $($b)*);
+                        log::log!(FATAL, $a, $($b)*);
                 }
         };
 }
@@ -81,12 +81,12 @@ macro_rules! fatal {
 macro_rules! fatal_no_ts {
         ($a:expr) => {
                 {
-                        log_no_ts!(FATAL, $a);
+                        log::log_no_ts!(FATAL, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log_no_ts!(FATAL, $a, $($b)*);
+                        log::log_no_ts!(FATAL, $a, $($b)*);
                 }
         };
 }
@@ -113,16 +113,16 @@ macro_rules! fatal_no_ts {
 #[macro_export]
 macro_rules! error {
         () => {
-                do_log!(ERROR);
+                log::do_log!(ERROR);
         };
         ($a:expr) => {
                 {
-                        log!(ERROR, $a);
+                        log::log!(ERROR, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log!(ERROR, $a, $($b)*);
+                        log::log!(ERROR, $a, $($b)*);
                 }
         };
 }
@@ -132,12 +132,12 @@ macro_rules! error {
 macro_rules! error_no_ts {
         ($a:expr) => {
                 {
-                        log_no_ts!(ERROR, $a);
+                        log::log_no_ts!(ERROR, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log_no_ts!(ERROR, $a, $($b)*);
+                        log::log_no_ts!(ERROR, $a, $($b)*);
                 }
         };
 }
@@ -164,16 +164,16 @@ macro_rules! error_no_ts {
 #[macro_export]
 macro_rules! warn {
         () => {
-                do_log!(WARN);
+                log::do_log!(WARN);
         };
         ($a:expr) => {
 		{
-                	log!(WARN, $a);
+                	log::log!(WARN, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log!(WARN, $a, $($b)*);
+                	log::log!(WARN, $a, $($b)*);
 		}
         };
 }
@@ -183,12 +183,12 @@ macro_rules! warn {
 macro_rules! warn_no_ts {
         ($a:expr) => {
                 {
-                	log_no_ts!(WARN, $a);
+                	log::log_no_ts!(WARN, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log_no_ts!(WARN, $a, $($b)*);
+                	log::log_no_ts!(WARN, $a, $($b)*);
 		}
         };
 }
@@ -215,16 +215,16 @@ macro_rules! warn_no_ts {
 #[macro_export]
 macro_rules! info {
 	() => {
-		do_log!(INFO);
+		log::do_log!(INFO);
 	};
         ($a:expr) => {
                 {
-                	log!(INFO, $a);
+                	log::log!(INFO, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log!(INFO, $a, $($b)*);
+                	log::log!(INFO, $a, $($b)*);
 		}
         };
 }
@@ -234,12 +234,12 @@ macro_rules! info {
 macro_rules! info_no_ts {
         ($a:expr) => {
                 {
-                	log_no_ts!(INFO, $a);
+                	log::log_no_ts!(INFO, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log_no_ts!(INFO, $a, $($b)*);
+                	log::log_no_ts!(INFO, $a, $($b)*);
 		}
         };
 }
@@ -266,7 +266,7 @@ macro_rules! info_no_ts {
 #[macro_export]
 macro_rules! debug {
 	() => {
-		do_log!(DEBUG);
+		log::do_log!(DEBUG);
 	};
         ($a:expr) => {
                 {
@@ -285,12 +285,12 @@ macro_rules! debug {
 macro_rules! debug_no_ts {
         ($a:expr) => {
                 {
-                	log_no_ts!(DEBUG, $a);
+                	log::log_no_ts!(DEBUG, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log_no_ts!(DEBUG, $a, $($b)*);
+                	log::log_no_ts!(DEBUG, $a, $($b)*);
 		}
         };
 }
@@ -317,16 +317,16 @@ macro_rules! debug_no_ts {
 #[macro_export]
 macro_rules! trace {
         () => {
-                do_log!(TRACE);
+                log::do_log!(TRACE);
         };
         ($a:expr) => {
                 {
-                        log!(TRACE, $a);
+                        log::log!(TRACE, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log!(TRACE, $a, $($b)*);
+                        log::log!(TRACE, $a, $($b)*);
                 }
         };
 }
@@ -336,12 +336,12 @@ macro_rules! trace {
 macro_rules! trace_no_ts {
         ($a:expr) => {
                 {
-                        log_no_ts!(TRACE, $a);
+                        log::log_no_ts!(TRACE, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log_no_ts!(TRACE, $a, $($b)*);
+                        log::log_no_ts!(TRACE, $a, $($b)*);
                 }
         };
 }
@@ -364,18 +364,18 @@ macro_rules! trace_no_ts {
 #[macro_export]
 macro_rules! log_multi {
 	($level:expr, $a:expr, $b:expr) => {
-		let static_log = &LOG;
+		let static_log = &log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
 				let log = log_map.get_mut($a);
 				match log {
 					Some(log) => {
-						do_log!($level, true, log, $b);
+						log::do_log!($level, true, log, $b);
 					},
 					None => {
 						let mut log = log::Log::new();
-						do_log!($level, true, log, $b);
+						log::do_log!($level, true, log, $b);
 						log_map.insert($a.to_string(), log);
 					}
 				}
@@ -390,18 +390,18 @@ macro_rules! log_multi {
 		}
 	};
 	($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
-		let static_log = &LOG;
+		let static_log = &log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
 				let log = log_map.get_mut($a);
 				match log {
 					Some(log) => {
-						do_log!($level, true, log, $b, $($c)*);
+						log::do_log!($level, true, log, $b, $($c)*);
 					},
 					None => {
 						let mut log = log::Log::new();
-						do_log!($level, true, log, $b, $($c)*);
+						log::do_log!($level, true, log, $b, $($c)*);
 						log_map.insert($a.to_string(), log);
 					}
 				}
@@ -440,18 +440,18 @@ macro_rules! log {
 	($level:expr, $a:expr)=>{
 		{
                 	const DEFAULT_LOG: &str = "default";
-                	let static_log = &LOG;
+                	let static_log = &log::LOG;
                 	let mut log_map = static_log.lock();
 			match log_map {
 				Ok(mut log_map) => {
                 	let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                 	match log {
                         	Some(log) => {
-                                	do_log!($level, true, log, $a);
+                                	log::do_log!($level, true, log, $a);
                         	},
                         	None => {
                                 	let mut log = log::Log::new();
-                                	do_log!($level, true, log, $a);
+                                	log::do_log!($level, true, log, $a);
                                 	log_map.insert(DEFAULT_LOG.to_string(), log);
                         	}
                 	}
@@ -469,16 +469,16 @@ macro_rules! log {
 	($level:expr, $a:expr,$($b:tt)*)=>{
 		{
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &LOG;
+                        let static_log = &log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        do_log!($level, true, log, $a, $($b)*);
+                                        log::do_log!($level, true, log, $a, $($b)*);
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        do_log!($level, true, log, $a, $($b)*);
+                                        log::do_log!($level, true, log, $a, $($b)*);
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -503,16 +503,16 @@ macro_rules! log {
 macro_rules! log_no_ts_multi {
         ($level:expr, $a:expr, $b:expr)=>{
                 {
-                        let static_log = &LOG;
+                        let static_log = &log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
                                 Some(log) => {
-                                        { do_log!($level, false, log, $b); }
+                                        { log::do_log!($level, false, log, $b); }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!($level, false, log, $b); }
+                                        { log::do_log!($level, false, log, $b); }
                                         log_map.insert($a.to_string(), log);
                                 }
                         }
@@ -520,16 +520,16 @@ macro_rules! log_no_ts_multi {
         };
         ($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
                 {
-                        let static_log = &LOG;
+                        let static_log = &log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
                                 Some(log) => {
-                                        { do_log!($level, false, log, $b, $($c)*) }
+                                        { log::do_log!($level, false, log, $b, $($c)*) }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!($level, false, log, $b, $($c)*) }
+                                        { log::do_log!($level, false, log, $b, $($c)*) }
                                         log_map.insert($a.to_string(), log);
                                 }
                         }
@@ -561,16 +561,16 @@ macro_rules! log_no_ts {
 	($level:expr, $a:expr)=>{
                 {
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &LOG;
+                        let static_log = &log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        { do_log!($level, false, log, $a); }
+                                        { log::do_log!($level, false, log, $a); }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!($level, false, log, $a); }
+                                        { log::do_log!($level, false, log, $a); }
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -580,16 +580,16 @@ macro_rules! log_no_ts {
 		{
 
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &LOG;
+                        let static_log = &log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        { do_log!($level, false, log, $a, $($b)*) }
+                                        { log::do_log!($level, false, log, $a, $($b)*) }
                                 },
                                 None => {
                                         let mut log = log::Log::new();
-                                        { do_log!($level, false, log, $a, $($b)*) }
+                                        { log::do_log!($level, false, log, $a, $($b)*) }
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -678,7 +678,7 @@ macro_rules! do_log {
 #[macro_export]
 macro_rules! log_config_multi {
 	($a:expr, $b:expr) => {{
-		let static_log = &LOG;
+		let static_log = &log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
@@ -722,7 +722,7 @@ macro_rules! log_config_multi {
 macro_rules! log_config {
 	($a:expr) => {{
 		const DEFAULT_LOG: &str = "default";
-		let static_log = &LOG;
+		let static_log = &log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
