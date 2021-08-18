@@ -1055,7 +1055,11 @@ impl HttpServer {
 		last_request_timeout: u128,
 		read_timeout: u128,
 	) -> Result<(bool, bool), Error> {
-		let conn_data = conn_data.write().unwrap();
+		let conn_data = conn_data.write().map_err(|e| {
+			let error: Error =
+				ErrorKind::PoisonError(format!("poison error getting conn_data, {}", e)).into();
+			error
+		})?;
 		let mut idledisc = false;
 		let mut rtimeout = false;
 		if conn_data.last_request_time != 0
