@@ -60,6 +60,8 @@ pub enum ErrorKind {
 	/// Connection close
 	#[fail(display = "Connection Close Error: {}", _0)]
 	ConnectionCloseError(String),
+	#[fail(display = "Ordering Error: {}", _0)]
+	OrderingError(String),
 }
 
 impl Display for Error {
