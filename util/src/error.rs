@@ -60,8 +60,12 @@ pub enum ErrorKind {
 	/// Connection close
 	#[fail(display = "Connection Close Error: {}", _0)]
 	ConnectionCloseError(String),
+	/// Ordering Error
 	#[fail(display = "Ordering Error: {}", _0)]
 	OrderingError(String),
+	/// Invalid RSP (Rust Server Page)
+	#[fail(display = "Invalid RSP Error: {}", _0)]
+	InvalidRSPError(String),
 }
 
 impl Display for Error {
