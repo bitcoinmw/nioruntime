@@ -1606,7 +1606,7 @@ impl HttpServer {
 		}
 
 		let redir_str = format!(
-			"HTTP/1.1 301 {}\r\n",
+			"HTTP/1.1 Moved Permanently\r\nLocation: {}\r\n",
 			redirect.as_ref().unwrap_or(&"".to_string())
 		);
 		let response = format!(
