@@ -1488,6 +1488,10 @@ impl HttpServer {
 		Ok(())
 	}
 
+	fn get_path(config: &HttpConfig, uri: &str) -> Result<String, Error> {
+		Ok(format!("{}/www{}", config.root_dir, uri))
+	}
+
 	fn send_response(
 		config: &HttpConfig,
 		wh: &WriteHandle,
@@ -1495,7 +1499,7 @@ impl HttpServer {
 		uri: &str,
 		keep_alive: bool,
 	) -> Result<(), Error> {
-		let mut path = format!("{}/www{}", config.root_dir, uri);
+		let mut path = Self::get_path(config, uri)?;
 		let mut flen = match metadata(path.clone()) {
 			Ok(md) => {
 				if md.is_dir() {
