@@ -1526,7 +1526,7 @@ impl HttpServer {
 					match res {
 						Ok(amt) => {
 							if first_loop {
-								Self::write_headers(wh, config, true, keep_alive, vec![])?;
+								Self::write_headers(wh, config, true, keep_alive, vec![], None)?;
 							}
 							if keep_alive {
 								let msg_len_bytes = format!("{:X}\r\n", amt);
@@ -1549,7 +1549,7 @@ impl HttpServer {
 						}
 						Err(_) => {
 							// directory
-							Self::write_headers(wh, config, false, keep_alive, vec![])?;
+							Self::write_headers(wh, config, false, keep_alive, vec![], None)?;
 							break;
 						}
 					}
@@ -1562,7 +1562,7 @@ impl HttpServer {
 			}
 			Err(_) => {
 				// file not found
-				Self::write_headers(wh, config, false, keep_alive, vec![])?;
+				Self::write_headers(wh, config, false, keep_alive, vec![], None)?;
 			}
 		}
 
@@ -1575,6 +1575,7 @@ impl HttpServer {
 		found: bool,
 		keep_alive: bool,
 		additional_headers: Vec<(String, String)>,
+		redirect: Option<String>,
 	) -> Result<(), Error> {
 		let response_404 = "<html><body>404 Page not found!</body></html>".to_string();
 		let now = chrono::Utc::now();
@@ -1604,9 +1605,15 @@ impl HttpServer {
 			);
 		}
 
+		let redir_str = format!(
+			"HTTP/1.1 301 {}\r\n",
+			redirect.as_ref().unwrap_or(&"".to_string())
+		);
 		let response = format!(
 			"{}{}{}{}{}\r\n{}",
-			if found {
+			if redirect.is_some() {
+				&redir_str
+			} else if found {
 				"HTTP/1.1 200 OK\r\n"
 			} else {
 				"HTTP/1.1 404 Not Found\r\n"
