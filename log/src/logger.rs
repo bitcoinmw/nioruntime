@@ -62,16 +62,16 @@ lazy_static! {
 #[macro_export]
 macro_rules! fatal {
         () => {
-                log::do_log!(FATAL);
+                log::do_log!(log::FATAL);
         };
         ($a:expr) => {
                 {
-                        log::log!(FATAL, $a);
+                        log::log!(log::FATAL, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log!(FATAL, $a, $($b)*);
+                        log::log!(log::FATAL, $a, $($b)*);
                 }
         };
 }
@@ -81,12 +81,12 @@ macro_rules! fatal {
 macro_rules! fatal_no_ts {
         ($a:expr) => {
                 {
-                        log::log_no_ts!(FATAL, $a);
+                        log::log_no_ts!(log::FATAL, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log_no_ts!(FATAL, $a, $($b)*);
+                        log::log_no_ts!(log::FATAL, $a, $($b)*);
                 }
         };
 }
@@ -113,16 +113,16 @@ macro_rules! fatal_no_ts {
 #[macro_export]
 macro_rules! error {
         () => {
-                log::do_log!(ERROR);
+                log::do_log!(log::ERROR);
         };
         ($a:expr) => {
                 {
-                        log::log!(ERROR, $a);
+                        log::log!(log::ERROR, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log!(ERROR, $a, $($b)*);
+                        log::log!(log::ERROR, $a, $($b)*);
                 }
         };
 }
@@ -132,12 +132,12 @@ macro_rules! error {
 macro_rules! error_no_ts {
         ($a:expr) => {
                 {
-                        log::log_no_ts!(ERROR, $a);
+                        log::log_no_ts!(log::ERROR, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log_no_ts!(ERROR, $a, $($b)*);
+                        log::log_no_ts!(log::ERROR, $a, $($b)*);
                 }
         };
 }
@@ -164,16 +164,16 @@ macro_rules! error_no_ts {
 #[macro_export]
 macro_rules! warn {
         () => {
-                log::do_log!(WARN);
+                log::do_log!(log::WARN);
         };
         ($a:expr) => {
 		{
-                	log::log!(WARN, $a);
+                	log::log!(log::WARN, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log!(WARN, $a, $($b)*);
+                	log::log!(log::WARN, $a, $($b)*);
 		}
         };
 }
@@ -183,12 +183,12 @@ macro_rules! warn {
 macro_rules! warn_no_ts {
         ($a:expr) => {
                 {
-                	log::log_no_ts!(WARN, $a);
+                	log::log_no_ts!(log::WARN, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log_no_ts!(WARN, $a, $($b)*);
+                	log::log_no_ts!(log::WARN, $a, $($b)*);
 		}
         };
 }
@@ -215,16 +215,16 @@ macro_rules! warn_no_ts {
 #[macro_export]
 macro_rules! info {
 	() => {
-		log::do_log!(INFO);
+		log::do_log!(log::INFO);
 	};
         ($a:expr) => {
                 {
-                	log::log!(INFO, $a);
+                	log::log!(log::INFO, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log!(INFO, $a, $($b)*);
+                	log::log!(log::INFO, $a, $($b)*);
 		}
         };
 }
@@ -234,12 +234,12 @@ macro_rules! info {
 macro_rules! info_no_ts {
         ($a:expr) => {
                 {
-                	log::log_no_ts!(INFO, $a);
+                	log::log_no_ts!(log::INFO, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log_no_ts!(INFO, $a, $($b)*);
+                	log::log_no_ts!(log::INFO, $a, $($b)*);
 		}
         };
 }
@@ -266,16 +266,16 @@ macro_rules! info_no_ts {
 #[macro_export]
 macro_rules! debug {
 	() => {
-		log::do_log!(DEBUG);
+		log::do_log!(log::DEBUG);
 	};
         ($a:expr) => {
                 {
-                	log!(DEBUG, $a);
+                	log!(log::DEBUG, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log!(DEBUG, $a, $($b)*);
+                	log!(log::DEBUG, $a, $($b)*);
 		}
         };
 }
@@ -285,12 +285,12 @@ macro_rules! debug {
 macro_rules! debug_no_ts {
         ($a:expr) => {
                 {
-                	log::log_no_ts!(DEBUG, $a);
+                	log::log_no_ts!(log::DEBUG, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log_no_ts!(DEBUG, $a, $($b)*);
+                	log::log_no_ts!(log::DEBUG, $a, $($b)*);
 		}
         };
 }
@@ -317,16 +317,16 @@ macro_rules! debug_no_ts {
 #[macro_export]
 macro_rules! trace {
         () => {
-                log::do_log!(TRACE);
+                log::do_log!(log::TRACE);
         };
         ($a:expr) => {
                 {
-                        log::log!(TRACE, $a);
+                        log::log!(log::TRACE, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log!(TRACE, $a, $($b)*);
+                        log::log!(log::TRACE, $a, $($b)*);
                 }
         };
 }
@@ -336,12 +336,12 @@ macro_rules! trace {
 macro_rules! trace_no_ts {
         ($a:expr) => {
                 {
-                        log::log_no_ts!(TRACE, $a);
+                        log::log_no_ts!(log::TRACE, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log_no_ts!(TRACE, $a, $($b)*);
+                        log::log_no_ts!(log::TRACE, $a, $($b)*);
                 }
         };
 }
@@ -357,8 +357,8 @@ macro_rules! trace_no_ts {
 /// info!();
 ///
 /// let abc = 123;
-/// log_multi!(WARN, "logger2", "hi");
-/// log_multi!(WARN, "logger2", "value = {}", abc);
+/// log_multi!(log::WARN, "logger2", "hi");
+/// log_multi!(log::WARN, "logger2", "value = {}", abc);
 ///
 /// ```
 #[macro_export]
@@ -428,8 +428,8 @@ macro_rules! log_multi {
 /// info!(); // set log level to info "2"
 ///
 /// let abc = 123;
-/// log!(INFO, "my value = {}", abc);
-/// log!(INFO, "hi");
+/// log!(log::INFO, "my value = {}", abc);
+/// log!(log::INFO, "hi");
 ///
 /// // The output will look like this:
 /// // [2021-08-09 19:41:37]: my value = 123
@@ -607,7 +607,7 @@ macro_rules! do_log {
 			{
                                         // if not configured, use defaults
                                         if !$log.is_configured() {
-                                                $log.config_with_object(LogConfig::default()).unwrap();
+                                                $log.config_with_object(log::LogConfig::default()).unwrap();
                                         }
 
 					let _ = $log.update_show_timestamp($show_ts);
@@ -633,7 +633,7 @@ macro_rules! do_log {
 			{
                                         // if not configured, use defaults
                                         if !$log.is_configured() {
-                                                $log.config_with_object(LogConfig::default()).unwrap();
+                                                $log.config_with_object(log::LogConfig::default()).unwrap();
                                         }
 
 					let _ = $log.update_show_timestamp($show_ts);
