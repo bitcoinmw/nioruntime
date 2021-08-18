@@ -1526,7 +1526,7 @@ impl HttpServer {
 					match res {
 						Ok(amt) => {
 							if first_loop {
-								Self::write_headers(wh, config, true, keep_alive)?;
+								Self::write_headers(wh, config, true, keep_alive, vec![])?;
 							}
 							if keep_alive {
 								let msg_len_bytes = format!("{:X}\r\n", amt);
@@ -1549,7 +1549,7 @@ impl HttpServer {
 						}
 						Err(_) => {
 							// directory
-							Self::write_headers(wh, config, false, keep_alive)?;
+							Self::write_headers(wh, config, false, keep_alive, vec![])?;
 							break;
 						}
 					}
@@ -1562,7 +1562,7 @@ impl HttpServer {
 			}
 			Err(_) => {
 				// file not found
-				Self::write_headers(wh, config, false, keep_alive)?;
+				Self::write_headers(wh, config, false, keep_alive, vec![])?;
 			}
 		}
 
@@ -1574,6 +1574,7 @@ impl HttpServer {
 		config: &HttpConfig,
 		found: bool,
 		keep_alive: bool,
+		additional_headers: Vec<(String, String)>,
 	) -> Result<(), Error> {
 		let response_404 = "<html><body>404 Page not found!</body></html>".to_string();
 		let now = chrono::Utc::now();
@@ -1595,8 +1596,16 @@ impl HttpServer {
 			format!("{}\r\n", response)
 		};
 
+		let mut additional_headers_formatted = "".to_string();
+		for header in additional_headers {
+			additional_headers_formatted = format!(
+				"{}{}: {}\r\n",
+				additional_headers_formatted, header.0, header.1,
+			);
+		}
+
 		let response = format!(
-			"{}{}{}{}\r\n{}",
+			"{}{}{}{}{}\r\n{}",
 			if found {
 				"HTTP/1.1 200 OK\r\n"
 			} else {
@@ -1604,6 +1613,7 @@ impl HttpServer {
 			},
 			date,
 			server,
+			additional_headers_formatted,
 			transfer_encoding,
 			not_found_message,
 		);
