@@ -1014,7 +1014,7 @@ impl HttpServer {
 								log_multi!(
 									ERROR,
 									MAIN_LOG,
-									"unexpected error in check_idle ConnData for {}, err={}",
+									"error in check_idle (possible thread panic) ConnData for {}, err={}",
 									k,
 									e.to_string(),
 								);
@@ -1056,8 +1056,19 @@ impl HttpServer {
 		read_timeout: u128,
 	) -> Result<(bool, bool), Error> {
 		let conn_data = conn_data.write().map_err(|e| {
+			match (*e.into_inner()).wh.close() {
+				Ok(_) => {}
+				Err(err) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"error closing conn_data from poison error: {}",
+						err.to_string(),
+					);
+				}
+			}
 			let error: Error =
-				ErrorKind::PoisonError(format!("poison error getting conn_data, {}", e)).into();
+				ErrorKind::PoisonError(format!("poison error getting conn_data")).into();
 			error
 		})?;
 		let mut idledisc = false;
