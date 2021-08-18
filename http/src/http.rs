@@ -371,11 +371,11 @@ impl HttpServer {
 			"webroot:              '{}/www'",
 			self.config.root_dir
 		);
-		log_multi!(INFO, MAIN_LOG, "bind address:         '{}'", addr);
+		log_multi!(INFO, MAIN_LOG, "bind_address:         '{}'", addr);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"thread pool size:     '{}'",
+			"thread_pool_size:     '{}'",
 			self.config.thread_pool_size
 		);
 		log_multi!(
