@@ -1488,7 +1488,7 @@ impl HttpServer {
 		Ok(())
 	}
 
-	fn get_path(config: &HttpConfig, uri: &str) -> Result<String, Error> {
+	pub fn get_path(config: &HttpConfig, uri: &str) -> Result<String, Error> {
 		Ok(format!("{}/www{}", config.root_dir, uri))
 	}
 
