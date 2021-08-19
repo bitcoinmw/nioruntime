@@ -32,6 +32,28 @@ macro_rules! lock {
 	};
 }
 
+#[macro_export]
+macro_rules! lockw {
+	($a:expr) => {
+		$a.write().map_err(|e| {
+			let error: Error =
+				ErrorKind::PoisonError(format!("Poison Error: {}", e.to_string())).into();
+			error
+		})?;
+	};
+}
+
+#[macro_export]
+macro_rules! lockr {
+	($a:expr) => {
+		$a.read().map_err(|e| {
+			let error: Error =
+				ErrorKind::PoisonError(format!("Poison Error: {}", e.to_string())).into();
+			error
+		})?;
+	};
+}
+
 /// Base Error struct which is used throught this crate and other crates
 #[derive(Debug, Fail)]
 pub struct Error {
