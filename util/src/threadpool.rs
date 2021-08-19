@@ -59,6 +59,29 @@ impl StaticThreadPool {
 		Ok(StaticThreadPool { id })
 	}
 
+	pub fn set_on_panic(&mut self, on_panic: OnPanic) -> Result<(), Error> {
+		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+			let error: Error = ErrorKind::InternalError(format!(
+				"static thread pool lock error: {}",
+				e.to_string()
+			))
+			.into();
+			error
+		})?;
+
+		let tp = stp.get_mut(&self.id);
+		match tp {
+			Some(tp) => tp.set_on_panic(on_panic),
+			None => {
+				return Err(ErrorKind::InternalError(format!(
+					"static thread pool id = {} doesn't exist error",
+					self.id
+				))
+				.into())
+			}
+		}
+	}
+
 	/// Start the static thread pool.
 	///
 	/// Start the thread pool with the specified size. After calling this function,
@@ -153,10 +176,13 @@ pub(crate) struct FuturesHolder {
 	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
 
+pub type OnPanic = fn() -> Result<(), Error>;
+
 pub(crate) struct ThreadPoolImpl {
 	tx: Arc<Mutex<mpsc::Sender<(FuturesHolder, bool)>>>,
 	rx: Arc<Mutex<mpsc::Receiver<(FuturesHolder, bool)>>>,
 	size: Arc<Mutex<usize>>,
+	on_panic: Option<OnPanic>,
 }
 
 impl ThreadPoolImpl {
@@ -171,7 +197,13 @@ impl ThreadPoolImpl {
 			tx,
 			rx,
 			size: Arc::new(Mutex::new(0)),
+			on_panic: None,
 		}
+	}
+
+	pub fn set_on_panic(&mut self, on_panic: OnPanic) -> Result<(), Error> {
+		self.on_panic = Some(on_panic);
+		Ok(())
 	}
 
 	pub fn start(&mut self, size: usize) -> Result<(), Error> {
@@ -184,6 +216,7 @@ impl ThreadPoolImpl {
 		}
 		for _id in 0..size {
 			let rx = self.rx.clone();
+			let on_panic = self.on_panic.clone();
 			thread::spawn(move || loop {
 				let rx = rx.clone();
 				let jh = thread::spawn(move || loop {
@@ -214,7 +247,18 @@ impl ThreadPoolImpl {
 
 					block_on(task.inner);
 				});
+
 				let _ = jh.join();
+
+				match on_panic {
+					Some(on_panic) => match (on_panic)() {
+						Ok(_) => {}
+						Err(e) => {
+							println!("on_panic callback generated error: '{}'", e.to_string())
+						}
+					},
+					None => {}
+				}
 			});
 		}
 

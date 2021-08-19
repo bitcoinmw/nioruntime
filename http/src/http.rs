@@ -16,6 +16,7 @@ use bytefmt;
 use dirs;
 use log::*;
 pub use nioruntime_evh::{EventHandler, WriteHandle};
+use nioruntime_util::threadpool::OnPanic;
 use nioruntime_util::threadpool::StaticThreadPool;
 use nioruntime_util::{Error, ErrorKind};
 use num_format::{Locale, ToFormattedString};
@@ -107,6 +108,10 @@ fn empty_callback(
 	Ok(())
 }
 
+fn empty_on_panic() -> Result<(), Error> {
+	Ok(())
+}
+
 #[derive(Clone)]
 pub struct HttpConfig {
 	pub host: String,
@@ -125,6 +130,7 @@ pub struct HttpConfig {
 	pub last_request_timeout: u128,
 	pub read_timeout: u128,
 	pub callback: Callback,
+	pub on_panic: OnPanic,
 	pub debug: bool,
 }
 
@@ -153,6 +159,7 @@ impl Default for HttpConfig {
 			last_request_timeout: 1000 * 120,             // 2 mins
 			read_timeout: 1000 * 30,                      // 30 seconds
 			callback: empty_callback,
+			on_panic: empty_on_panic,
 			debug: false,
 		}
 	}
@@ -449,7 +456,8 @@ impl HttpServer {
 		let http_config_clone4 = http_config.clone();
 		let http_config_clone5 = http_config.clone();
 
-		let thread_pool = StaticThreadPool::new()?;
+		let mut thread_pool = StaticThreadPool::new()?;
+		thread_pool.set_on_panic(self.config.on_panic)?;
 		thread_pool.start(self.config.thread_pool_size)?;
 		let thread_pool = Arc::new(RwLock::new(thread_pool));
 		let thread_pool_clone = thread_pool.clone();
