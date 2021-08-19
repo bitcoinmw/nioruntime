@@ -21,6 +21,17 @@ use std::fmt;
 use std::fmt::Display;
 use std::str::Utf8Error;
 
+#[macro_export]
+macro_rules! lock {
+	($a:expr) => {
+		$a.lock().map_err(|e| {
+			let error: Error =
+				ErrorKind::PoisonError(format!("Poison Error: {}", e.to_string())).into();
+			error
+		})?;
+	};
+}
+
 /// Base Error struct which is used throught this crate and other crates
 #[derive(Debug, Fail)]
 pub struct Error {

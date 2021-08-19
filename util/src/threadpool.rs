@@ -148,14 +148,7 @@ impl StaticThreadPool {
 	where
 		F: Future<Output = ()> + Send + Sync + 'static,
 	{
-		let stp = STATIC_THREAD_POOL.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!(
-				"static thread pool lock error: {}",
-				e.to_string()
-			))
-			.into();
-			error
-		})?;
+		let stp = crate::lock!(STATIC_THREAD_POOL);
 
 		let tp = stp.get(&self.id);
 		match tp {
@@ -276,7 +269,11 @@ impl ThreadPoolImpl {
 		for _ in 0..*size {
 			let f = async {};
 			let f = FuturesHolder { inner: Box::pin(f) };
-			let tx = self.tx.lock().unwrap();
+			let tx = self.tx.lock().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("tx.lock stop tp: {}", e.to_string())).into();
+				error
+			})?;
 			tx.send((f, true))?;
 		}
 		Ok(())
@@ -288,7 +285,11 @@ impl ThreadPoolImpl {
 	{
 		let f = FuturesHolder { inner: Box::pin(f) };
 		{
-			let tx = self.tx.lock().unwrap();
+			let tx = self.tx.lock().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("tx.lock tp: {}", e.to_string())).into();
+				error
+			})?;
 			tx.send((f, false))?;
 		}
 		Ok(())
