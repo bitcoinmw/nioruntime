@@ -1066,17 +1066,12 @@ impl HttpServer {
 		read_timeout: u128,
 	) -> Result<(bool, bool), Error> {
 		let conn_data = conn_data.write().map_err(|e| {
-			match (*e.into_inner()).wh.close() {
-				Ok(_) => {}
-				Err(err) => {
-					log_multi!(
-						ERROR,
-						MAIN_LOG,
-						"error closing conn_data from poison error: {}",
-						err.to_string(),
-					);
-				}
-			}
+			log_multi!(
+				ERROR,
+				MAIN_LOG,
+				"error closing conn_data from poison error: {}",
+				e.to_string(),
+			);
 			let error: Error =
 				ErrorKind::PoisonError(format!("poison error getting conn_data")).into();
 			error
