@@ -1417,7 +1417,14 @@ impl HttpServer {
 						let query = std::str::from_utf8(&query_string[..])?;
 
 						if config.debug {
-							info!("method={:?},uri={},query={}", method, uri, query);
+							log_multi!(
+								DEBUG,
+								MAIN_LOG,
+								"method={:?},uri={},query={}",
+								method,
+								uri,
+								query
+							);
 						}
 
 						let last_dot = uri.rfind('.');
