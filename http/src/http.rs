@@ -1224,15 +1224,11 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		let mut log_item = None;
 		{
-			let mut conn_data = conn_data
-				.write()
-				.map_err(|e| {
-					let error: Error =
-						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
-							.into();
-					error
-				})
-				.unwrap();
+			let mut conn_data = conn_data.write().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
+				error
+			})?;
 
 			if conn_data.needed_len != 0 && conn_data.buffer.len() < conn_data.needed_len {
 				// data not sufficient return and wait for more data
