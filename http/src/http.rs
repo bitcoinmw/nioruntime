@@ -83,6 +83,7 @@ pub enum HttpVersion {
 }
 
 type Callback = fn(
+	Arc<RwLock<ConnData>>,
 	&[u8],
 	HttpMethod,
 	HttpConfig,
@@ -95,6 +96,7 @@ type Callback = fn(
 ) -> Result<(), Error>;
 
 fn empty_callback(
+	_: Arc<RwLock<ConnData>>,
 	_: &[u8],
 	_: HttpMethod,
 	_: HttpConfig,
@@ -165,7 +167,7 @@ impl Default for HttpConfig {
 	}
 }
 
-struct ConnData {
+pub struct ConnData {
 	buffer: Vec<u8>,
 	wh: WriteHandle,
 	create_time: u128,
@@ -1222,6 +1224,7 @@ impl HttpServer {
 		mappings: HashSet<String>,
 		extensions: HashSet<String>,
 	) -> Result<(), Error> {
+		let conn_data_clone = conn_data.clone();
 		let mut log_item = None;
 		{
 			let mut conn_data = conn_data.write().map_err(|e| {
@@ -1426,6 +1429,7 @@ impl HttpServer {
 
 						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
 							(config.callback)(
+								conn_data_clone,
 								match has_content {
 									true => &buffer[start_buf..end_buf + 1],
 									false => &[0u8; 0],
