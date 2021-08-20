@@ -253,7 +253,7 @@ fn do_write(
 			error
 		})?;
 
-		guarded_data.write_pending.push(fd.into());
+		guarded_data.write_pending.push((fd.into(), connection_id));
 		do_wakeup_with_lock(&mut *guarded_data)?
 	};
 
@@ -459,7 +459,7 @@ struct GuardedData {
 	wakeup_rx: ConnectionHandle,
 	wakeup_scheduled: bool,
 	handler_events: Vec<HandlerEvent>,
-	write_pending: Vec<ConnectionHandle>,
+	write_pending: Vec<(ConnectionHandle, u128)>,
 	selector: Option<ConnectionHandle>,
 	stop: bool,
 	write_queue: Vec<StreamWriteBuffer>,
@@ -1096,7 +1096,7 @@ where
 
 	fn process_handler_events(
 		handler_events: Vec<HandlerEvent>,
-		write_pending: Vec<ConnectionHandle>,
+		write_pending: Vec<(ConnectionHandle, u128)>,
 		evs: &mut Vec<GenericEvent>,
 		read_fd_type: &mut Vec<FdType>,
 		use_on_client_read: &mut Vec<bool>,
@@ -1104,6 +1104,7 @@ where
 		thread_pool: &StaticThreadPool,
 		global_lock: &Arc<RwLock<bool>>,
 		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
+		active_seqnos: &mut HashSet<u128>,
 	) -> Result<(), Error> {
 		let lock = global_lock.write();
 		match lock {
@@ -1167,6 +1168,7 @@ where
 					let seqno = handler_event.seqno;
 					let fd = handler_event.fd;
 					Self::do_close(fd, seqno, fd_locks)?;
+					active_seqnos.remove(&seqno);
 					match fd_locks[fd as usize].lock() {
 						Ok(mut state) => {
 							#[cfg(unix)]
@@ -1205,7 +1207,9 @@ where
 
 		// handle write_pending
 		for pending in write_pending {
-			evs.push(GenericEvent::new(pending, GenericEventType::AddWriteET));
+			if active_seqnos.get(&pending.1).is_some() {
+				evs.push(GenericEvent::new(pending.0, GenericEventType::AddWriteET));
+			}
 		}
 		Ok(())
 	}
@@ -1311,7 +1315,7 @@ where
 		}
 		let mut events: [epoll_event; MAX_EVENTS as usize] =
 			unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 100) };
+		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 1000) };
 		let mut ret_count_adjusted = 0;
 
 		if results > 0 {
@@ -1556,6 +1560,7 @@ where
 		thread_pool.start(4)?;
 		let global_lock = Arc::new(RwLock::new(true));
 		let mut seqno = 0u128;
+		let mut active_seqnos = HashSet::new();
 
 		let rx = {
 			let guarded_data = guarded_data.lock().map_err(|e| {
@@ -1697,7 +1702,7 @@ where
 				match proc.atype {
 					ActionType::AddStream => {
 						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadET));
-
+						active_seqnos.insert(proc.seqno);
 						let fd = proc.fd as uintptr_t;
 						// make sure there's enough space
 						let len = read_fd_type.len();
@@ -1739,6 +1744,7 @@ where
 					}
 					ActionType::AddListener => {
 						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadLT));
+						active_seqnos.insert(proc.seqno);
 						let fd = proc.fd as uintptr_t;
 
 						// make sure there's enough space
@@ -1771,6 +1777,7 @@ where
 				&thread_pool,
 				&global_lock,
 				fd_locks,
+				&mut active_seqnos,
 			)?;
 			let mut output_events = vec![];
 			ret_count = Self::get_events(
@@ -1817,6 +1824,7 @@ where
 						seqno,
 						&global_lock,
 						&mut use_on_client_read,
+						&mut active_seqnos,
 					);
 
 					match res {
@@ -2176,6 +2184,7 @@ where
 		seqno: u128,
 		global_lock: &Arc<RwLock<bool>>,
 		use_client_on_read: &mut Vec<bool>,
+		active_seqnos: &mut HashSet<u128>,
 	) -> Result<(), Error> {
 		let fd_type = &read_fd_type[fd as usize];
 		match fd_type {
@@ -2211,6 +2220,7 @@ where
 					)
 				};
 				if res > 0 {
+					active_seqnos.insert(seqno);
 					Self::ensure_allocations(
 						res,
 						read_fd_type,
