@@ -1311,7 +1311,7 @@ where
 		}
 		let mut events: [epoll_event; MAX_EVENTS as usize] =
 			unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 1000) };
+		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 100) };
 		let mut ret_count_adjusted = 0;
 
 		if results > 0 {
