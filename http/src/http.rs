@@ -1461,9 +1461,7 @@ impl HttpServer {
 								method,
 							));
 
-							for _ in 0..end_buf + 1 {
-								buffer.remove(0);
-							}
+							buffer.drain(0..end_buf + 1);
 
 							break;
 						}
