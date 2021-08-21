@@ -1605,14 +1605,13 @@ impl HttpServer {
 		Ok(())
 	}
 
-	pub fn write_headers(
-		wh: &WriteHandle,
+	pub fn build_headers(
 		config: &HttpConfig,
 		found: bool,
 		keep_alive: bool,
 		additional_headers: Vec<(String, String)>,
 		redirect: Option<String>,
-	) -> Result<(), Error> {
+	) -> Result<String, Error> {
 		let response_404 = "<html><body>404 Page not found!</body></html>".to_string();
 		let now = chrono::Utc::now();
 
@@ -1645,7 +1644,8 @@ impl HttpServer {
 			"HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\n",
 			redirect.as_ref().unwrap_or(&"".to_string())
 		);
-		let response = format!(
+
+		Ok(format!(
 			"{}{}{}{}{}\r\n{}",
 			if redirect.is_some() {
 				&redir_str
@@ -1659,7 +1659,19 @@ impl HttpServer {
 			additional_headers_formatted,
 			transfer_encoding,
 			not_found_message,
-		);
+		))
+	}
+
+	pub fn write_headers(
+		wh: &WriteHandle,
+		config: &HttpConfig,
+		found: bool,
+		keep_alive: bool,
+		additional_headers: Vec<(String, String)>,
+		redirect: Option<String>,
+	) -> Result<(), Error> {
+		let response =
+			Self::build_headers(config, found, keep_alive, additional_headers, redirect)?;
 
 		let response = response.as_bytes();
 		wh.write(response, 0, response.len(), false)?;
