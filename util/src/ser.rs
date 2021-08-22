@@ -22,12 +22,8 @@
 use crate::{Error, ErrorKind};
 use byteorder::{BigEndian, ByteOrder, ReadBytesExt};
 use bytes::Buf;
-use serde::{Deserialize, Serialize};
-use std::fmt::{self, Debug};
 use std::io::{self, Read, Write};
 use std::marker;
-
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(1_000);
 
 pub trait Writer {
 	/// Writes a u8 as bytes
@@ -108,9 +104,6 @@ pub trait Reader {
 	/// Consumes a byte from the reader, producing an error if it doesn't have
 	/// the expected value
 	fn expect_u8(&mut self, val: u8) -> Result<u8, Error>;
-	/// Access to underlying protocol version to support
-	/// version specific deserialization logic.
-	fn protocol_version(&self) -> ProtocolVersion;
 
 	/// Read a fixed number of "empty" bytes from the underlying reader.
 	/// It is an error if any non-empty bytes encountered.
@@ -190,64 +183,6 @@ where
 	Ok(res)
 }
 
-/// Protocol version for serialization/deserialization.
-/// Note: This is used in various places including but limited to
-/// the p2p layer and our local db storage layer.
-/// We may speak multiple versions to various peers and a potentially *different*
-/// version for our local db.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialOrd, PartialEq, Serialize)]
-pub struct ProtocolVersion(pub u32);
-
-impl ProtocolVersion {
-	/// The max protocol version supported.
-	pub const MAX: u32 = std::u32::MAX;
-
-	/// Protocol version as u32 to allow for convenient exhaustive matching on values.
-	pub fn value(self) -> u32 {
-		self.0
-	}
-
-	/// Our default "local" protocol version.
-	/// This protocol version is provided to peers as part of the Hand/Shake
-	/// negotiation in the p2p layer. Connected peers will negotiate a suitable
-	/// protocol version for serialization/deserialization of p2p messages.
-	pub fn local() -> ProtocolVersion {
-		PROTOCOL_VERSION
-	}
-
-	/// We need to specify a protocol version for our local database.
-	/// Regardless of specific version used when sending/receiving data between peers
-	/// we need to take care with serialization/deserialization of data locally in the db.
-	pub fn local_db() -> ProtocolVersion {
-		ProtocolVersion(1)
-	}
-}
-
-impl fmt::Display for ProtocolVersion {
-	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-		write!(f, "{}", self.0)
-	}
-}
-
-impl From<ProtocolVersion> for u32 {
-	fn from(v: ProtocolVersion) -> u32 {
-		v.0
-	}
-}
-
-impl Writeable for ProtocolVersion {
-	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), Error> {
-		writer.write_u32(self.0)
-	}
-}
-
-impl Readable for ProtocolVersion {
-	fn read<R: Reader>(reader: &mut R) -> Result<ProtocolVersion, Error> {
-		let version = reader.read_u32()?;
-		Ok(ProtocolVersion(version))
-	}
-}
-
 /// Trait that every type that can be deserialized from binary must implement.
 /// Reads directly to a Reader, a utility type thinly wrapping an
 /// underlying Read implementation.
@@ -260,52 +195,44 @@ where
 }
 
 /// Deserializes a Readable from any std::io::Read implementation.
-pub fn deserialize<T: Readable, R: Read>(
-	source: &mut R,
-	version: ProtocolVersion,
-) -> Result<T, Error> {
-	let mut reader = BinReader::new(source, version);
+pub fn deserialize<T: Readable, R: Read>(source: &mut R) -> Result<T, Error> {
+	let mut reader = BinReader::new(source);
 	T::read(&mut reader)
 }
 
 /// Deserialize a Readable based on our default "local" protocol version.
 pub fn deserialize_default<T: Readable, R: Read>(source: &mut R) -> Result<T, Error> {
-	deserialize(source, ProtocolVersion::local())
+	deserialize(source)
 }
 
 /// Serializes a Writeable into any std::io::Write implementation.
-pub fn serialize<W: Writeable>(
-	sink: &mut dyn Write,
-	_version: ProtocolVersion,
-	thing: &W,
-) -> Result<(), Error> {
+pub fn serialize<W: Writeable>(sink: &mut dyn Write, thing: &W) -> Result<(), Error> {
 	let mut writer = BinWriter::new(sink);
 	thing.write(&mut writer)
 }
 
 /// Serialize a Writeable according to our default "local" protocol version.
 pub fn serialize_default<W: Writeable>(sink: &mut dyn Write, thing: &W) -> Result<(), Error> {
-	serialize(sink, ProtocolVersion::local(), thing)
+	serialize(sink, thing)
 }
 
 /// Utility function to serialize a writeable directly in memory using a
 /// Vec<u8>.
-pub fn ser_vec<W: Writeable>(thing: &W, version: ProtocolVersion) -> Result<Vec<u8>, Error> {
+pub fn ser_vec<W: Writeable>(thing: &W) -> Result<Vec<u8>, Error> {
 	let mut vec = vec![];
-	serialize(&mut vec, version, thing)?;
+	serialize(&mut vec, thing)?;
 	Ok(vec)
 }
 
 /// Utility to read from a binary source
 pub struct BinReader<'a, R: Read> {
 	source: &'a mut R,
-	version: ProtocolVersion,
 }
 
 impl<'a, R: Read> BinReader<'a, R> {
 	/// Constructor for a new BinReader for the provided source and protocol version.
-	pub fn new(source: &'a mut R, version: ProtocolVersion) -> Self {
-		BinReader { source, version }
+	pub fn new(source: &'a mut R) -> Self {
+		BinReader { source }
 	}
 }
 
@@ -368,27 +295,21 @@ impl<'a, R: Read> Reader for BinReader<'a, R> {
 			.into())
 		}
 	}
-
-	fn protocol_version(&self) -> ProtocolVersion {
-		self.version
-	}
 }
 
 /// A reader that reads straight off a stream.
 /// Tracks total bytes read so we can verify we read the right number afterwards.
 pub struct StreamingReader<'a> {
 	total_bytes_read: u64,
-	version: ProtocolVersion,
 	stream: &'a mut dyn Read,
 }
 
 impl<'a> StreamingReader<'a> {
 	/// Create a new streaming reader with the provided underlying stream.
 	/// Also takes a duration to be used for each individual read_exact call.
-	pub fn new(stream: &'a mut dyn Read, version: ProtocolVersion) -> StreamingReader<'a> {
+	pub fn new(stream: &'a mut dyn Read) -> StreamingReader<'a> {
 		StreamingReader {
 			total_bytes_read: 0,
-			version,
 			stream,
 		}
 	}
@@ -454,25 +375,19 @@ impl<'a> Reader for StreamingReader<'a> {
 			.into())
 		}
 	}
-
-	fn protocol_version(&self) -> ProtocolVersion {
-		self.version
-	}
 }
 
 /// Protocol version-aware wrapper around a `Buf` impl
 pub struct BufReader<'a, B: Buf> {
 	inner: &'a mut B,
-	version: ProtocolVersion,
 	bytes_read: usize,
 }
 
 impl<'a, B: Buf> BufReader<'a, B> {
 	/// Construct a new BufReader
-	pub fn new(buf: &'a mut B, version: ProtocolVersion) -> Self {
+	pub fn new(buf: &'a mut B) -> Self {
 		Self {
 			inner: buf,
-			version,
 			bytes_read: 0,
 		}
 	}
@@ -560,10 +475,6 @@ impl<'a, B: Buf> Reader for BufReader<'a, B> {
 			))
 			.into())
 		}
-	}
-
-	fn protocol_version(&self) -> ProtocolVersion {
-		self.version
 	}
 }
 
