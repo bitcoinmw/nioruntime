@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod error;
+pub mod ser;
 pub mod threadpool;
 
 pub use crate::error::{Error, ErrorKind};

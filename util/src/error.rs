@@ -99,6 +99,18 @@ pub enum ErrorKind {
 	/// Invalid RSP (Rust Server Page)
 	#[fail(display = "Invalid RSP Error: {}", _0)]
 	InvalidRSPError(String),
+	/// UnexpectedData
+	#[fail(display = "Unexpected Data Error: {}", _0)]
+	UnexpectedData(String),
+	/// TooLargeRead
+	#[fail(display = "TooLargeRead Error: {}", _0)]
+	TooLargeRead(String),
+	/// CorruptedData
+	#[fail(display = "Corrupted Data Error: {}", _0)]
+	CorruptedData(String),
+	/// CountError
+	#[fail(display = "CountError: {}", _0)]
+	CountError(String),
 }
 
 impl Display for Error {
