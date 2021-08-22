@@ -19,6 +19,7 @@ use nix::errno::Errno;
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Display;
+use std::num::ParseIntError;
 use std::str::Utf8Error;
 
 #[macro_export]
@@ -111,6 +112,9 @@ pub enum ErrorKind {
 	/// CountError
 	#[fail(display = "CountError: {}", _0)]
 	CountError(String),
+	/// ParseIntError
+	#[fail(display = "ParseIntError: {}", _0)]
+	ParseIntError(String),
 }
 
 impl Display for Error {
@@ -191,6 +195,14 @@ impl From<OsString> for Error {
 	fn from(e: OsString) -> Error {
 		Error {
 			inner: Context::new(ErrorKind::OsStringError(format!("{:?}", e))),
+		}
+	}
+}
+
+impl From<ParseIntError> for Error {
+	fn from(e: ParseIntError) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::ParseIntError(format!("{}", e))),
 		}
 	}
 }
