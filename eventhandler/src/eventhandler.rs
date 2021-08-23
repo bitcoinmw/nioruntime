@@ -49,7 +49,7 @@ use libc::c_int;
 use libc::c_void;
 use libc::uintptr_t;
 use libc::EAGAIN;
-use log::*;
+use nioruntime_log::*;
 use std::collections::HashSet;
 use std::collections::LinkedList;
 use std::convert::TryInto;
@@ -718,7 +718,7 @@ where
 	/// ```
 	/// use nioruntime_evh::EventHandler;
 	/// use nioruntime_util::Error;
-	/// use log::*;
+	/// use nioruntime_log::*;
 	///
 	/// // set log level to info
 	/// info!();
@@ -758,7 +758,7 @@ where
 	/// ```
 	/// use nioruntime_evh::EventHandler;
 	/// use nioruntime_util::Error;
-	/// use log::*;
+	/// use nioruntime_log::*;
 	///
 	/// // set log level to info
 	/// info!();
@@ -799,7 +799,7 @@ where
 	/// ```
 	/// use nioruntime_evh::EventHandler;
 	/// use nioruntime_util::Error;
-	/// use log::*;
+	/// use nioruntime_log::*;
 	///
 	/// // set log level to info
 	/// info!();

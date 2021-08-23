@@ -169,6 +169,8 @@ pub(crate) struct FuturesHolder {
 	inner: Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>,
 }
 
+/// This type is a callback which may be set when creating a ThreadPool. It is called
+/// if a thread that is executing the future panics.
 pub type OnPanic = fn() -> Result<(), Error>;
 
 pub(crate) struct ThreadPoolImpl {

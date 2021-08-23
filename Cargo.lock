@@ -203,7 +203,7 @@ checksum = "44533bbbb3bb3c1fa17d9f2e4e38bbbaf8396ba82193c4cb1b6445d711445d36"
 dependencies = [
  "atty",
  "humantime",
- "log 0.4.14",
+ "log",
  "regex",
  "termcolor",
 ]
@@ -268,7 +268,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f025c5fe9dd7348f756224f90d3a52fc6499a66aa2e9efc068316f63a3a48848"
 dependencies = [
  "env_logger",
- "log 0.4.14",
+ "log",
 ]
 
 [[package]]
@@ -397,7 +397,7 @@ dependencies = [
  "bitflags",
  "libc",
  "libgit2-sys",
- "log 0.4.14",
+ "log",
  "url",
 ]
 
@@ -493,20 +493,6 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.0.1"
-dependencies = [
- "chrono",
- "failure",
- "failure_derive",
- "futures",
- "lazy_static",
- "nioruntime_util",
- "nix",
- "rand",
-]
-
-[[package]]
-name = "log"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51b9bbe6c47d51fc3e1a9b945965946b4c44142ab8792c50835a980d362c2710"
@@ -556,9 +542,9 @@ dependencies = [
  "errno",
  "lazy_static",
  "libc",
- "log 0.0.1",
  "nioruntime_evh",
  "nioruntime_http",
+ "nioruntime_log",
  "nioruntime_util",
  "nix",
  "rand",
@@ -573,7 +559,7 @@ dependencies = [
  "futures",
  "kqueue-sys",
  "libc",
- "log 0.0.1",
+ "nioruntime_log",
  "nioruntime_util",
  "nix",
  "portpicker",
@@ -591,10 +577,24 @@ dependencies = [
  "chrono",
  "dirs",
  "fsutils",
- "log 0.0.1",
  "nioruntime_evh",
+ "nioruntime_log",
  "nioruntime_util",
  "num-format",
+ "rand",
+]
+
+[[package]]
+name = "nioruntime_log"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "failure",
+ "failure_derive",
+ "futures",
+ "lazy_static",
+ "nioruntime_util",
+ "nix",
  "rand",
 ]
 

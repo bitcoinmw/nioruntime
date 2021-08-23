@@ -28,10 +28,10 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
 use errno::errno;
-use log::*;
 use nioruntime_evh::eventhandler::EventHandler;
 use nioruntime_http::HttpConfig;
 use nioruntime_http::HttpServer;
+use nioruntime_log::*;
 use nioruntime_util::Error;
 use rand::Rng;
 use std::collections::HashMap;
@@ -196,7 +196,7 @@ fn client_thread(
 }
 
 fn real_main() -> Result<(), Error> {
-	log_config!(log::LogConfig::default())?;
+	log_config!(nioruntime_log::LogConfig::default())?;
 
 	let yml = load_yaml!("nio.yml");
 	let args = App::from_yaml(yml)

@@ -22,6 +22,8 @@ use std::fmt::Display;
 use std::num::ParseIntError;
 use std::str::Utf8Error;
 
+/// A macro that is used to lock a mutex and return the appropriate error if the lock is poisoned.
+/// This code was used in many places, and this macro simplifies it.
 #[macro_export]
 macro_rules! lock {
 	($a:expr) => {
@@ -33,6 +35,8 @@ macro_rules! lock {
 	};
 }
 
+/// A macro that is used to lock a rwlock in write mode and return the appropriate error if the lock is poisoned.
+/// This code was used in many places, and this macro simplifies it.
 #[macro_export]
 macro_rules! lockw {
 	($a:expr) => {
@@ -44,6 +48,8 @@ macro_rules! lockw {
 	};
 }
 
+/// A macro that is used to lock a rwlock in read mode and return the appropriate error if the lock is poisoned.
+/// This code was used in many places, and this macro simplifies it.
 #[macro_export]
 macro_rules! lockr {
 	($a:expr) => {

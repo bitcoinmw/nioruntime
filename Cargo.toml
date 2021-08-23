@@ -16,7 +16,7 @@ members = ["log", "http", "eventhandler", "util"]
 
 [dependencies]
 
-log             = { path = "./log"          }
+nioruntime_log  = { path = "./log"          }
 nioruntime_http = { path = "./http"         }
 nioruntime_util = { path = "./util"         }
 nioruntime_evh  = { path = "./eventhandler" }

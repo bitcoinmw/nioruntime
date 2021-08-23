@@ -14,8 +14,8 @@
 
 use bytefmt;
 use dirs;
-use log::*;
 pub use nioruntime_evh::{EventHandler, WriteHandle};
+use nioruntime_log::*;
 use nioruntime_util::threadpool::OnPanic;
 use nioruntime_util::threadpool::StaticThreadPool;
 use nioruntime_util::{Error, ErrorKind};
@@ -175,6 +175,8 @@ impl Default for HttpConfig {
 	}
 }
 
+/// Connection Data used internally
+/// It is held in a lock that is used to determine if the thread has panicked.
 pub struct ConnData {
 	buffer: Vec<u8>,
 	wh: WriteHandle,
@@ -241,14 +243,17 @@ impl HttpContext {
 	}
 }
 
+/// The main struct representing an [`HttpServer`].
 pub struct HttpServer {
-	pub config: HttpConfig,
+	config: HttpConfig,
 	listener: Option<TcpListener>,
 	http_context: Option<Arc<RwLock<HttpContext>>>,
 	thread_pool: Option<Arc<RwLock<StaticThreadPool>>>,
 }
 
 impl HttpServer {
+	/// Create a new HttpServer instance based on the [`HttpConfig`]
+	/// specified.
 	pub fn new(config: HttpConfig) -> Self {
 		let mut cloned_config = config.clone();
 		let home_dir = match dirs::home_dir() {
@@ -287,6 +292,10 @@ impl HttpServer {
 		}
 	}
 
+	/// add an API extension such that any requests that end in this extension
+	/// will be sent to the the specified [`HttpConfig::callback`]. This is used
+	/// by rsps to map all paths that end in ".rsp" to the rustlet container instead
+	/// of being processed by the [`HttpServer`].
 	pub fn add_api_extension(&self, extension: String) -> Result<(), Error> {
 		match &self.http_context {
 			Some(http_context) => {
@@ -309,6 +318,9 @@ impl HttpServer {
 		Ok(())
 	}
 
+	/// Add an API mapping such that any requests that have this URI will be sent to the specified
+	/// [`HttpConfig::callback`] instead of being processed by the [`HttpServer`]. This is used
+	/// by rustlet mappings.
 	pub fn add_api_mapping(&self, path: String) -> Result<(), Error> {
 		match &self.http_context {
 			Some(http_context) => {
@@ -331,38 +343,10 @@ impl HttpServer {
 		Ok(())
 	}
 
-	fn create_file_from_bytes(
-		resource: String,
-		root_dir: String,
-		bytes: &[u8],
-	) -> Result<(), Error> {
-		let path = format!("{}/www/{}", root_dir, resource);
-		let mut file = File::create(&path)?;
-		file.write_all(bytes)?;
-		Ok(())
-	}
-
-	fn format_bytes(n: u64) -> String {
-		if n >= 1_000_000 {
-			bytefmt::format_to(n, bytefmt::Unit::MB)
-		} else if n >= 1_000 {
-			bytefmt::format_to(n, bytefmt::Unit::KB)
-		} else {
-			bytefmt::format_to(n, bytefmt::Unit::B)
-		}
-	}
-
-	fn format_time(n: u128) -> String {
-		let duration = std::time::Duration::from_millis(n.try_into().unwrap_or(u64::MAX));
-		if n >= 1000 * 60 {
-			format!("{} Minutes", (duration.as_secs() / 60))
-		} else if n >= 1000 {
-			format!("{} Seconds", duration.as_secs())
-		} else {
-			format!("{} Milliseconds", duration.as_millis())
-		}
-	}
-
+	/// Start the [`HttpServer`]. This function will print some startup parameters to the mainlog,
+	/// which is initially configured to print to both standard output and the mainlog log file
+	/// location. After the startup parameters are printed, the server has begun and logging only
+	/// is printed to the mainlog file location.
 	pub fn start(&mut self) -> Result<(), Error> {
 		let addr = format!("{}:{}", self.config.host, self.config.port,);
 
@@ -582,6 +566,7 @@ impl HttpServer {
 		Ok(())
 	}
 
+	/// Stop the [`HttpServer`]. All resources including threads and file descriptors will be released.
 	pub fn stop(&mut self) -> Result<(), Error> {
 		match &self.http_context {
 			Some(http_context) => {
@@ -609,6 +594,133 @@ impl HttpServer {
 		}
 		self.listener = None;
 		Ok(())
+	}
+
+	/// Get the path of the file specified based on the the [`HttpConfig`] and the uri.
+	pub fn get_path(config: &HttpConfig, uri: &str) -> Result<String, Error> {
+		Ok(format!("{}/www{}", config.root_dir, uri))
+	}
+
+	/// Write headers the connection associated with this WriteHandle.
+	/// `wh` - The write handle to use to write.
+	/// `config` - The [`HttpConfig`] associated with this connection.
+	/// `found` - Whether or not this file was found.
+	/// `keep-alive` - Whether or not to keep the connection alive after this response is sent.
+	/// `additional_headers` - Additional headers to send with this response.
+	/// `redirect` - Optional redirect for this request.
+	pub fn write_headers(
+		wh: &WriteHandle,
+		config: &HttpConfig,
+		found: bool,
+		keep_alive: bool,
+		additional_headers: Vec<(String, String)>,
+		redirect: Option<String>,
+	) -> Result<(), Error> {
+		let response =
+			Self::build_headers(config, found, keep_alive, additional_headers, redirect)?;
+
+		let response = response.as_bytes();
+		wh.write(response, 0, response.len(), false)?;
+		if !found && !keep_alive {
+			wh.close()?;
+		}
+
+		Ok(())
+	}
+
+	/// Build (but do not write) headers based on specified parameters.
+	/// `config` - The [`HttpConfig`] associated with this connection.
+	/// `found` - Whether or not this file was found.
+	/// `keep-alive` - Whether or not to keep the connection alive after this response is sent.
+	/// `additional_headers` - Additional headers to send with this response.
+	/// `redirect` - Optional redirect for this request.
+	pub fn build_headers(
+		config: &HttpConfig,
+		found: bool,
+		keep_alive: bool,
+		additional_headers: Vec<(String, String)>,
+		redirect: Option<String>,
+	) -> Result<String, Error> {
+		let response_404 = "<html><body>404 Page not found!</body></html>".to_string();
+		let now = chrono::Utc::now();
+
+		let date = format!("Date: {}\r\n", now.format("%a, %d %h %Y %T GMT"));
+		let server = format!("Server: {} {}\r\n", config.server_name, VERSION);
+		let transfer_encoding = if found && keep_alive {
+			"Transfer-Encoding: chunked\r\n".to_string()
+		} else if !found {
+			format!("Content-Length: {}\r\n", response_404.len())
+		} else {
+			"".to_string()
+		};
+
+		let not_found_message = if found {
+			"".to_string()
+		} else {
+			let response = response_404;
+			format!("{}\r\n", response)
+		};
+
+		let mut additional_headers_formatted = "".to_string();
+		for header in additional_headers {
+			additional_headers_formatted = format!(
+				"{}{}: {}\r\n",
+				additional_headers_formatted, header.0, header.1,
+			);
+		}
+
+		let redir_str = format!(
+			"HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\n",
+			redirect.as_ref().unwrap_or(&"".to_string())
+		);
+
+		Ok(format!(
+			"{}{}{}{}{}\r\n{}",
+			if redirect.is_some() {
+				&redir_str
+			} else if found {
+				"HTTP/1.1 200 OK\r\n"
+			} else {
+				"HTTP/1.1 404 Not Found\r\n"
+			},
+			date,
+			server,
+			additional_headers_formatted,
+			transfer_encoding,
+			not_found_message,
+		))
+	}
+
+	fn create_file_from_bytes(
+		resource: String,
+		root_dir: String,
+		bytes: &[u8],
+	) -> Result<(), Error> {
+		let path = format!("{}/www/{}", root_dir, resource);
+		let mut file = File::create(&path)?;
+		file.write_all(bytes)?;
+		Ok(())
+	}
+
+	fn format_bytes(n: u64) -> String {
+		if n >= 1_000_000 {
+			bytefmt::format_to(n, bytefmt::Unit::MB)
+		} else if n >= 1_000 {
+			bytefmt::format_to(n, bytefmt::Unit::KB)
+		} else {
+			bytefmt::format_to(n, bytefmt::Unit::B)
+		}
+	}
+
+	fn format_time(n: u128) -> String {
+		let duration = std::time::Duration::from_millis(n.try_into().unwrap_or(u64::MAX));
+		if n >= 1000 * 60 {
+			format!("{} Minutes", (duration.as_secs() / 60))
+		} else if n >= 1000 {
+			format!("{} Seconds", duration.as_secs())
+		} else {
+			format!("{} Milliseconds", duration.as_millis())
+		}
 	}
 
 	fn format_qps(num: f64) -> String {
@@ -1525,10 +1637,6 @@ impl HttpServer {
 		Ok(())
 	}
 
-	pub fn get_path(config: &HttpConfig, uri: &str) -> Result<String, Error> {
-		Ok(format!("{}/www{}", config.root_dir, uri))
-	}
-
 	fn send_response(
 		config: &HttpConfig,
 		wh: &WriteHandle,
@@ -1620,83 +1728,6 @@ impl HttpServer {
 				// file not found
 				Self::write_headers(wh, config, false, keep_alive, vec![], None)?;
 			}
-		}
-
-		Ok(())
-	}
-
-	pub fn build_headers(
-		config: &HttpConfig,
-		found: bool,
-		keep_alive: bool,
-		additional_headers: Vec<(String, String)>,
-		redirect: Option<String>,
-	) -> Result<String, Error> {
-		let response_404 = "<html><body>404 Page not found!</body></html>".to_string();
-		let now = chrono::Utc::now();
-
-		let date = format!("Date: {}\r\n", now.format("%a, %d %h %Y %T GMT"));
-		let server = format!("Server: {} {}\r\n", config.server_name, VERSION);
-		let transfer_encoding = if found && keep_alive {
-			"Transfer-Encoding: chunked\r\n".to_string()
-		} else if !found {
-			format!("Content-Length: {}\r\n", response_404.len())
-		} else {
-			"".to_string()
-		};
-
-		let not_found_message = if found {
-			"".to_string()
-		} else {
-			let response = response_404;
-			format!("{}\r\n", response)
-		};
-
-		let mut additional_headers_formatted = "".to_string();
-		for header in additional_headers {
-			additional_headers_formatted = format!(
-				"{}{}: {}\r\n",
-				additional_headers_formatted, header.0, header.1,
-			);
-		}
-
-		let redir_str = format!(
-			"HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\n",
-			redirect.as_ref().unwrap_or(&"".to_string())
-		);
-
-		Ok(format!(
-			"{}{}{}{}{}\r\n{}",
-			if redirect.is_some() {
-				&redir_str
-			} else if found {
-				"HTTP/1.1 200 OK\r\n"
-			} else {
-				"HTTP/1.1 404 Not Found\r\n"
-			},
-			date,
-			server,
-			additional_headers_formatted,
-			transfer_encoding,
-			not_found_message,
-		))
-	}
-
-	pub fn write_headers(
-		wh: &WriteHandle,
-		config: &HttpConfig,
-		found: bool,
-		keep_alive: bool,
-		additional_headers: Vec<(String, String)>,
-		redirect: Option<String>,
-	) -> Result<(), Error> {
-		let response =
-			Self::build_headers(config, found, keep_alive, additional_headers, redirect)?;
-
-		let response = response.as_bytes();
-		wh.write(response, 0, response.len(), false)?;
-		if !found && !keep_alive {
-			wh.close()?;
 		}
 
 		Ok(())

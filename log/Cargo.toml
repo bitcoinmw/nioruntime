@@ -1,5 +1,5 @@
 [package]
-name = "log"
+name = "nioruntime_log"
 version = "0.0.1"
 authors = ["BMW Developers"]
 description = "utilities for nioruntime"

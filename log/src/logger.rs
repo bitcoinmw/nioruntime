@@ -45,7 +45,7 @@ lazy_static! {
 /// Also see [`trace`] [`debug`], [`info`], [`warn`], or [`error`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
@@ -62,16 +62,16 @@ lazy_static! {
 #[macro_export]
 macro_rules! fatal {
         () => {
-                log::do_log!(log::FATAL);
+                nioruntime_log::do_log!(nioruntime_log::FATAL);
         };
         ($a:expr) => {
                 {
-                        log::log!(log::FATAL, $a);
+                        nioruntime_log::log!(nioruntime_log::FATAL, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log!(log::FATAL, $a, $($b)*);
+                        nioruntime_log::log!(nioruntime_log::FATAL, $a, $($b)*);
                 }
         };
 }
@@ -81,12 +81,12 @@ macro_rules! fatal {
 macro_rules! fatal_no_ts {
         ($a:expr) => {
                 {
-                        log::log_no_ts!(log::FATAL, $a);
+                        nioruntime_log::log_no_ts!(nioruntime_log::FATAL, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log_no_ts!(log::FATAL, $a, $($b)*);
+                        nioruntime_log::log_no_ts!(nioruntime_log::FATAL, $a, $($b)*);
                 }
         };
 }
@@ -96,7 +96,7 @@ macro_rules! fatal_no_ts {
 /// Also see [`trace`], [`debug`], [`info`], [`warn`], or [`fatal`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
@@ -113,16 +113,16 @@ macro_rules! fatal_no_ts {
 #[macro_export]
 macro_rules! error {
         () => {
-                log::do_log!(log::ERROR);
+                nioruntime_log::do_log!(nioruntime_log::ERROR);
         };
         ($a:expr) => {
                 {
-                        log::log!(log::ERROR, $a);
+                        nioruntime_log::log!(nioruntime_log::ERROR, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log!(log::ERROR, $a, $($b)*);
+                        nioruntime_log::log!(nioruntime_log::ERROR, $a, $($b)*);
                 }
         };
 }
@@ -132,12 +132,12 @@ macro_rules! error {
 macro_rules! error_no_ts {
         ($a:expr) => {
                 {
-                        log::log_no_ts!(log::ERROR, $a);
+                        nioruntime_log::log_no_ts!(nioruntime_log::ERROR, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log_no_ts!(log::ERROR, $a, $($b)*);
+                        nioruntime_log::log_no_ts!(nioruntime_log::ERROR, $a, $($b)*);
                 }
         };
 }
@@ -147,7 +147,7 @@ macro_rules! error_no_ts {
 /// Also see [`trace`], [`debug`], [`info`], [`error`], or [`fatal`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
@@ -164,16 +164,16 @@ macro_rules! error_no_ts {
 #[macro_export]
 macro_rules! warn {
         () => {
-                log::do_log!(log::WARN);
+                nioruntime_log::do_log!(nioruntime_log::WARN);
         };
         ($a:expr) => {
 		{
-                	log::log!(log::WARN, $a);
+                	nioruntime_log::log!(nioruntime_log::WARN, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log!(log::WARN, $a, $($b)*);
+                	nioruntime_log::log!(nioruntime_log::WARN, $a, $($b)*);
 		}
         };
 }
@@ -183,12 +183,12 @@ macro_rules! warn {
 macro_rules! warn_no_ts {
         ($a:expr) => {
                 {
-                	log::log_no_ts!(log::WARN, $a);
+                	nioruntime_log::log_no_ts!(nioruntime_log::WARN, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log_no_ts!(log::WARN, $a, $($b)*);
+                	nioruntime_log::log_no_ts!(nioruntime_log::WARN, $a, $($b)*);
 		}
         };
 }
@@ -198,7 +198,7 @@ macro_rules! warn_no_ts {
 /// Also see [`trace`], [`debug`], [`warn`], [`error`], or [`fatal`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
@@ -215,16 +215,16 @@ macro_rules! warn_no_ts {
 #[macro_export]
 macro_rules! info {
 	() => {
-		log::do_log!(log::INFO);
+		nioruntime_log::do_log!(nioruntime_log::INFO);
 	};
         ($a:expr) => {
                 {
-                	log::log!(log::INFO, $a);
+                	nioruntime_log::log!(nioruntime_log::INFO, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log!(log::INFO, $a, $($b)*);
+                	nioruntime_log::log!(nioruntime_log::INFO, $a, $($b)*);
 		}
         };
 }
@@ -234,12 +234,12 @@ macro_rules! info {
 macro_rules! info_no_ts {
         ($a:expr) => {
                 {
-                	log::log_no_ts!(log::INFO, $a);
+                	nioruntime_log::log_no_ts!(nioruntime_log::INFO, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log_no_ts!(log::INFO, $a, $($b)*);
+                	nioruntime_log::log_no_ts!(nioruntime_log::INFO, $a, $($b)*);
 		}
         };
 }
@@ -249,7 +249,7 @@ macro_rules! info_no_ts {
 /// Also see [`trace`], [`info`], [`warn`], [`error`], or [`fatal`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
@@ -266,16 +266,16 @@ macro_rules! info_no_ts {
 #[macro_export]
 macro_rules! debug {
 	() => {
-		log::do_log!(log::DEBUG);
+		nioruntime_log::do_log!(nioruntime_log::DEBUG);
 	};
         ($a:expr) => {
                 {
-                	log!(log::DEBUG, $a);
+                	log!(nioruntime_log::DEBUG, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log!(log::DEBUG, $a, $($b)*);
+                	log!(nioruntime_log::DEBUG, $a, $($b)*);
 		}
         };
 }
@@ -285,12 +285,12 @@ macro_rules! debug {
 macro_rules! debug_no_ts {
         ($a:expr) => {
                 {
-                	log::log_no_ts!(log::DEBUG, $a);
+                	nioruntime_log::log_no_ts!(nioruntime_log::DEBUG, $a);
 		}
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                	log::log_no_ts!(log::DEBUG, $a, $($b)*);
+                	nioruntime_log::log_no_ts!(nioruntime_log::DEBUG, $a, $($b)*);
 		}
         };
 }
@@ -300,7 +300,7 @@ macro_rules! debug_no_ts {
 /// Also see [`debug`], [`info`], [`warn`], [`error`], or [`fatal`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
@@ -317,16 +317,16 @@ macro_rules! debug_no_ts {
 #[macro_export]
 macro_rules! trace {
         () => {
-                log::do_log!(log::TRACE);
+                nioruntime_log::do_log!(nioruntime_log::TRACE);
         };
         ($a:expr) => {
                 {
-                        log::log!(log::TRACE, $a);
+                        nioruntime_log::log!(nioruntime_log::TRACE, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log!(log::TRACE, $a, $($b)*);
+                        nioruntime_log::log!(nioruntime_log::TRACE, $a, $($b)*);
                 }
         };
 }
@@ -336,12 +336,12 @@ macro_rules! trace {
 macro_rules! trace_no_ts {
         ($a:expr) => {
                 {
-                        log::log_no_ts!(log::TRACE, $a);
+                        nioruntime_log::log_no_ts!(nioruntime_log::TRACE, $a);
                 }
         };
         ($a:expr,$($b:tt)*)=>{
                 {
-                        log::log_no_ts!(log::TRACE, $a, $($b)*);
+                        nioruntime_log::log_no_ts!(nioruntime_log::TRACE, $a, $($b)*);
                 }
         };
 }
@@ -350,32 +350,32 @@ macro_rules! trace_no_ts {
 /// the default logger.
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 /// // log level must be set before calling any logging function.
 /// // typically it is done at the top of a file so that it's easy to change.
 /// // but it can be done at any level or scope. The inner scope prevails.
 /// info!();
 ///
 /// let abc = 123;
-/// log_multi!(log::WARN, "logger2", "hi");
-/// log_multi!(log::WARN, "logger2", "value = {}", abc);
+/// log_multi!(nioruntime_log::WARN, "logger2", "hi");
+/// log_multi!(nioruntime_log::WARN, "logger2", "value = {}", abc);
 ///
 /// ```
 #[macro_export]
 macro_rules! log_multi {
 	($level:expr, $a:expr, $b:expr) => {
-		let static_log = &log::LOG;
+		let static_log = &nioruntime_log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
 				let log = log_map.get_mut($a);
 				match log {
 					Some(log) => {
-						log::do_log!($level, true, log, $b);
+						nioruntime_log::do_log!($level, true, log, $b);
 					},
 					None => {
-						let mut log = log::Log::new();
-						log::do_log!($level, true, log, $b);
+						let mut log = nioruntime_log::Log::new();
+						nioruntime_log::do_log!($level, true, log, $b);
 						log_map.insert($a.to_string(), log);
 					}
 				}
@@ -390,18 +390,18 @@ macro_rules! log_multi {
 		}
 	};
 	($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
-		let static_log = &log::LOG;
+		let static_log = &nioruntime_log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
 				let log = log_map.get_mut($a);
 				match log {
 					Some(log) => {
-						log::do_log!($level, true, log, $b, $($c)*);
+						nioruntime_log::do_log!($level, true, log, $b, $($c)*);
 					},
 					None => {
-						let mut log = log::Log::new();
-						log::do_log!($level, true, log, $b, $($c)*);
+						let mut log = nioruntime_log::Log::new();
+						nioruntime_log::do_log!($level, true, log, $b, $($c)*);
 						log_map.insert($a.to_string(), log);
 					}
 				}
@@ -423,13 +423,13 @@ macro_rules! log_multi {
 /// [`info`], [`warn`], [`error`], or [`fatal`].
 /// # Examples
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 ///
 /// info!(); // set log level to info "2"
 ///
 /// let abc = 123;
-/// log!(log::INFO, "my value = {}", abc);
-/// log!(log::INFO, "hi");
+/// log!(nioruntime_log::INFO, "my value = {}", abc);
+/// log!(nioruntime_log::INFO, "hi");
 ///
 /// // The output will look like this:
 /// // [2021-08-09 19:41:37]: my value = 123
@@ -440,18 +440,18 @@ macro_rules! log {
 	($level:expr, $a:expr)=>{
 		{
                 	const DEFAULT_LOG: &str = "default";
-                	let static_log = &log::LOG;
+                	let static_log = &nioruntime_log::LOG;
                 	let mut log_map = static_log.lock();
 			match log_map {
 				Ok(mut log_map) => {
                 	let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                 	match log {
                         	Some(log) => {
-                                	log::do_log!($level, true, log, $a);
+                                	nioruntime_log::do_log!($level, true, log, $a);
                         	},
                         	None => {
-                                	let mut log = log::Log::new();
-                                	log::do_log!($level, true, log, $a);
+                                	let mut log = nioruntime_log::Log::new();
+                                	nioruntime_log::do_log!($level, true, log, $a);
                                 	log_map.insert(DEFAULT_LOG.to_string(), log);
                         	}
                 	}
@@ -469,16 +469,16 @@ macro_rules! log {
 	($level:expr, $a:expr,$($b:tt)*)=>{
 		{
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &log::LOG;
+                        let static_log = &nioruntime_log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        log::do_log!($level, true, log, $a, $($b)*);
+                                        nioruntime_log::do_log!($level, true, log, $a, $($b)*);
                                 },
                                 None => {
-                                        let mut log = log::Log::new();
-                                        log::do_log!($level, true, log, $a, $($b)*);
+                                        let mut log = nioruntime_log::Log::new();
+                                        nioruntime_log::do_log!($level, true, log, $a, $($b)*);
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -491,7 +491,7 @@ macro_rules! log {
 /// # Examples
 ///
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 ///
 /// info!();
 ///
@@ -503,16 +503,16 @@ macro_rules! log {
 macro_rules! log_no_ts_multi {
         ($level:expr, $a:expr, $b:expr)=>{
                 {
-                        let static_log = &log::LOG;
+                        let static_log = &nioruntime_log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
                                 Some(log) => {
-                                        { log::do_log!($level, false, log, $b); }
+                                        { nioruntime_log::do_log!($level, false, log, $b); }
                                 },
                                 None => {
-                                        let mut log = log::Log::new();
-                                        { log::do_log!($level, false, log, $b); }
+                                        let mut log = nioruntime_log::Log::new();
+                                        { nioruntime_log::do_log!($level, false, log, $b); }
                                         log_map.insert($a.to_string(), log);
                                 }
                         }
@@ -520,16 +520,16 @@ macro_rules! log_no_ts_multi {
         };
         ($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
                 {
-                        let static_log = &log::LOG;
+                        let static_log = &nioruntime_log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
                                 Some(log) => {
-                                        { log::do_log!($level, false, log, $b, $($c)*) }
+                                        { nioruntime_log::do_log!($level, false, log, $b, $($c)*) }
                                 },
                                 None => {
-                                        let mut log = log::Log::new();
-                                        { log::do_log!($level, false, log, $b, $($c)*) }
+                                        let mut log = nioruntime_log::Log::new();
+                                        { nioruntime_log::do_log!($level, false, log, $b, $($c)*) }
                                         log_map.insert($a.to_string(), log);
                                 }
                         }
@@ -541,7 +541,7 @@ macro_rules! log_no_ts_multi {
 /// # Examples
 ///
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 ///
 /// debug!();
 ///
@@ -561,16 +561,16 @@ macro_rules! log_no_ts {
 	($level:expr, $a:expr)=>{
                 {
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &log::LOG;
+                        let static_log = &nioruntime_log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        { log::do_log!($level, false, log, $a); }
+                                        { nioruntime_log::do_log!($level, false, log, $a); }
                                 },
                                 None => {
-                                        let mut log = log::Log::new();
-                                        { log::do_log!($level, false, log, $a); }
+                                        let mut log = nioruntime_log::Log::new();
+                                        { nioruntime_log::do_log!($level, false, log, $a); }
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -580,16 +580,16 @@ macro_rules! log_no_ts {
 		{
 
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &log::LOG;
+                        let static_log = &nioruntime_log::LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
                                 Some(log) => {
-                                        { log::do_log!($level, false, log, $a, $($b)*) }
+                                        { nioruntime_log::do_log!($level, false, log, $a, $($b)*) }
                                 },
                                 None => {
-                                        let mut log = log::Log::new();
-                                        { log::do_log!($level, false, log, $a, $($b)*) }
+                                        let mut log = nioruntime_log::Log::new();
+                                        { nioruntime_log::do_log!($level, false, log, $a, $($b)*) }
                                         log_map.insert(DEFAULT_LOG.to_string(), log);
                                 }
                         }
@@ -607,7 +607,7 @@ macro_rules! do_log {
 			{
                                         // if not configured, use defaults
                                         if !$log.is_configured() {
-                                                $log.config_with_object(log::LogConfig::default()).unwrap();
+                                                $log.config_with_object(nioruntime_log::LogConfig::default()).unwrap();
                                         }
 
 					let _ = $log.update_show_timestamp($show_ts);
@@ -633,7 +633,7 @@ macro_rules! do_log {
 			{
                                         // if not configured, use defaults
                                         if !$log.is_configured() {
-                                                $log.config_with_object(log::LogConfig::default()).unwrap();
+                                                $log.config_with_object(nioruntime_log::LogConfig::default()).unwrap();
                                         }
 
 					let _ = $log.update_show_timestamp($show_ts);
@@ -660,7 +660,7 @@ macro_rules! do_log {
 /// A sample log_config_multi! call might look something like this:
 ///
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 ///
 /// info!();
 ///
@@ -678,7 +678,7 @@ macro_rules! do_log {
 #[macro_export]
 macro_rules! log_config_multi {
 	($a:expr, $b:expr) => {{
-		let static_log = &log::LOG;
+		let static_log = &nioruntime_log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
@@ -686,7 +686,7 @@ macro_rules! log_config_multi {
 				match log {
 					Some(log) => log.config_with_object($b),
 					None => {
-						let mut log = log::Log::new();
+						let mut log = nioruntime_log::Log::new();
 						let ret = log.config_with_object($b);
 						log_map.insert($a.to_string(), log);
 						ret
@@ -707,11 +707,11 @@ macro_rules! log_config_multi {
 /// A sample log_config! call might look something like this:
 ///
 /// ```
-/// use log::*;
+/// use nioruntime_log::*;
 ///
 /// info!();
 ///
-/// log_config!(log::LogConfig {
+/// log_config!(nioruntime_log::LogConfig {
 /// 	max_age_millis: 10000, // set log rotations to every 10 seconds
 /// 	max_size: 10000, // set log rotations to every 10,000 bytes
 /// 	..Default::default()
@@ -722,7 +722,7 @@ macro_rules! log_config_multi {
 macro_rules! log_config {
 	($a:expr) => {{
 		const DEFAULT_LOG: &str = "default";
-		let static_log = &log::LOG;
+		let static_log = &nioruntime_log::LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
@@ -730,7 +730,7 @@ macro_rules! log_config {
 				match log {
 					Some(log) => log.config_with_object($a),
 					None => {
-						let mut log = log::Log::new();
+						let mut log = nioruntime_log::Log::new();
 						let ret = log.config_with_object($a);
 						log_map.insert(DEFAULT_LOG.to_string(), log);
 						ret

@@ -200,7 +200,7 @@ pub fn deserialize<T: Readable, R: Read>(source: &mut R) -> Result<T, Error> {
 	T::read(&mut reader)
 }
 
-/// Deserialize a Readable based on our default "local" protocol version.
+/// Deserialize a Readable
 pub fn deserialize_default<T: Readable, R: Read>(source: &mut R) -> Result<T, Error> {
 	deserialize(source)
 }
@@ -211,7 +211,7 @@ pub fn serialize<W: Writeable>(sink: &mut dyn Write, thing: &W) -> Result<(), Er
 	thing.write(&mut writer)
 }
 
-/// Serialize a Writeable according to our default "local" protocol version.
+/// Serialize a Writeable
 pub fn serialize_default<W: Writeable>(sink: &mut dyn Write, thing: &W) -> Result<(), Error> {
 	serialize(sink, thing)
 }
@@ -230,7 +230,7 @@ pub struct BinReader<'a, R: Read> {
 }
 
 impl<'a, R: Read> BinReader<'a, R> {
-	/// Constructor for a new BinReader for the provided source and protocol version.
+	/// Constructor for a new BinReader
 	pub fn new(source: &'a mut R) -> Self {
 		BinReader { source }
 	}
@@ -377,7 +377,7 @@ impl<'a> Reader for StreamingReader<'a> {
 	}
 }
 
-/// Protocol version-aware wrapper around a `Buf` impl
+/// Wrapper around a `Buf` impl
 pub struct BufReader<'a, B: Buf> {
 	inner: &'a mut B,
 	bytes_read: usize,
@@ -490,7 +490,7 @@ impl<'a> BinWriter<'a> {
 		BinWriter { sink }
 	}
 
-	/// Constructor for BinWriter with default "local" protocol version.
+	/// Constructor for BinWriter
 	pub fn default(sink: &'a mut dyn Write) -> BinWriter<'a> {
 		BinWriter::new(sink)
 	}
