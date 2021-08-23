@@ -82,6 +82,8 @@ pub enum HttpVersion {
 	V09,
 }
 
+type Housekeeper = fn() -> Result<(), Error>;
+
 type Callback = fn(
 	Arc<RwLock<ConnData>>,
 	&[u8],
@@ -114,6 +116,10 @@ fn empty_on_panic() -> Result<(), Error> {
 	Ok(())
 }
 
+fn empty_housekeeper() -> Result<(), Error> {
+	Ok(())
+}
+
 #[derive(Clone)]
 pub struct HttpConfig {
 	pub host: String,
@@ -133,6 +139,7 @@ pub struct HttpConfig {
 	pub read_timeout: u128,
 	pub callback: Callback,
 	pub on_panic: OnPanic,
+	pub on_housekeeper: Housekeeper,
 	pub debug: bool,
 }
 
@@ -162,6 +169,7 @@ impl Default for HttpConfig {
 			read_timeout: 1000 * 30,                      // 30 seconds
 			callback: empty_callback,
 			on_panic: empty_on_panic,
+			on_housekeeper: empty_housekeeper,
 			debug: false,
 		}
 	}
@@ -1054,6 +1062,18 @@ impl HttpServer {
 				})?;
 				http_context.stats.idledisc += idledisc_incr;
 				http_context.stats.rtimeout += rtimeout_incr;
+			}
+
+			match (http_config.on_housekeeper)() {
+				Ok(_) => {}
+				Err(e) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"error in on_housekeeper, err={}",
+						e.to_string(),
+					);
+				}
 			}
 		}
 		Ok(())
