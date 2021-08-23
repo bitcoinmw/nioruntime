@@ -125,9 +125,10 @@ fn empty_housekeeper() -> Result<(), Error> {
 /// # Examples
 ///
 /// ```
+/// use nioruntime_http::HttpConfig;
 /// let config = HttpConfig {
 ///     port: 80,
-///     ..HttpConfig::Default()
+///     ..HttpConfig::default()
 /// };
 /// ```
 #[derive(Clone)]
