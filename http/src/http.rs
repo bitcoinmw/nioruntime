@@ -288,6 +288,23 @@ impl HttpContext {
 }
 
 /// The main struct representing an [`HttpServer`].
+/// # Examples
+///
+/// ```
+/// use nioruntime_http::HttpConfig;
+/// use nioruntime_http::HttpServer;
+/// use nioruntime_util::Error;
+///
+/// fn test() -> Result<(), Error> {
+///     let config = HttpConfig {
+///         port: 80,
+///         ..HttpConfig::default()
+///     };
+///     let mut http_server = HttpServer::new(config);
+///     http_server.start()?;
+///     Ok(())
+/// }
+/// ```
 pub struct HttpServer {
 	/// The config of this [`HttpServer`].
 	pub config: HttpConfig,
