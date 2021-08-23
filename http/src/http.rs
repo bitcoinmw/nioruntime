@@ -120,26 +120,69 @@ fn empty_housekeeper() -> Result<(), Error> {
 	Ok(())
 }
 
+/// The configuration struct for an [`HttpServer`]. The [`Default`] trait
+/// is implemented for this struct so default can be used like below.
+/// # Examples
+///
+/// ```
+/// let config = HttpConfig {
+///     port: 80,
+///     ..HttpConfig::Default()
+/// };
+/// ```
 #[derive(Clone)]
 pub struct HttpConfig {
+	/// The host to bind to. In most cases, this is `0.0.0.0` or `127.0.0.1`.
+	/// By default this is `0.0.0.0`.
 	pub host: String,
+	/// The port to bind to. The default is 8080.
 	pub port: u16,
+	/// The root directory of the http daemon. By default ~/.niohttpd is used.
 	pub root_dir: String,
+	/// Size of the thread_pool. The default value is 6.
 	pub thread_pool_size: usize,
+	/// The name of the server. The default is `"NIORuntime Httpd <version>"`
 	pub server_name: String,
+	/// Which parameters to log into the request log. The default values are:
+	/// * `method` - Http Method of the request.
+	/// * `uri` - Http URI of the request.
+	/// * `query` - The query string of the request.
+	/// * `User-Agent` - The user-agent making the request.
+	/// * `Referer` - The Http referer of this request.
+	/// Any additional header may be chosen. If it exists, it will be logged in
+	/// the request log.
 	pub request_log_params: Vec<String>,
+	/// The separator char of the request log. By default `|` is used.
 	pub request_log_separator_char: char,
+	/// The maximum size in bytes of the request log.
 	pub request_log_max_size: u64,
+	/// The maximum age in milliseconds of the request log.
 	pub request_log_max_age_millis: u128,
+	/// The maximum size in bytes of the main log.
 	pub main_log_max_size: u64,
+	/// The maximum age in milliseconds of the main log.
 	pub main_log_max_age_millis: u128,
+	/// The maximum size in bytes of the stats log.
 	pub stats_log_max_size: u64,
+	/// The maximum age in milliseconds of the stats log.
 	pub stats_log_max_age_millis: u128,
+	/// The amount of time in milliseconds to wait beforing closing a connection.
+	/// This is set to 2 minutes by default. This means that if a request is made,
+	/// and no additional requests are made for two minutes, the connection will be
+	/// closed.
 	pub last_request_timeout: u128,
+	/// The amount of time in milliseconds before disconnecting a connection. By
+	/// default, this is 30 seconds. This is different than `last_request_timeout`
+	/// in that that parameter is used if a request has already been made on a connection.
+	/// This one is used if no requests have been made.
 	pub read_timeout: u128,
+	/// The callback used for APIs. This is specified by the rustlet project for example.
 	pub callback: Callback,
+	/// The handler for panics that occur in the thread pool.
 	pub on_panic: OnPanic,
+	/// The handler that is called every second by the Housekeeper thread.
 	pub on_housekeeper: Housekeeper,
+	/// Whether or not to print debugging information to stdout.
 	pub debug: bool,
 }
 
@@ -603,12 +646,12 @@ impl HttpServer {
 	}
 
 	/// Write headers the connection associated with this WriteHandle.
-	/// `wh` - The write handle to use to write.
-	/// `config` - The [`HttpConfig`] associated with this connection.
-	/// `found` - Whether or not this file was found.
-	/// `keep-alive` - Whether or not to keep the connection alive after this response is sent.
-	/// `additional_headers` - Additional headers to send with this response.
-	/// `redirect` - Optional redirect for this request.
+	/// * `wh` - The write handle to use to write.
+	/// * `config` - The [`HttpConfig`] associated with this connection.
+	/// * `found` - Whether or not this file was found.
+	/// * `keep-alive` - Whether or not to keep the connection alive after this response is sent.
+	/// * `additional_headers` - Additional headers to send with this response.
+	/// * `redirect` - Optional redirect for this request.
 	pub fn write_headers(
 		wh: &WriteHandle,
 		config: &HttpConfig,
@@ -630,11 +673,11 @@ impl HttpServer {
 	}
 
 	/// Build (but do not write) headers based on specified parameters.
-	/// `config` - The [`HttpConfig`] associated with this connection.
-	/// `found` - Whether or not this file was found.
-	/// `keep-alive` - Whether or not to keep the connection alive after this response is sent.
-	/// `additional_headers` - Additional headers to send with this response.
-	/// `redirect` - Optional redirect for this request.
+	/// * `config` - The [`HttpConfig`] associated with this connection.
+	/// * `found` - Whether or not this file was found.
+	/// * `keep-alive` - Whether or not to keep the connection alive after this response is sent.
+	/// * `additional_headers` - Additional headers to send with this response.
+	/// * `redirect` - Optional redirect for this request.
 	pub fn build_headers(
 		config: &HttpConfig,
 		found: bool,
