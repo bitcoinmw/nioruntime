@@ -245,7 +245,8 @@ impl HttpContext {
 
 /// The main struct representing an [`HttpServer`].
 pub struct HttpServer {
-	config: HttpConfig,
+	/// The config of this [`HttpServer`].
+	pub config: HttpConfig,
 	listener: Option<TcpListener>,
 	http_context: Option<Arc<RwLock<HttpContext>>>,
 	thread_pool: Option<Arc<RwLock<StaticThreadPool>>>,
