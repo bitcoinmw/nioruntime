@@ -17,9 +17,8 @@ use libc::timespec;
 #[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use std::time::Duration;
 
-pub mod eventhandler;
-
-pub use nioruntime_util as util;
+mod eventhandler;
+use nioruntime_util as util;
 
 pub use crate::eventhandler::{EventHandler, WriteHandle};
 

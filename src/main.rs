@@ -28,7 +28,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
 use errno::errno;
-use nioruntime_evh::eventhandler::EventHandler;
+use nioruntime_evh::EventHandler;
 use nioruntime_http::HttpConfig;
 use nioruntime_http::HttpServer;
 use nioruntime_log::*;
