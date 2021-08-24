@@ -908,7 +908,7 @@ impl HttpServer {
 			let mut rotate_complete = false;
 			let mut auto_rotate_complete = false;
 			{
-				let static_log = &LOG;
+				let static_log = &STATIC_LOG;
 				let log_map = static_log.lock();
 
 				match log_map {
@@ -1060,7 +1060,7 @@ impl HttpServer {
 			let mut rotate_complete = false;
 			let mut auto_rotate_complete = false;
 			{
-				let static_log = &LOG;
+				let static_log = &STATIC_LOG;
 				let log_map = static_log.lock();
 
 				match log_map {

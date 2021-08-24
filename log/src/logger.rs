@@ -37,7 +37,7 @@ pub const FATAL: i32 = 5;
 lazy_static! {
 	/// This is the static holder of all log objects. Generally this
 	/// should not be called directly. See [`log`] instead.
-	pub static ref LOG: Arc<Mutex<HashMap<String, Log>>> = Arc::new(Mutex::new(HashMap::new()));
+	pub static ref STATIC_LOG: Arc<Mutex<HashMap<String, Log>>> = Arc::new(Mutex::new(HashMap::new()));
 }
 
 /// Log at the 'fatal' (5) log level. This macro calls the default logger. To configure this
@@ -364,7 +364,7 @@ macro_rules! trace_no_ts {
 #[macro_export]
 macro_rules! log_multi {
 	($level:expr, $a:expr, $b:expr) => {
-		let static_log = &nioruntime_log::LOG;
+		let static_log = &nioruntime_log::STATIC_LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
@@ -390,7 +390,7 @@ macro_rules! log_multi {
 		}
 	};
 	($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
-		let static_log = &nioruntime_log::LOG;
+		let static_log = &nioruntime_log::STATIC_LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
@@ -440,7 +440,7 @@ macro_rules! log {
 	($level:expr, $a:expr)=>{
 		{
                 	const DEFAULT_LOG: &str = "default";
-                	let static_log = &nioruntime_log::LOG;
+                	let static_log = &nioruntime_log::STATIC_LOG;
                 	let mut log_map = static_log.lock();
 			match log_map {
 				Ok(mut log_map) => {
@@ -469,7 +469,7 @@ macro_rules! log {
 	($level:expr, $a:expr,$($b:tt)*)=>{
 		{
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &nioruntime_log::LOG;
+                        let static_log = &nioruntime_log::STATIC_LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
@@ -503,7 +503,7 @@ macro_rules! log {
 macro_rules! log_no_ts_multi {
         ($level:expr, $a:expr, $b:expr)=>{
                 {
-                        let static_log = &nioruntime_log::LOG;
+                        let static_log = &nioruntime_log::STATIC_LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
@@ -520,7 +520,7 @@ macro_rules! log_no_ts_multi {
         };
         ($level:expr, $a:expr,$b:expr,$($c:tt)*)=>{
                 {
-                        let static_log = &nioruntime_log::LOG;
+                        let static_log = &nioruntime_log::STATIC_LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut($a);
                         match log {
@@ -561,7 +561,7 @@ macro_rules! log_no_ts {
 	($level:expr, $a:expr)=>{
                 {
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &nioruntime_log::LOG;
+                        let static_log = &nioruntime_log::STATIC_LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
@@ -580,7 +580,7 @@ macro_rules! log_no_ts {
 		{
 
                         const DEFAULT_LOG: &str = "default";
-                        let static_log = &nioruntime_log::LOG;
+                        let static_log = &nioruntime_log::STATIC_LOG;
                         let mut log_map = static_log.lock().unwrap();
                         let log = log_map.get_mut(&DEFAULT_LOG.to_string());
                         match log {
@@ -678,7 +678,7 @@ macro_rules! do_log {
 #[macro_export]
 macro_rules! log_config_multi {
 	($a:expr, $b:expr) => {{
-		let static_log = &nioruntime_log::LOG;
+		let static_log = &nioruntime_log::STATIC_LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {
@@ -722,7 +722,7 @@ macro_rules! log_config_multi {
 macro_rules! log_config {
 	($a:expr) => {{
 		const DEFAULT_LOG: &str = "default";
-		let static_log = &nioruntime_log::LOG;
+		let static_log = &nioruntime_log::STATIC_LOG;
 		let mut log_map = static_log.lock();
 		match log_map {
 			Ok(mut log_map) => {

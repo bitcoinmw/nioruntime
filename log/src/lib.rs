@@ -14,5 +14,5 @@
 
 pub mod logger;
 
-pub use crate::logger::{Log, LogConfig, RotationStatus, LOG};
+pub use crate::logger::{Log, LogConfig, RotationStatus, STATIC_LOG};
 pub use crate::logger::{DEBUG, ERROR, FATAL, INFO, TRACE, WARN};
