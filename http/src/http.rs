@@ -250,6 +250,10 @@ impl ConnData {
 			needed_len: 0,
 		}
 	}
+
+	pub fn get_buffer(&self) -> Vec<u8> {
+		self.buffer.clone()
+	}
 }
 
 struct HttpStats {
