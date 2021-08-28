@@ -279,7 +279,6 @@ impl HttpStats {
 struct HttpContext {
 	stop: bool,
 	map: Arc<RwLock<HashMap<u128, Arc<RwLock<ConnData>>>>>,
-	log_queue: Vec<RequestLogItem>,
 	stats: HttpStats,
 	api_mappings: HashSet<String>,
 	api_extensions: HashSet<String>,
@@ -290,7 +289,6 @@ impl HttpContext {
 		HttpContext {
 			stop: false,
 			map: Arc::new(RwLock::new(HashMap::new())),
-			log_queue: vec![],
 			stats: HttpStats::new(),
 			api_mappings: HashSet::new(),
 			api_extensions: HashSet::new(),
@@ -321,6 +319,7 @@ pub struct HttpServer {
 	pub config: HttpConfig,
 	listener: Option<TcpListener>,
 	http_context: Option<Arc<RwLock<HttpContext>>>,
+	log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 	thread_pool: Option<Arc<RwLock<StaticThreadPool>>>,
 }
 
@@ -357,10 +356,13 @@ impl HttpServer {
 			}
 		}
 
+		let log_queue = Arc::new(RwLock::new(vec![]));
+
 		HttpServer {
 			config: cloned_config,
 			listener: None,
 			http_context: None,
+			log_queue,
 			thread_pool: None,
 		}
 	}
@@ -422,6 +424,8 @@ impl HttpServer {
 	/// is printed to the mainlog file location.
 	pub fn start(&mut self) -> Result<(), Error> {
 		let addr = format!("{}:{}", self.config.host, self.config.port,);
+		let log_queue = self.log_queue.clone();
+		let log_queue_clone = log_queue.clone();
 
 		log_config_multi!(
 			MAIN_LOG,
@@ -552,6 +556,7 @@ impl HttpServer {
 				buf,
 				len,
 				wh,
+				log_queue.clone(),
 			)
 		})?;
 		eh.set_on_accept(move |id, wh| {
@@ -614,7 +619,11 @@ impl HttpServer {
 		});
 
 		std::thread::spawn(move || {
-			Self::request_log(http_context_clone5, http_config_clone3.clone())
+			Self::request_log(
+				http_context_clone5,
+				http_config_clone3.clone(),
+				log_queue_clone,
+			)
 		});
 
 		std::thread::spawn(move || {
@@ -970,6 +979,7 @@ impl HttpServer {
 	fn request_log(
 		http_context: Arc<RwLock<HttpContext>>,
 		http_config: HttpConfig,
+		log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 	) -> Result<(), Error> {
 		let mut log = Log::new();
 
@@ -1000,17 +1010,19 @@ impl HttpServer {
 		let mut to_log;
 		loop {
 			std::thread::sleep(std::time::Duration::from_millis(100));
+			{
+				let mut log_queue = nioruntime_util::lockw!(log_queue);
+				to_log = log_queue.clone();
+				(*log_queue).clear();
+			}
 			let stop = {
-				let mut http_context = http_context.write().map_err(|_e| {
+				let http_context = http_context.read().map_err(|_e| {
 					let error: Error = ErrorKind::InternalError(
 						"unexpected error obtaining http_context lock".to_string(),
 					)
 					.into();
 					error
 				})?;
-
-				to_log = http_context.log_queue.clone();
-				http_context.log_queue.clear();
 
 				http_context.stop
 			};
@@ -1331,6 +1343,7 @@ impl HttpServer {
 		buf: &[u8],
 		len: usize,
 		wh: WriteHandle,
+		log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 	) -> Result<(), Error> {
 		let (conn_data, mappings, extensions) = {
 			let http_context = http_context.write().map_err(|e| {
@@ -1404,14 +1417,21 @@ impl HttpServer {
 
 		match log_item {
 			Some(log_item) => {
-				let mut http_context = http_context.write().map_err(|e| {
-					let error: Error =
-						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
-							.into();
-					error
-				})?;
-				http_context.log_queue.push(log_item);
-				http_context.stats.requests += 1;
+				{
+					let mut http_context = http_context.write().map_err(|e| {
+						let error: Error =
+							ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+								.into();
+						error
+					})?;
+					//http_context.log_queue.push(log_item);
+					http_context.stats.requests += 1;
+				}
+
+				{
+					let mut log_queue = nioruntime_util::lockw!(log_queue);
+					log_queue.push(log_item);
+				}
 			}
 			None => {}
 		}
