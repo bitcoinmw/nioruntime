@@ -1709,11 +1709,6 @@ where
 					Ok(_) => {}
 					Err(e) => info!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
 				}
-			} else if evt.etype == GenericEventType::DelRead {
-				interest |= EpollFlags::EPOLLIN;
-				filter_set.remove(&evt.fd);
-			} else if evt.etype == GenericEventType::DelWrite {
-				interest |= EpollFlags::EPOLLOUT;
 			} else {
 				return Err(
 					ErrorKind::InternalError(format!("unexpected etype: {:?}", evt.etype)).into(),
