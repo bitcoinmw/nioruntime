@@ -29,6 +29,7 @@ use clap::load_yaml;
 use clap::App;
 use errno::errno;
 use nioruntime_evh::EventHandler;
+use nioruntime_evh::EventHandlerConfig;
 use nioruntime_http::HttpConfig;
 use nioruntime_http::HttpServer;
 use nioruntime_log::*;
@@ -303,68 +304,68 @@ fn real_main() -> Result<(), Error> {
 	} else {
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
 		info!("Listener Started");
-		let mut eh = EventHandler::new();
+		let mut eh = EventHandler::new(EventHandlerConfig { thread_count: 6 });
 
-		let buffers: Arc<Mutex<HashMap<u128, Buffer>>> = Arc::new(Mutex::new(HashMap::new()));
+		let buffers: Arc<Mutex<HashMap<u128, Arc<Mutex<Buffer>>>>> =
+			Arc::new(Mutex::new(HashMap::new()));
 		let buffers_clone = buffers.clone();
 		let buffers_clone2 = buffers.clone();
 		eh.set_on_read(move |buf, len, wh| {
-			let mut buffers = buffers_clone2.lock().unwrap();
-			let held_buf = &mut buffers.get_mut(&wh.get_connection_id());
-			match held_buf {
-				Some(held_buf) => {
-					copy(
-						&buf[0..len],
-						&mut held_buf.data[held_buf.len..held_buf.len + len],
-					);
-					held_buf.len += len;
-					if held_buf.len < 5 {
-						// not enough data
-						Ok(())
-					} else {
-						let exp_len =
-							Cursor::new(&held_buf.data[0..4]).read_u32::<LittleEndian>()?;
-						let offt = held_buf.data[4] as u32;
-						if exp_len + 5 == held_buf.len as u32 {
-							let ret_len = held_buf.len;
-							held_buf.len = 0;
+			let held_buf;
+			{
+				let mut buffers = buffers_clone2.lock().unwrap();
+				let held_buf2 = buffers.get_mut(&wh.get_connection_id()).unwrap();
+				held_buf = held_buf2.clone()
+			}
 
-							// do assertion for our test
-							for i in 0..ret_len - 5 {
-								if held_buf.data[i as usize + 5]
-									!= ((i + offt as usize) % 128) as u8
-								{
-									info!("invalid data at index = {}", i + 5);
-								}
-								assert_eq!(
-									held_buf.data[i as usize + 5],
-									((i + offt as usize) % 128) as u8
-								);
-							}
+			let mut held_buf = held_buf.lock().unwrap();
+			let hbuf_len = (*held_buf).len;
+			copy(
+				&buf[0..len],
+				&mut (*held_buf).data[hbuf_len..hbuf_len + len],
+			);
+			(*held_buf).len += len;
+			if (*held_buf).len < 5 {
+				// not enough data
+				Ok(())
+			} else {
+				let exp_len = Cursor::new(&(*held_buf).data[0..4]).read_u32::<LittleEndian>()?;
+				let offt = (*held_buf).data[4] as u32;
+				if exp_len + 5 == (*held_buf).len as u32 {
+					let ret_len = (*held_buf).len;
+					(*held_buf).len = 0;
 
-							// special case, we disconnect at this len for testing.
-							// client is aware and should do an assertion on disconnect.
-							wh.write(&held_buf.data.to_vec(), 0, ret_len, exp_len == 99990)?;
-							Ok(())
-						} else {
-							Ok(())
+					// do assertion for our test
+					for i in 0..ret_len - 5 {
+						if (*held_buf).data[i as usize + 5] != ((i + offt as usize) % 128) as u8 {
+							info!("invalid data at index = {}", i + 5);
 						}
+						assert_eq!(
+							(*held_buf).data[i as usize + 5],
+							((i + offt as usize) % 128) as u8
+						);
 					}
-				}
-				None => {
-					info!("unexpected none: {}, len = {}", wh.get_connection_id(), len);
+
+					// special case, we disconnect at this len for testing.
+					// client is aware and should do an assertion on disconnect.
+					wh.write(&(*held_buf).data.to_vec()[0..ret_len])?;
+					if exp_len == 99990 {
+						wh.close()?;
+					}
+					Ok(())
+				} else {
 					Ok(())
 				}
 			}
 		})?;
 		eh.set_on_client_read(move |buf, len, wh| {
-			wh.write(&buf.to_vec(), 0, len, false)?;
+			wh.write(&buf.to_vec()[0..len])?;
 			Ok(())
 		})?;
 		eh.set_on_accept(move |connection_id, _wh| {
 			let mut buffers = buffers.lock().unwrap();
 
-			buffers.insert(connection_id, Buffer::new());
+			buffers.insert(connection_id, Arc::new(Mutex::new(Buffer::new())));
 
 			Ok(())
 		})?;

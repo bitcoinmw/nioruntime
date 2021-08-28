@@ -18,9 +18,8 @@ use libc::timespec;
 use std::time::Duration;
 
 mod eventhandler;
-use nioruntime_util as util;
 
-pub use crate::eventhandler::{EventHandler, WriteHandle};
+pub use crate::eventhandler::{EventHandler, EventHandlerConfig, WriteHandle};
 
 // Some needed timespec code
 

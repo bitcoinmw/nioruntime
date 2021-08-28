@@ -14,7 +14,7 @@
 
 use bytefmt;
 use dirs;
-pub use nioruntime_evh::{EventHandler, WriteHandle};
+pub use nioruntime_evh::{EventHandler, EventHandlerConfig, WriteHandle};
 use nioruntime_log::*;
 use nioruntime_util::threadpool::OnPanic;
 use nioruntime_util::threadpool::StaticThreadPool;
@@ -530,7 +530,8 @@ impl HttpServer {
 		let http_context_clone5 = http_context.clone();
 		let http_context_clone6 = http_context.clone();
 		let http_context_clone7 = http_context.clone();
-		let mut eh = EventHandler::new();
+
+		let mut eh = EventHandler::new(EventHandlerConfig::default());
 
 		eh.set_on_read(move |buf, len, wh| {
 			Self::process_read(
@@ -560,7 +561,6 @@ impl HttpServer {
 				id,
 			)
 		})?;
-
 		eh.start()?;
 		eh.add_tcp_listener(&listener)?;
 		self.listener = Some(listener);
@@ -682,7 +682,7 @@ impl HttpServer {
 			Self::build_headers(config, found, keep_alive, additional_headers, redirect)?;
 
 		let response = response.as_bytes();
-		wh.write(response, 0, response.len(), false)?;
+		wh.write(response)?;
 		if !found && !keep_alive {
 			wh.close()?;
 		}
@@ -1314,7 +1314,7 @@ impl HttpServer {
 	}
 
 	fn process_read(
-		thread_pool: Arc<RwLock<StaticThreadPool>>,
+		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
 		http_config: HttpConfig,
 		buf: &[u8],
@@ -1357,12 +1357,13 @@ impl HttpServer {
 			}
 		};
 
-		let thread_pool = thread_pool.read().map_err(|e| {
-			let error: Error =
-				ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
-			error
-		})?;
-
+		/*
+				let thread_pool = thread_pool.read().map_err(|e| {
+					let error: Error =
+						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
+					error
+				})?;
+		*/
 		{
 			let mut conn_data = conn_data.write().map_err(|e| {
 				let error: Error =
@@ -1381,26 +1382,26 @@ impl HttpServer {
 			}
 		}
 
-		thread_pool.execute(async move {
-			match Self::process_request(
-				http_config,
-				conn_data,
-				wh,
-				http_context,
-				mappings,
-				extensions,
-			) {
-				Ok(_) => {}
-				Err(e) => {
-					log_multi!(
-						ERROR,
-						MAIN_LOG,
-						"unexpected error processing request: {}",
-						e.to_string()
-					);
-				}
+		//		thread_pool.execute(async move {
+		match Self::process_request(
+			http_config,
+			conn_data,
+			wh,
+			http_context,
+			mappings,
+			extensions,
+		) {
+			Ok(_) => {}
+			Err(e) => {
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"unexpected error processing request: {}",
+					e.to_string()
+				);
 			}
-		})?;
+		}
+		//		})?;
 
 		Ok(())
 	}
@@ -1438,7 +1439,7 @@ impl HttpServer {
 
 				if len <= 3 {
 					// not enough data, go away until more is available
-					return Ok(());
+					break;
 				}
 				let mut end_buf;
 				let mut start_buf;
@@ -1695,7 +1696,8 @@ impl HttpServer {
 			num
 		);
 		let response = msg.as_bytes();
-		wh.write(response, 0, response.len(), true)?;
+		wh.write(response)?;
+		wh.close()?;
 		Ok(())
 	}
 
@@ -1757,18 +1759,24 @@ impl HttpServer {
 							if keep_alive {
 								let msg_len_bytes = format!("{:X}\r\n", amt);
 								let msg_len_bytes = msg_len_bytes.as_bytes();
-								wh.write(msg_len_bytes, 0, msg_len_bytes.len(), false)?;
-								wh.write(&buf, 0, amt, false)?;
+								wh.write(msg_len_bytes)?;
+								wh.write(&buf[0..amt])?;
 								if flen <= amt.try_into().unwrap_or(0) {
-									wh.write("\r\n0\r\n\r\n".as_bytes(), 0, 7, !keep_alive)?;
+									wh.write("\r\n0\r\n\r\n".as_bytes())?;
+									if !keep_alive {
+										wh.close()?;
+									}
 								} else {
-									wh.write("\r\n".as_bytes(), 0, 2, false)?;
+									wh.write("\r\n".as_bytes())?;
 								}
 							} else {
 								if flen <= amt.try_into().unwrap_or(0) {
-									wh.write(&buf, 0, amt, !keep_alive)?;
+									wh.write(&buf[0..amt])?;
+									if !keep_alive {
+										wh.close()?;
+									}
 								} else {
-									wh.write(&buf, 0, amt, false)?;
+									wh.write(&buf[0..amt])?;
 								}
 							}
 							flen -= amt.try_into().unwrap_or(0);

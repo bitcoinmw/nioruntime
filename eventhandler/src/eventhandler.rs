@@ -10,7 +10,29 @@
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
-// limitations under the License.
+// limitations under the License
+
+use errno::errno;
+use libc::{accept, c_int, c_void, EAGAIN};
+use nioruntime_log::*;
+use nioruntime_util::{Error, ErrorKind};
+use rand::Rng;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::LinkedList;
+use std::convert::TryInto;
+use std::net::{TcpListener, TcpStream};
+use std::pin::Pin;
+use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, RwLock};
+use std::thread::spawn;
+
+// linux deps
+#[cfg(target_os = "linux")]
+use nix::sys::epoll::{
+	epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
+};
 
 // macos/bsd deps
 #[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
@@ -20,270 +42,24 @@ use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
 #[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
 
-// linux deps
-#[cfg(target_os = "linux")]
-use nix::sys::epoll::{
-	epoll_create1, epoll_ctl, epoll_wait, EpollCreateFlags, EpollEvent, EpollFlags, EpollOp,
-};
-
-debug!();
-
+// unix deps
 #[cfg(unix)]
-type ConnectionHandle = i32;
-#[cfg(target_os = "windows")]
-type ConnectionHandle = u64;
-
-// unix specific deps
-#[cfg(unix)]
-use libc::fcntl;
-#[cfg(unix)]
-use libc::{close, pipe, read, write};
+use libc::{close, fcntl, pipe, read, uintptr_t, write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-use crate::util::threadpool::StaticThreadPool;
-use crate::util::{Error, ErrorKind};
-use errno::errno;
-use libc::accept;
-use libc::c_int;
-use libc::c_void;
-use libc::uintptr_t;
-use libc::EAGAIN;
-use nioruntime_log::*;
-use std::collections::HashSet;
-use std::collections::LinkedList;
-use std::convert::TryInto;
-use std::net::TcpListener;
-use std::net::TcpStream;
-#[cfg(target_os = "windows")]
-use std::os::windows::io::AsRawSocket;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::spawn;
-#[cfg(target_os = "windows")]
-use wepoll_sys::{
-	epoll_close, epoll_create, epoll_ctl, epoll_data_t, epoll_event, epoll_wait, EPOLLIN, EPOLLOUT,
-	EPOLLRDHUP, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
-};
+info!();
 
-const INITIAL_MAX_FDS: usize = 100;
+const MAIN_LOG: &str = "mainlog";
 const BUFFER_SIZE: usize = 1024;
 const MAX_EVENTS: i32 = 100;
 #[cfg(target_os = "windows")]
 const WINSOCK_BUF_SIZE: winapi::c_int = 100_000_000;
 
-#[derive(Debug, Clone)]
-pub(crate) enum ActionType {
-	AddStream,
-	AddListener,
-}
-
-#[derive(Debug, PartialEq)]
-enum GenericEventType {
-	AddReadET,
-	AddReadLT,
-	DelRead,
-	AddWriteET,
-	DelWrite,
-}
-
-#[derive(Debug)]
-struct GenericEvent {
-	fd: ConnectionHandle,
-	etype: GenericEventType,
-}
-
-impl GenericEvent {
-	fn new(fd: ConnectionHandle, etype: GenericEventType) -> Self {
-		GenericEvent { fd, etype }
-	}
-
-	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
-	fn to_kev(&self) -> kevent {
-		kevent::new(
-			self.fd as uintptr_t,
-			match &self.etype {
-				GenericEventType::AddReadET => EventFilter::EVFILT_READ,
-				GenericEventType::AddReadLT => EventFilter::EVFILT_READ,
-				GenericEventType::DelRead => EventFilter::EVFILT_READ,
-				GenericEventType::AddWriteET => EventFilter::EVFILT_WRITE,
-				GenericEventType::DelWrite => EventFilter::EVFILT_WRITE,
-			},
-			match &self.etype {
-				GenericEventType::AddReadET => EventFlag::EV_ADD | EventFlag::EV_CLEAR,
-				GenericEventType::AddReadLT => EventFlag::EV_ADD,
-				GenericEventType::DelRead => EventFlag::EV_DELETE,
-				GenericEventType::AddWriteET => EventFlag::EV_ADD | EventFlag::EV_CLEAR,
-				GenericEventType::DelWrite => EventFlag::EV_DELETE,
-			},
-			FilterFlag::empty(),
-		)
-	}
-}
-
-fn do_write_no_fd_lock(
-	fd: ConnectionHandle,
-	connection_seqno: u128,
-	data: &[u8],
-	close: bool,
-	guarded_data: &Arc<Mutex<GuardedData>>,
-) -> Result<(), Error> {
-	let mut buf = [0u8; BUFFER_SIZE];
-	let len = data.len();
-	let mut rem = len;
-	let mut start = 0;
-	let mut end = if len > BUFFER_SIZE { BUFFER_SIZE } else { len };
-	let mut wakeupfd = 0;
-	let mut wakeup_scheduled = false;
-	match guarded_data.lock() {
-		Ok(mut guarded_data) => loop {
-			let len = if rem < BUFFER_SIZE { rem } else { BUFFER_SIZE };
-			buf[..len].clone_from_slice(&data[start..end]);
-			guarded_data.write_queue.push(StreamWriteBuffer {
-				fd,
-				write_buffer: WriteBuffer {
-					buffer: buf.clone(),
-					offset: 0,
-					len: len.try_into().unwrap_or(0),
-					close,
-					connection_seqno,
-				},
-			});
-			if rem <= BUFFER_SIZE {
-				let (fd_inner, wakeup_scheduled_inner) = do_wakeup_with_lock(&mut *guarded_data)?;
-				wakeupfd = fd_inner;
-				wakeup_scheduled = wakeup_scheduled_inner;
-				break;
-			}
-			rem -= BUFFER_SIZE;
-			start += BUFFER_SIZE;
-			end += BUFFER_SIZE;
-			if end > data.len() {
-				end = data.len();
-			}
-		},
-		Err(e) => {
-			info!("unexpected error obtaining guarded_data lock, {}", e);
-		}
-	}
-	if !wakeup_scheduled {
-		#[cfg(unix)]
-		{
-			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-			unsafe {
-				write(wakeupfd, buf, 1);
-			}
-		}
-		#[cfg(target_os = "windows")]
-		{
-			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
-			unsafe {
-				ws2_32::send(wakeupfd, buf, 1, 0);
-			}
-		}
-	}
-	Ok(())
-}
-
-fn do_write(
-	fd: ConnectionHandle,
-	data: &[u8],
-	offset: usize,
-	len: usize,
-	close: bool,
-	fd_lock: Option<&Arc<Mutex<StateInfo>>>,
-	connection_id: u128,
-	guarded_data: &Arc<Mutex<GuardedData>>,
-) -> Result<(), Error> {
-	if len + offset > data.len() {
-		return Err(ErrorKind::ArrayIndexOutofBounds(format!(
-			"offset+len='{}',data.len='{}'",
-			offset + len,
-			data.len()
-		))
-		.into());
-	}
-	if fd_lock.is_none() {
-		do_write_no_fd_lock(fd, connection_id, data, close, guarded_data)?;
-		return Ok(());
-	} else {
-		let fd_lock = fd_lock.unwrap();
-		let linked_list = &mut fd_lock
-			.lock()
-			.map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?
-			.write_buffer;
-		let mut rem = len;
-		let mut count = 0;
-		loop {
-			let len = match rem <= BUFFER_SIZE {
-				true => rem,
-				false => BUFFER_SIZE,
-			} as u16;
-			let mut write_buffer = WriteBuffer {
-				offset: 0,
-				len,
-				buffer: [0u8; BUFFER_SIZE],
-				close: match rem <= BUFFER_SIZE {
-					true => close,
-					false => false,
-				},
-				connection_seqno: connection_id,
-			};
-
-			let start = offset + count * BUFFER_SIZE;
-			let end = offset + count * BUFFER_SIZE + (len as usize);
-			write_buffer.buffer[0..(len as usize)].copy_from_slice(&data[start..end]);
-
-			linked_list.push_back(write_buffer);
-
-			if rem <= BUFFER_SIZE {
-				break;
-			}
-			rem -= BUFFER_SIZE;
-			count += 1;
-		}
-	}
-
-	let (fd, wakeup_scheduled) = {
-		let mut guarded_data = guarded_data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
-		guarded_data.write_pending.push((fd.into(), connection_id));
-		do_wakeup_with_lock(&mut *guarded_data)?
-	};
-
-	if !wakeup_scheduled {
-		#[cfg(unix)]
-		{
-			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-			unsafe {
-				write(fd, buf, 1);
-			}
-		}
-		#[cfg(target_os = "windows")]
-		{
-			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
-			unsafe {
-				ws2_32::send(fd, buf, 1, 0);
-			}
-		}
-	}
-
-	Ok(())
-}
-
-fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(ConnectionHandle, bool), Error> {
-	let wakeup_scheduled = data.wakeup_scheduled;
-	if !wakeup_scheduled {
-		data.wakeup_scheduled = true;
-	}
-	Ok((data.wakeup_fd, wakeup_scheduled))
-}
+#[cfg(unix)]
+type ConnectionHandle = i32;
+#[cfg(target_os = "windows")]
+type ConnectionHandle = u64;
 
 /// A handle that is associated with a particular connection and may be used for writing
 /// to the socket.
@@ -297,22 +73,22 @@ fn do_wakeup_with_lock(data: &mut GuardedData) -> Result<(ConnectionHandle, bool
 pub struct WriteHandle {
 	fd: ConnectionHandle,
 	connection_id: u128,
-	guarded_data: Arc<Mutex<GuardedData>>,
-	fd_lock: Option<Arc<Mutex<StateInfo>>>,
+	guarded_data: Arc<RwLock<GuardedData>>,
+	global_lock: Arc<RwLock<bool>>,
 }
 
 impl WriteHandle {
 	fn new(
 		fd: ConnectionHandle,
-		guarded_data: Arc<Mutex<GuardedData>>,
+		guarded_data: Arc<RwLock<GuardedData>>,
 		connection_id: u128,
-		fd_lock: Option<Arc<Mutex<StateInfo>>>,
+		global_lock: Arc<RwLock<bool>>,
 	) -> Self {
 		WriteHandle {
 			fd,
 			guarded_data,
 			connection_id,
-			fd_lock,
+			global_lock,
 		}
 	}
 
@@ -323,146 +99,77 @@ impl WriteHandle {
 
 	/// Close the connection associated with this write handle.
 	pub fn close(&self) -> Result<(), Error> {
-		self.write(&[1], 0, 0, true)
+		let buf = [0u8; BUFFER_SIZE];
+		let mut guarded_data = nioruntime_util::lockw!(self.guarded_data);
+		let wbuffer = WriteBuffer {
+			buffer: buf.clone(),
+			offset: 0,
+			len: 0,
+			close: true,
+			connection_id: self.connection_id,
+		};
+		guarded_data.write_queue.push(wbuffer);
+		guarded_data.wakeup()?;
+
+		Ok(())
+	}
+
+	fn _nbwrite(&self, data: &[u8]) -> Result<usize, Error> {
+		let len = write_data(self.fd, data, &self.global_lock)?;
+		Ok(len.try_into().unwrap_or(0))
 	}
 
 	/// Write the specifed data to the connection associated with this write handle.
 	///
 	/// * `data` - The data to write to this connection.
-	/// * `offset` - The offset into this data buffer to start writing at.
-	/// * `len` - The length of data to write.
-	/// * `close` - Whether or not to close this connection after writing the data.
-	pub fn write(&self, data: &[u8], offset: usize, len: usize, close: bool) -> Result<(), Error> {
-		do_write(
-			self.fd,
-			data,
-			offset,
-			len,
-			close,
-			self.fd_lock.as_ref(),
-			self.connection_id,
-			&self.guarded_data,
-		)
-	}
-}
-
-#[derive(Debug, Clone)]
-struct FdAction {
-	fd: ConnectionHandle,
-	atype: ActionType,
-	seqno: u128,
-}
-
-impl FdAction {
-	fn new(fd: ConnectionHandle, atype: ActionType, seqno: u128) -> FdAction {
-		FdAction { fd, atype, seqno }
-	}
-}
-
-#[derive(Clone, PartialEq, Debug)]
-enum HandlerEventType {
-	Accept,
-	Close,
-	#[cfg(target_os = "windows")]
-	PauseRead,
-	#[cfg(target_os = "windows")]
-	ResumeRead,
-	#[cfg(target_os = "windows")]
-	PauseWrite,
-	#[cfg(target_os = "windows")]
-	ResumeWrite,
-}
-
-#[derive(Clone, PartialEq, Debug)]
-struct HandlerEvent {
-	etype: HandlerEventType,
-	fd: ConnectionHandle,
-	seqno: u128,
-}
-
-impl HandlerEvent {
-	fn new(fd: ConnectionHandle, etype: HandlerEventType, seqno: u128) -> Self {
-		HandlerEvent { fd, etype, seqno }
-	}
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum FdType {
-	Wakeup,
-	Listener,
-	Stream,
-	Unknown,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StreamWriteBuffer {
-	fd: ConnectionHandle,
-	write_buffer: WriteBuffer,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct WriteBuffer {
-	offset: u16,
-	len: u16,
-	buffer: [u8; BUFFER_SIZE],
-	close: bool,
-	connection_seqno: u128,
-}
-
-struct Callbacks<F, G, H, K> {
-	on_read: Option<Pin<Box<F>>>,
-	on_accept: Option<Pin<Box<G>>>,
-	on_close: Option<Pin<Box<H>>>,
-	on_client_read: Option<Pin<Box<K>>>,
-}
-
-#[derive(Debug, PartialEq)]
-enum State {
-	Normal,
-	Closing,
-	Closed,
-}
-
-#[derive(Debug)]
-pub(crate) struct StateInfo {
-	fd: ConnectionHandle,
-	state: State,
-	seqno: u128,
-	write_buffer: LinkedList<WriteBuffer>,
-}
-
-impl Default for StateInfo {
-	fn default() -> Self {
-		StateInfo {
-			fd: 0,
-			state: State::Normal,
-			seqno: 0,
-			write_buffer: LinkedList::new(),
+	pub fn write(&self, data: &[u8]) -> Result<(), Error> {
+		let len = data.len();
+		if len == 0 {
+			// nothing to write
+			return Ok(());
 		}
-	}
-}
-
-impl StateInfo {
-	fn new(fd: ConnectionHandle, state: State, seqno: u128) -> Self {
-		StateInfo {
-			fd,
-			state,
-			seqno,
-			write_buffer: LinkedList::new(),
+		let mut buf = [0u8; BUFFER_SIZE];
+		let mut guarded_data = nioruntime_util::lockw!(self.guarded_data);
+		let mut start = 0;
+		let len = data.len();
+		let mut end = if len > BUFFER_SIZE { BUFFER_SIZE } else { len };
+		let mut rem = len;
+		loop {
+			let len = if rem < BUFFER_SIZE { rem } else { BUFFER_SIZE };
+			buf[..len].clone_from_slice(&data[start..end]);
+			let wbuffer = WriteBuffer {
+				buffer: buf.clone(),
+				offset: 0,
+				len: len.try_into().unwrap_or(0),
+				close: false,
+				connection_id: self.connection_id,
+			};
+			guarded_data.write_queue.push(wbuffer);
+			if rem <= BUFFER_SIZE {
+				break;
+			}
+			rem -= BUFFER_SIZE;
+			start += BUFFER_SIZE;
+			end += BUFFER_SIZE;
+			if end > data.len() {
+				end = data.len();
+			}
 		}
+
+		guarded_data.wakeup()?;
+
+		Ok(())
 	}
 }
 
-struct GuardedData {
-	fd_actions: Vec<FdAction>,
-	wakeup_fd: ConnectionHandle,
-	wakeup_rx: ConnectionHandle,
-	wakeup_scheduled: bool,
-	handler_events: Vec<HandlerEvent>,
-	write_pending: Vec<(ConnectionHandle, u128)>,
-	selector: Option<ConnectionHandle>,
-	stop: bool,
-	write_queue: Vec<StreamWriteBuffer>,
+pub struct EventHandlerConfig {
+	pub thread_count: usize,
+}
+
+impl Default for EventHandlerConfig {
+	fn default() -> EventHandlerConfig {
+		EventHandlerConfig { thread_count: 6 }
+	}
 }
 
 /// EventHandler struct.
@@ -486,24 +193,28 @@ struct GuardedData {
 /// // use required libraries
 /// use std::io::Write;
 /// use std::net::{TcpListener, TcpStream};
-/// use std::sync::{Mutex, Arc};
+/// use std::sync::{RwLock, Arc};
 /// use nioruntime_evh::EventHandler;
 /// use nioruntime_util::Error;
+/// use nioruntime_evh::EventHandlerConfig;
+///
+/// nioruntime_log::info!();
 ///
 /// fn main() -> Result<(), Error> {
 ///     // create a mutex to ensure functions are called
-///     let x = Arc::new(Mutex::new(0));
+///     let x = Arc::new(RwLock::new(0));
 ///     let x_clone = x.clone();
 ///
 ///     // create a listener/stream with a port that is likely not used
 ///     let listener = TcpListener::bind("127.0.0.1:9991")?;
 ///     let mut stream = TcpStream::connect("127.0.0.1:9991")?;
 ///     // instantiate the EventHandler
-///     let mut eh = EventHandler::new();
+///     let mut eh = EventHandler::new(EventHandlerConfig::default());
 ///
 ///     // set the on_read callback to simply echo back what is written to it
 ///     eh.set_on_read(|buf, len, wh| {
-///         let _ = wh.write(buf, 0, len, false);
+///         nioruntime_log::info!("on read");
+///         let _ = wh.write(&buf[0..len]);
 ///         Ok(())
 ///     })?;
 ///
@@ -514,13 +225,14 @@ struct GuardedData {
 ///     // assert that the client receives the echoed message back exactly
 ///     // as was sent
 ///     eh.set_on_client_read(move |buf, len, _wh| {
+///         nioruntime_log::info!("on client read");
 ///         assert_eq!(len, 5);
 ///         assert_eq!(buf[0], 1);
 ///         assert_eq!(buf[1], 2);
 ///         assert_eq!(buf[2], 3);
 ///         assert_eq!(buf[3], 4);
 ///         assert_eq!(buf[4], 5);
-///         let mut x = x.lock().unwrap();
+///         let mut x = x.write().unwrap();
 ///         (*x) += 1;
 ///         Ok(())
 ///     })?;
@@ -530,24 +242,23 @@ struct GuardedData {
 ///
 ///     // add the tcp listener
 ///     eh.add_tcp_listener(&listener)?;
-///     // add the tcp stream and retreive the fd, seqno which are needed to write
-///     // on this client through the EventHandler interface
+///     // get the write handle which is needed to write on the connection
 ///     let wh = eh.add_tcp_stream(&stream)?;
 ///     // send the message
-///     wh.write(&[1, 2, 3, 4, 5], 5, 0, false)?;
+///     wh.write(&[1, 2, 3, 4, 5])?;
 ///     // wait long enough to make sure the client got the message
-///     std::thread::sleep(std::time::Duration::from_millis(100));
-///     let x = x_clone.lock().unwrap();
+///     std::thread::sleep(std::time::Duration::from_millis(1000));
+///     let x = x_clone.write().unwrap();
 ///     // ensure that the client callback executed
 ///     assert_eq!((*x), 1);
 ///     Ok(())
 /// }
 /// ```
 pub struct EventHandler<F, G, H, K> {
-	data: Arc<Mutex<GuardedData>>,
-	callbacks: Arc<Mutex<Callbacks<F, G, H, K>>>,
-	_pipe_listener: Option<TcpListener>,
-	_pipe_stream: Option<TcpStream>,
+	config: EventHandlerConfig,
+	guarded_data: Vec<Arc<RwLock<GuardedData>>>,
+	callbacks: Arc<RwLock<Callbacks<F, G, H, K>>>,
+	global_lock: Arc<RwLock<bool>>,
 }
 
 impl<F, G, H, K> EventHandler<F, G, H, K>
@@ -581,10 +292,7 @@ where
 	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<WriteHandle, Error> {
 		// make sure we have a client on_read handler configured
 		{
-			let callbacks = self.callbacks.lock().map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?;
+			let callbacks = nioruntime_util::lockr!(self.callbacks);
 
 			match callbacks.on_read {
 				Some(_) => {}
@@ -614,7 +322,12 @@ where
 			};
 
 			if sockoptres != 0 {
-				error!("setsockopt resulted in error: {}", errno().to_string());
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"setsockopt resulted in error: {}",
+					errno().to_string()
+				);
 			}
 		}
 
@@ -626,14 +339,15 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, connection_id) = self.add_fd(stream.as_raw_fd(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
-		let (fd, connection_id) = self.add_socket(stream.as_raw_socket(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add(stream.as_raw_socket(), ActionType::AddStream)?;
+
 		Ok(WriteHandle {
 			fd,
 			connection_id,
-			guarded_data: self.data.clone(),
-			fd_lock: None,
+			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
+			global_lock: self.global_lock.clone(),
 		})
 	}
 
@@ -659,17 +373,10 @@ where
 	pub fn add_tcp_listener(&mut self, listener: &TcpListener) -> Result<(), Error> {
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
-		#[cfg(any(
-			target_os = "linux",
-			target_os = "macos",
-			dragonfly,
-			freebsd,
-			netbsd,
-			openbsd
-		))]
-		self.add_fd(listener.as_raw_fd(), ActionType::AddListener)?;
+		#[cfg(unix)]
+		self.add(listener.as_raw_fd(), ActionType::AddListener)?;
 		#[cfg(target_os = "windows")]
-		self.add_socket(
+		self.add(
 			listener.as_raw_socket().try_into().unwrap_or(0),
 			ActionType::AddListener,
 		)?;
@@ -682,14 +389,14 @@ where
 	/// on a connection that has been accepted by a [`TcpListener`] that was registered with this [`EventHandler`].
 	/// # Examples
 	/// ```
-	/// use nioruntime_evh::EventHandler;
+	/// use nioruntime_evh::{EventHandler, EventHandlerConfig};
 	/// use nioruntime_util::Error;
 	///
 	/// fn main() -> Result<(), Error> {
-	///     let mut eh = EventHandler::new();
+	///     let mut eh = EventHandler::new(EventHandlerConfig::default());
 	///     // set the on_read callback to simply echo back what is written to it
 	///     eh.set_on_read(|buf, len, wh| {
-	///         let _ = wh.write(buf, 0, len, false);
+	///         let _ = wh.write(&buf[0..len]);
 	///         Ok(())
 	///     })?;
 	///     eh.set_on_accept(|_,_| Ok(()))?;
@@ -699,10 +406,7 @@ where
 	/// }
 	/// ```
 	pub fn set_on_read(&mut self, on_read: F) -> Result<(), Error> {
-		let mut callbacks = self.callbacks.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
+		let mut callbacks = nioruntime_util::lockw!(self.callbacks);
 
 		callbacks.on_read = Some(Box::pin(on_read));
 
@@ -724,7 +428,7 @@ where
 	/// info!();
 	///
 	/// fn main() -> Result<(), Error> {
-	///     let mut eh = EventHandler::new();
+	///     let mut eh = EventHandler::new(nioruntime_evh::EventHandlerConfig::default());
 	///     // print out a message when a new connection is accepted
 	///     eh.set_on_accept(|connection_id, _| {
 	///         info!("accepted connection with id = {}", connection_id);
@@ -734,13 +438,10 @@ where
 	///     eh.set_on_client_read(|_,_,_| Ok(()))?;
 	///     eh.set_on_close(|_| Ok(()))?;
 	///     Ok(())
-	/// }   
+	/// }
 	/// ```
 	pub fn set_on_accept(&mut self, on_accept: G) -> Result<(), Error> {
-		let mut callbacks = self.callbacks.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
+		let mut callbacks = nioruntime_util::lockw!(self.callbacks);
 
 		callbacks.on_accept = Some(Box::pin(on_accept));
 
@@ -764,7 +465,7 @@ where
 	/// info!();
 	///
 	/// fn main() -> Result<(), Error> {
-	///     let mut eh = EventHandler::new();
+	///     let mut eh = EventHandler::new(nioruntime_evh::EventHandlerConfig::default());
 	///     // print out a message when a connection is closed
 	///     eh.set_on_close(|connection_id| {
 	///         info!("closed connection with id = {}", connection_id);
@@ -777,10 +478,7 @@ where
 	/// }
 	/// ```
 	pub fn set_on_close(&mut self, on_close: H) -> Result<(), Error> {
-		let mut callbacks = self.callbacks.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
+		let mut callbacks = nioruntime_util::lockw!(self.callbacks);
 
 		callbacks.on_close = Some(Box::pin(on_close));
 
@@ -805,10 +503,10 @@ where
 	/// info!();
 	///
 	/// fn main() -> Result<(), Error> {
-	///     let mut eh = EventHandler::new();
+	///     let mut eh = EventHandler::new(nioruntime_evh::EventHandlerConfig::default());
 	///     // echo back the message
 	///     eh.set_on_client_read(|buf, len, wh| {
-	///         let _ = wh.write(buf, 0, len, false);
+	///         let _ = wh.write(&buf[0..len]);
 	///         Ok(())
 	///     })?;
 	///     eh.set_on_close(|_| Ok(()))?;
@@ -818,10 +516,7 @@ where
 	/// }
 	/// ```
 	pub fn set_on_client_read(&mut self, on_client_read: K) -> Result<(), Error> {
-		let mut callbacks = self.callbacks.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
+		let mut callbacks = nioruntime_util::lockw!(self.callbacks);
 
 		callbacks.on_client_read = Some(Box::pin(on_client_read));
 
@@ -831,121 +526,118 @@ where
 	/// Create a new instance of the [`EventHandler`]. Note that all callbacks must be registered
 	/// and [`EventHandler::start`] must be called before handleing events. See the example in the
 	/// [`EventHandler`] section of the documentation for a full details.
-	pub fn new() -> Self {
-		let mut _pipe_stream = None;
-		let mut _pipe_listener = None;
-		// create the pipe (for wakeups)
-		let (rx, tx) = {
-			let mut retfds = [0i32; 2];
-			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
-			#[cfg(target_os = "windows")]
-			{
-				let res = Self::socket_pipe(fds);
-				match res {
-					Ok((listener, stream)) => {
-						_pipe_stream = Some(stream);
-						_pipe_listener = Some(listener);
-					}
-					Err(e) => {
-						info!("Error creating socket_pipe on windows, {}", e.to_string());
-					}
-				}
-			}
-			#[cfg(unix)]
-			unsafe {
-				pipe(fds)
-			};
-			(retfds[0], retfds[1])
-		};
-
+	pub fn new(config: EventHandlerConfig) -> Self {
 		let callbacks = Callbacks {
 			on_read: None,
 			on_accept: None,
 			on_close: None,
 			on_client_read: None,
 		};
-		let callbacks = Arc::new(Mutex::new(callbacks));
+		let callbacks = Arc::new(RwLock::new(callbacks));
 
-		let guarded_data = GuardedData {
-			fd_actions: vec![],
-			wakeup_fd: tx as ConnectionHandle,
-			wakeup_rx: rx as ConnectionHandle,
-			wakeup_scheduled: false,
-			handler_events: vec![],
-			write_pending: vec![],
-			selector: None,
-			stop: false,
-			write_queue: vec![],
-		};
-		let guarded_data = Arc::new(Mutex::new(guarded_data));
+		let mut guarded_data = vec![];
+		for _ in 0..config.thread_count + 1 {
+			guarded_data.push(Arc::new(RwLock::new(GuardedData {
+				nconns: vec![],
+				write_queue: vec![],
+				cconns: vec![],
+				wakeup_tx: 0,
+				wakeup_rx: 0,
+				wakeup_scheduled: false,
+				stop: false,
+			})));
+		}
+
+		let global_lock = Arc::new(RwLock::new(true));
 
 		EventHandler {
-			data: guarded_data,
+			config,
+			guarded_data,
 			callbacks,
-			_pipe_listener,
-			_pipe_stream,
+			global_lock,
 		}
 	}
 
 	/// Start the event handler.
 	pub fn start(&mut self) -> Result<(), Error> {
-		self.do_start()
+		for i in 0..self.guarded_data.len() {
+			let (rx, tx) = Self::build_pipe()?;
+			let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[i]);
+			guarded_data.wakeup_tx = tx;
+			guarded_data.wakeup_rx = rx;
+		}
+		self.do_start()?;
+
+		Ok(())
 	}
 
 	/// Stop the event handler and free any internal resources associated with it. Note: this
 	/// does not close any registered sockets. That is the responsibility of the user.
 	pub fn stop(&self) -> Result<(), Error> {
-		let mut guarded_data = self.data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
-
-		guarded_data.stop = true;
-		#[cfg(unix)]
-		{
-			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-			unsafe {
-				write(guarded_data.wakeup_fd, buf, 1);
-			}
-		}
-		#[cfg(target_os = "windows")]
-		{
-			let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
-			unsafe {
-				ws2_32::send(guarded_data.wakeup_fd, buf, 1, 0);
-			}
+		for i in 0..self.guarded_data.len() {
+			let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[i]);
+			guarded_data.stop = true;
+			guarded_data.wakeup()?;
 		}
 
 		Ok(())
 	}
 
+	fn build_pipe() -> Result<(ConnectionHandle, ConnectionHandle), Error> {
+		let mut retfds = [0i32; 2];
+		let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
+		#[cfg(target_os = "windows")]
+		{
+			let res = Self::socket_pipe(fds);
+			match res {
+				Ok((listener, stream)) => {
+					_pipe_stream = Some(stream);
+					_pipe_listener = Some(listener);
+				}
+				Err(e) => {
+					info!("Error creating socket_pipe on windows, {}", e.to_string());
+				}
+			}
+		}
+		#[cfg(unix)]
+		unsafe {
+			pipe(fds)
+		};
+		Ok((retfds[0], retfds[1]))
+	}
+
 	#[cfg(target_os = "linux")]
 	fn do_start(&mut self) -> Result<(), Error> {
-		// create poll fd
-		let selector = epoll_create1(EpollCreateFlags::empty())?;
-		self.start_generic(selector)?;
+		let mut selectors = vec![];
+		for _ in 0..self.config.thread_count + 1 {
+			selectors.push(epoll_create1(EpollCreateFlags::empty()).unwrap());
+		}
+		self.start_generic(selectors)?;
 		Ok(())
 	}
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn do_start(&mut self) -> Result<(), Error> {
-		// create the kqueue
-		let selector = unsafe { kqueue() };
-		self.start_generic(selector)?;
+		let mut selectors = vec![];
+		for _ in 0..self.config.thread_count + 1 {
+			selectors.push(unsafe { kqueue() });
+		}
+		self.start_generic(selectors)?;
 		Ok(())
 	}
 
 	#[cfg(target_os = "windows")]
 	fn do_start(&mut self) -> Result<(), Error> {
-		self.start_generic(0)?;
+		let mut selectors = vec![];
+		for _ in 0..self.config.thread_count + 1 {
+			selectors.push(unsafe { kqueue() });
+		}
+		self.start_generic(selectors)?;
 		Ok(())
 	}
 
 	fn ensure_handlers(&self) -> Result<(), Error> {
-		let callbacks = self.callbacks.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-			error
-		})?;
+		let callbacks = nioruntime_util::lockr!(self.callbacks);
 
 		match callbacks.on_read {
 			Some(_) => {}
@@ -980,235 +672,807 @@ where
 		Ok(())
 	}
 
-	fn check_and_set<T>(vec: &mut Vec<T>, i: usize, value: T)
-	where
-		T: Default,
-	{
-		let cur_len = vec.len();
-		if cur_len <= i {
-			for _ in cur_len..i + 1 {
-				vec.push(T::default());
+	fn add(
+		&mut self,
+		handle: ConnectionHandle,
+		atype: ActionType,
+	) -> Result<(ConnectionHandle, u128), Error> {
+		let mut rng = rand::thread_rng();
+		let connection_id = rng.gen();
+
+		let (tx, rx) = sync_channel(5);
+
+		let conn = ConnectionInfo {
+			handle,
+			connection_id,
+			ctype: if atype == ActionType::AddListener {
+				ConnectionType::Listener
+			} else {
+				ConnectionType::Outbound
+			},
+			sender: Some(tx.clone()),
+		};
+
+		{
+			match atype {
+				ActionType::AddListener => {
+					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[0]);
+					guarded_data.nconns.push(conn);
+					guarded_data.wakeup()?;
+				}
+				ActionType::AddStream => {
+					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[1]);
+					guarded_data.nconns.push(conn);
+					guarded_data.wakeup()?;
+				}
 			}
 		}
-		vec[i] = value;
-	}
 
-	#[cfg(target_os = "windows")]
-	fn add_socket(
-		&mut self,
-		socket: ConnectionHandle,
-		atype: ActionType,
-	) -> Result<(ConnectionHandle, u128), Error> {
-		let fd = socket;
-		let (fd, seqno) = self.add_fd(fd, atype)?;
-		Ok((fd, seqno))
-	}
-
-	fn add_fd(
-		&mut self,
-		fd: ConnectionHandle,
-		atype: ActionType,
-	) -> Result<(ConnectionHandle, u128), Error> {
-		self.ensure_handlers()?;
-
-		let mut data = self.data.lock().map_err(|e| {
-			let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
+		rx.recv().map_err(|e| {
+			let error: Error =
+				ErrorKind::InternalError(format!("recv error: {}", e.to_string())).into();
 			error
 		})?;
 
-		if data.selector.is_none() {
-			return Err(
-				ErrorKind::SetupError("EventHandler must be started first".to_string()).into(),
-			);
-		}
-
-		let fd_actions = &mut data.fd_actions;
-		let seqno: u128 = rand::random();
-		fd_actions.push(FdAction::new(fd, atype, seqno));
-		Ok((fd.into(), seqno))
+		Ok((handle, connection_id))
 	}
 
-	#[cfg(target_os = "windows")]
-	fn socket_pipe(fds: *mut i32) -> Result<(TcpListener, TcpStream), Error> {
-		let port = portpicker::pick_unused_port().unwrap_or(9999);
-		let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
-		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
-		let res = unsafe {
-			accept(
-				listener.as_raw_socket().try_into().unwrap_or(0),
-				&mut libc::sockaddr {
-					..std::mem::zeroed()
-				},
-				&mut (std::mem::size_of::<libc::sockaddr>() as u32)
-					.try_into()
-					.unwrap_or(0),
-			)
-		};
-		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
-		fds[0] = res as i32;
-		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
-		Ok((listener, stream))
-	}
+	fn start_generic(&mut self, selectors: Vec<SelectorHandle>) -> Result<(), Error> {
+		self.ensure_handlers()?;
 
-	fn start_generic(&mut self, selector: ConnectionHandle) -> Result<(), Error> {
-		{
-			let mut guarded_data = self.data.lock().map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?;
-			guarded_data.selector = Some(selector);
+		let global_lock = &self.global_lock;
+		let global_lock_clone = global_lock.clone();
+		let selectors_clone = selectors.clone();
+		let guarded_data = self.guarded_data[0].clone();
+		let callbacks = nioruntime_util::lockr!(self.callbacks);
+		let mut guarded_data_vec = vec![];
+		for i in 1..self.guarded_data.len() {
+			guarded_data_vec.push(self.guarded_data[i].clone());
 		}
 
-		let mut fd_locks = vec![];
-		let mut on_read_locks = vec![];
-		let cloned_guarded_data = self.data.clone();
-		let cloned_callbacks = self.callbacks.clone();
-
+		let on_accept = callbacks.on_accept.as_ref().unwrap().clone();
+		let on_close = callbacks.on_close.as_ref().unwrap().clone();
 		spawn(move || {
-			#[cfg(target_os = "windows")]
-			let win_selector = unsafe { epoll_create(1) };
-			#[cfg(unix)]
-			let win_selector = 1 as *mut c_void;
-			if win_selector.is_null() {
-				info!("win_selector is null. Cannot start");
-			} else {
-				let res = Self::poll_loop(
-					&cloned_guarded_data,
-					&cloned_callbacks,
-					&mut fd_locks,
-					&mut on_read_locks,
-					selector,
-					win_selector,
-				);
-				match res {
-					Ok(_) => {
-						info!("poll loop done");
-					}
-					Err(e) => {
-						info!("FATAL: Unexpected error in poll loop: {}", e.to_string());
-					}
+			match Self::listener(
+				selectors_clone[0],
+				guarded_data,
+				&mut guarded_data_vec,
+				on_accept.clone(),
+				on_close.clone(),
+				global_lock_clone.clone(),
+			) {
+				Ok(_) => {}
+				Err(e) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"listener generated error: {}",
+						e.to_string()
+					);
 				}
 			}
 		});
 
+		// start r/w threads
+		for i in 0..self.config.thread_count {
+			let selectors = selectors.clone();
+			let listener_guarded_data = self.guarded_data[0].clone();
+			let guarded_data = self.guarded_data[i + 1].clone();
+			let on_read = callbacks.on_read.as_ref().unwrap().clone();
+			let on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
+			let global_lock = global_lock.clone();
+			spawn(move || {
+				match Self::rwthread(
+					selectors[i + 1],
+					listener_guarded_data,
+					guarded_data,
+					on_read,
+					on_client_read,
+					global_lock,
+				) {
+					Ok(_) => {}
+					Err(e) => {
+						log_multi!(
+							ERROR,
+							MAIN_LOG,
+							"rwthread generated error: {}",
+							e.to_string()
+						);
+					}
+				}
+			});
+		}
 		Ok(())
 	}
 
-	fn process_handler_events(
-		handler_events: Vec<HandlerEvent>,
-		write_pending: Vec<(ConnectionHandle, u128)>,
-		evs: &mut Vec<GenericEvent>,
-		read_fd_type: &mut Vec<FdType>,
-		use_on_client_read: &mut Vec<bool>,
+	fn update_listener_input_events(
+		guarded_data: &Arc<RwLock<GuardedData>>,
+		input_events: &mut Vec<GenericEvent>,
+		global_lock: Arc<RwLock<bool>>,
 		on_close: Pin<Box<H>>,
-		thread_pool: &StaticThreadPool,
-		global_lock: &Arc<RwLock<bool>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		active_seqnos: &mut HashSet<u128>,
-	) -> Result<(), Error> {
-		let lock = global_lock.write();
-		match lock {
-			Ok(_) => {}
-			Err(e) => info!("Error obtaining global lock: {}", e),
+	) -> Result<(bool, bool), Error> {
+		let stop;
+		let wakeup;
+		let nconns;
+		let cconns;
+		{
+			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+			stop = guarded_data.stop;
+			wakeup = guarded_data.wakeup_scheduled;
+			nconns = guarded_data.nconns.clone();
+			cconns = guarded_data.cconns.clone();
+			guarded_data.nconns.clear();
+			guarded_data.cconns.clear();
 		}
-		for handler_event in &handler_events {
-			match handler_event.etype {
-				#[cfg(target_os = "windows")]
-				HandlerEventType::PauseRead => {
-					evs.push(GenericEvent::new(
-						handler_event.fd,
-						GenericEventType::DelRead,
-					));
-				}
-				#[cfg(target_os = "windows")]
-				HandlerEventType::ResumeRead => {
-					evs.push(GenericEvent::new(
-						handler_event.fd,
-						GenericEventType::AddReadET,
-					));
-				}
-				#[cfg(target_os = "windows")]
-				HandlerEventType::PauseWrite => {
-					evs.push(GenericEvent::new(
-						handler_event.fd,
-						GenericEventType::DelWrite,
-					));
-				}
-				#[cfg(target_os = "windows")]
-				HandlerEventType::ResumeWrite => {
-					evs.push(GenericEvent::new(
-						handler_event.fd,
-						GenericEventType::AddWriteET,
-					));
-				}
-				HandlerEventType::Accept => {
-					let fd = handler_event.fd as uintptr_t;
-					evs.push(GenericEvent::new(
-						handler_event.fd,
-						GenericEventType::AddReadET,
-					));
-					// make sure there's enough space
-					let len = read_fd_type.len();
-					if fd >= len {
-						for _ in len..fd + 1 {
-							read_fd_type.push(FdType::Unknown);
-						}
-					}
-					read_fd_type[fd] = FdType::Stream;
 
-					let len = use_on_client_read.len();
-					if fd >= len {
-						for _ in len..fd + 1 {
-							use_on_client_read.push(false);
-						}
-					}
-					use_on_client_read[fd] = false;
-				}
-				HandlerEventType::Close => {
-					let seqno = handler_event.seqno;
-					let fd = handler_event.fd;
-					Self::do_close(fd, seqno, fd_locks)?;
-					active_seqnos.remove(&seqno);
-					match fd_locks[fd as usize].lock() {
-						Ok(mut state) => {
-							#[cfg(unix)]
-							{
-								evs.push(GenericEvent::new(state.fd, GenericEventType::DelRead));
-								evs.push(GenericEvent::new(state.fd, GenericEventType::DelWrite));
-							}
-							read_fd_type[handler_event.fd as usize] = FdType::Unknown;
-							use_on_client_read[handler_event.fd as usize] = false;
-							(*state).write_buffer.clear();
-							let on_close = on_close.clone();
-							thread_pool.execute(async move {
-								match (on_close)(seqno) {
-									Ok(_) => {}
-									Err(e) => {
-										info!(
-											"on close handler generated error: {}",
-											e.to_string()
-										);
-									}
-								}
-							})?;
-						}
-						Err(e) => {
-							info!(
-								"unexpected error getting state lock: {}, fd={}, seqno={}",
-								e.to_string(),
-								fd,
-								seqno,
-							);
-						}
-					}
+		for conn in nconns {
+			let ge = GenericEvent {
+				fd: conn.handle,
+				etype: GenericEventType::AddReadLT,
+			};
+			input_events.push(ge);
+
+			if conn.sender.is_some() {
+				let _ = conn.sender.unwrap().send(());
+			}
+		}
+
+		for conn in cconns {
+			let connection_id = conn.connection_id;
+			let fd = conn.handle;
+			(on_close)(connection_id)?;
+
+			{
+				let _lock = nioruntime_util::lockw!(global_lock);
+				#[cfg(unix)]
+				let res = unsafe { close(fd) };
+				#[cfg(target_os = "windows")]
+				let res = unsafe { ws2_32::closesocket(fd) };
+				if res != 0 {
+					let e = errno();
+					info!("error closing socket: {}", e.to_string());
+					return Err(ErrorKind::InternalError("Already closed".to_string()).into());
 				}
 			}
 		}
 
-		// handle write_pending
-		for pending in write_pending {
-			if active_seqnos.get(&pending.1).is_some() {
-				evs.push(GenericEvent::new(pending.0, GenericEventType::AddWriteET));
+		Ok((stop, wakeup))
+	}
+
+	fn process_listener_events(
+		count: usize,
+		events: &Vec<GenericEvent>,
+		next_index: &mut usize,
+		guarded_data: &mut Vec<Arc<RwLock<GuardedData>>>,
+		on_accept: Pin<Box<G>>,
+		global_lock: Arc<RwLock<bool>>,
+		wakeup_fd: ConnectionHandle,
+		listener_guarded_data: &Arc<RwLock<GuardedData>>,
+	) -> Result<(), Error> {
+		for i in 0..count {
+			let event = &events[i];
+			if event.fd == wakeup_fd {
+				// read one byte for wakeup
+				let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+				let res = unsafe { read(wakeup_fd, cbuf, 1) };
+				if res <= 0 {
+					log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
+				}
+				let mut guarded_data = nioruntime_util::lockw!(listener_guarded_data);
+				guarded_data.wakeup_scheduled = false;
+				continue;
+			}
+
+			let res = {
+				let _lock = nioruntime_util::lockw!(global_lock);
+				#[cfg(unix)]
+				let res = unsafe {
+					accept(
+						event.fd,
+						&mut libc::sockaddr {
+							..std::mem::zeroed()
+						},
+						&mut (std::mem::size_of::<libc::sockaddr>() as u32)
+							.try_into()
+							.unwrap_or(0),
+					)
+				};
+
+				#[cfg(target_os = "windows")]
+				let res = unsafe {
+					ws2_32::accept(
+						event.fd,
+						&mut winapi::ws2def::SOCKADDR {
+							..std::mem::zeroed()
+						},
+						&mut (std::mem::size_of::<winapi::ws2def::SOCKADDR>() as u32)
+							.try_into()
+							.unwrap_or(0),
+					)
+				};
+
+				res
+			};
+
+			if res > 0 {
+				// set non-blocking
+				#[cfg(unix)]
+				{
+					let fcntl_res = unsafe { fcntl(res, libc::F_SETFL, libc::O_NONBLOCK) };
+					if fcntl_res < 0 {
+						let e = errno().to_string();
+						return Err(ErrorKind::InternalError(format!("fcntl error: {}", e)).into());
+					}
+				}
+				#[cfg(target_os = "windows")]
+				{
+					let fionbio = 0x8004667eu32;
+					let ioctl_res = unsafe { ws2_32::ioctlsocket(res, fionbio as c_int, &mut 1) };
+
+					if ioctl_res != 0 {
+						info!("complete fion with error: {}", errno().to_string());
+					}
+
+					let sockoptres = unsafe {
+						ws2_32::setsockopt(
+							res,
+							winapi::SOL_SOCKET,
+							winapi::SO_SNDBUF,
+							&WINSOCK_BUF_SIZE as *const _ as *const i8,
+							std::mem::size_of_val(&WINSOCK_BUF_SIZE) as winapi::c_int,
+						)
+					};
+
+					if sockoptres != 0 {
+						info!("setsockopt resulted in error: {}", errno().to_string());
+					}
+				}
+				let index = *next_index % guarded_data.len();
+				*next_index += 1;
+				if *next_index == usize::MAX {
+					*next_index = 0;
+				}
+				let guarded_data_next = &guarded_data[index];
+				let mut rng = rand::thread_rng();
+				let connection_id = rng.gen();
+
+				let wh = WriteHandle::new(
+					res,
+					guarded_data[index].clone(),
+					connection_id,
+					global_lock.clone(),
+				);
+				(on_accept)(connection_id, wh)?;
+				{
+					let mut guarded_data_next = nioruntime_util::lockw!(guarded_data_next);
+					guarded_data_next.nconns.push(ConnectionInfo {
+						handle: res,
+						connection_id,
+						ctype: ConnectionType::Inbound,
+						sender: None,
+					});
+					guarded_data_next.wakeup()?;
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	fn listener(
+		selector: SelectorHandle,
+		guarded_data: Arc<RwLock<GuardedData>>,
+		guarded_data_vec: &mut Vec<Arc<RwLock<GuardedData>>>,
+		on_accept: Pin<Box<G>>,
+		on_close: Pin<Box<H>>,
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<(), Error> {
+		let mut hash_set = HashSet::new();
+		let mut input_events = vec![];
+		let mut output_events = vec![];
+		let mut next_index = 0;
+		let wakeup_fd;
+
+		// add wakeup fd
+		{
+			let guarded_data = nioruntime_util::lockw!(guarded_data);
+			input_events.push(GenericEvent {
+				fd: guarded_data.wakeup_rx,
+				etype: GenericEventType::AddReadLT,
+			});
+			wakeup_fd = guarded_data.wakeup_rx;
+		}
+
+		loop {
+			// get new handles
+			let (stop, wakeup) = Self::update_listener_input_events(
+				&guarded_data,
+				&mut input_events,
+				global_lock.clone(),
+				on_close.clone(),
+			)?;
+
+			if stop {
+				#[cfg(unix)]
+				let _ = unsafe { close(selector) };
+				#[cfg(target_os = "windows")]
+				let _ = unsafe { ws2_32::closesocket(selector) };
+				break;
+			}
+
+			output_events.clear();
+			let count = Self::get_events(
+				selector,
+				input_events.clone(),
+				&mut output_events,
+				&mut hash_set,
+				wakeup,
+			)?;
+			input_events.clear();
+
+			Self::process_listener_events(
+				count,
+				&output_events,
+				&mut next_index,
+				guarded_data_vec,
+				on_accept.clone(),
+				global_lock.clone(),
+				wakeup_fd,
+				&guarded_data,
+			)?;
+		}
+		Ok(())
+	}
+
+	fn update_rw_input_events(
+		guarded_data: Arc<RwLock<GuardedData>>,
+		input_events: &mut Vec<GenericEvent>,
+		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+		hash_set: &mut HashSet<ConnectionHandle>,
+	) -> Result<(bool, bool), Error> {
+		let nconns;
+		let stop;
+		let wakeup;
+		{
+			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+			stop = guarded_data.stop;
+			wakeup = guarded_data.wakeup_scheduled;
+			nconns = guarded_data.nconns.clone();
+			guarded_data.nconns.clear();
+		}
+
+		for conn in nconns {
+			hash_set.remove(&conn.handle);
+			connection_info_map.insert(conn.handle, conn.clone());
+			connection_id_map.insert(conn.connection_id, conn.clone());
+			let ge = GenericEvent {
+				fd: conn.handle,
+				etype: GenericEventType::AddReadET,
+			};
+			input_events.push(ge);
+
+			if conn.sender.is_some() {
+				let _ = conn.sender.unwrap().send(());
+			}
+		}
+
+		Ok((stop, wakeup))
+	}
+
+	fn do_write(
+		fd: ConnectionHandle,
+		write_buffer: &mut WriteBuffer,
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<(bool, bool, bool), Error> {
+		if write_buffer.len == 0 {
+			return Ok((false, write_buffer.close, true));
+		}
+
+		let len = write_data(
+			fd,
+			&mut write_buffer.buffer[(write_buffer.offset as usize)
+				..(write_buffer.offset as usize + write_buffer.len as usize)],
+			&global_lock,
+		)?;
+
+		if len >= 0 {
+			if len == (write_buffer.len as i32).try_into().unwrap_or(0) {
+				// we're done
+				write_buffer.offset += len as u16;
+				write_buffer.len -= len as u16;
+				return Ok((true, write_buffer.close, false));
+			} else {
+				// update values and write again
+				write_buffer.offset += len as u16;
+				write_buffer.len -= len as u16;
+				return Ok((false, false, false));
+			}
+		} else {
+			if errno().0 == EAGAIN {
+				// break because we're edge triggered.
+				// a new event occurs.
+
+				return Ok((false, false, true));
+			} else {
+				// this is an actual write error.
+				// close the connection.
+				return Ok((true, true, true));
+			}
+		}
+	}
+
+	fn process_write_event(
+		event: &GenericEvent,
+		connection_id: u128,
+		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
+		global_lock: Arc<RwLock<bool>>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
+		listener_guarded_data: Arc<RwLock<GuardedData>>,
+	) -> Result<(), Error> {
+		let mut disconnect = false;
+		let list = write_buffers.get_mut(&connection_id);
+		let mut break_received = false;
+
+		match list {
+			Some(list) => loop {
+				if list.is_empty() || break_received {
+					break;
+				}
+
+				loop {
+					let front = list.front_mut();
+					match front {
+						Some(mut front) => {
+							let (pop, disc, br) =
+								Self::do_write(event.fd, &mut front, global_lock.clone())?;
+							if disc {
+								break_received = true;
+								disconnect = true;
+								break;
+							}
+							if pop {
+								// if all was written, pop
+								list.pop_front();
+							}
+							if br {
+								break_received = true;
+								break;
+							}
+						}
+						None => {
+							break;
+						}
+					}
+				}
+			},
+			None => {}
+		}
+
+		if disconnect {
+			let fd = event.fd;
+			connection_id_map.remove(&connection_id);
+			connection_info_map.remove(&fd);
+			write_buffers.remove(&connection_id);
+
+			let mut listener_guarded_data = nioruntime_util::lockw!(listener_guarded_data);
+			listener_guarded_data.cconns.push(ConnectionInfo {
+				handle: fd,
+				connection_id,
+				ctype: ConnectionType::Inbound,
+				sender: None,
+			});
+		}
+
+		Ok(())
+	}
+
+	fn process_read_event(
+		event: &GenericEvent,
+		listener_guarded_data: Arc<RwLock<GuardedData>>,
+		guarded_data: Arc<RwLock<GuardedData>>,
+		connection_id: u128,
+		on_read: Pin<Box<F>>,
+		on_client_read: Pin<Box<K>>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
+		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<(), Error> {
+		loop {
+			let mut buf = [0u8; BUFFER_SIZE];
+			let len = {
+				let _lock = nioruntime_util::lockr!(global_lock);
+				#[cfg(unix)]
+				let len = {
+					let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
+					unsafe { read(event.fd, cbuf, BUFFER_SIZE) }
+				};
+				#[cfg(target_os = "windows")]
+				let len = {
+					let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
+					unsafe { ws2_32::recv(event.fd, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) }
+				};
+				len
+			};
+			if !Self::process_read_result(
+				event.fd,
+				listener_guarded_data.clone(),
+				guarded_data.clone(),
+				&buf,
+				len,
+				connection_id,
+				on_read.clone(),
+				on_client_read.clone(),
+				connection_id_map,
+				connection_info_map,
+				write_buffers,
+				global_lock.clone(),
+			)? {
+				break;
+			}
+		}
+		Ok(())
+	}
+
+	fn process_read_result(
+		fd: ConnectionHandle,
+		listener_guarded_data: Arc<RwLock<GuardedData>>,
+		guarded_data: Arc<RwLock<GuardedData>>,
+		buf: &[u8],
+		len: isize,
+		connection_id: u128,
+		on_read: Pin<Box<F>>,
+		on_client_read: Pin<Box<K>>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
+		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<bool, Error> {
+		let connection_info = connection_id_map.get(&connection_id);
+		if connection_info.is_some() {
+			let connection_info = connection_info.unwrap();
+			if len > 0 {
+				let wh = WriteHandle::new(fd, guarded_data, connection_id, global_lock);
+				match connection_info.ctype {
+					ConnectionType::Inbound => (on_read)(buf, len.try_into().unwrap_or(0), wh)?,
+					ConnectionType::Outbound => {
+						(on_client_read)(buf, len.try_into().unwrap_or(0), wh)?
+					}
+					_ => {} // not expected
+				}
+				Ok(true)
+			} else {
+				let mut do_close = true;
+				if len < 0 {
+					let e = errno();
+					if e.0 == EAGAIN {
+						do_close = false;
+					}
+				}
+
+				if do_close {
+					connection_id_map.remove(&connection_id);
+					connection_info_map.remove(&fd);
+					write_buffers.remove(&connection_id);
+
+					let mut listener_guarded_data = nioruntime_util::lockw!(listener_guarded_data);
+					listener_guarded_data.cconns.push(ConnectionInfo {
+						handle: fd,
+						connection_id,
+						ctype: ConnectionType::Inbound,
+						sender: None,
+					});
+				}
+				Ok(do_close)
+			}
+		} else {
+			Ok(false)
+		}
+	}
+
+	fn _close(
+		connection_id: u128,
+		fd: ConnectionHandle,
+		on_close: Pin<Box<H>>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
+		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<(), Error> {
+		connection_id_map.remove(&connection_id);
+		connection_info_map.remove(&fd);
+		write_buffers.remove(&connection_id);
+		(on_close)(connection_id)?;
+		{
+			let _lock = nioruntime_util::lockw!(global_lock);
+			#[cfg(unix)]
+			let res = unsafe { close(fd) };
+			#[cfg(target_os = "windows")]
+			let res = unsafe { ws2_32::closesocket(fd) };
+			if res != 0 {
+				let e = errno();
+				info!("error closing socket: {}", e.to_string());
+				return Err(ErrorKind::InternalError("Already closed".to_string()).into());
+			}
+		}
+
+		Ok(())
+	}
+
+	fn process_writes(
+		guarded_data: Arc<RwLock<GuardedData>>,
+		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
+		input_events: &mut Vec<GenericEvent>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+	) -> Result<(), Error> {
+		let write_queue = {
+			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+			let ret = guarded_data.write_queue.clone();
+			guarded_data.write_queue.clear();
+			ret
+		};
+
+		for write_buffer in write_queue {
+			let list = write_buffers.get_mut(&write_buffer.connection_id);
+			let connection_info = connection_id_map.get(&write_buffer.connection_id);
+
+			match connection_info {
+				Some(connection_info) => {
+					match list {
+						Some(list) => {
+							list.push_back(write_buffer);
+						}
+						None => {
+							let mut list = LinkedList::new();
+							list.push_back(write_buffer);
+							write_buffers.insert(connection_info.connection_id, list);
+						}
+					}
+					let ge = GenericEvent {
+						fd: connection_info.handle,
+						etype: GenericEventType::AddWriteET,
+					};
+					input_events.push(ge);
+				}
+				None => {
+					// the connection already closed
+					log_multi!(DEBUG, MAIN_LOG, "connection not found write_buffer");
+				}
+			}
+		}
+
+		Ok(())
+	}
+
+	fn rwthread(
+		selector: SelectorHandle,
+		listener_guarded_data: Arc<RwLock<GuardedData>>,
+		guarded_data: Arc<RwLock<GuardedData>>,
+		on_read: Pin<Box<F>>,
+		on_client_read: Pin<Box<K>>,
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<(), Error> {
+		let mut connection_info_map = HashMap::new();
+		let mut connection_id_map = HashMap::new();
+		let mut hash_set = HashSet::new();
+		let mut input_events = vec![];
+		let mut output_events = vec![];
+		let mut write_buffers = HashMap::new();
+		let wakeup_fd;
+
+		// add wakeup fd
+		{
+			let guarded_data = nioruntime_util::lockw!(guarded_data);
+			input_events.push(GenericEvent {
+				fd: guarded_data.wakeup_rx,
+				etype: GenericEventType::AddReadLT,
+			});
+			wakeup_fd = guarded_data.wakeup_rx;
+		}
+
+		loop {
+			// see if there's any new write buffers to process
+			Self::process_writes(
+				guarded_data.clone(),
+				&mut write_buffers,
+				&mut input_events,
+				&mut connection_id_map,
+			)?;
+
+			// get new handles
+			let (stop, wakeup) = Self::update_rw_input_events(
+				guarded_data.clone(),
+				&mut input_events,
+				&mut connection_info_map,
+				&mut connection_id_map,
+				&mut hash_set,
+			)?;
+
+			if stop {
+				#[cfg(unix)]
+				let _ = unsafe { close(selector) };
+				#[cfg(target_os = "windows")]
+				let _ = unsafe { ws2_32::closesocket(selector) };
+				break;
+			}
+
+			output_events.clear();
+			let res = Self::get_events(
+				selector,
+				input_events.clone(),
+				&mut output_events,
+				&mut hash_set,
+				wakeup,
+			)?;
+			input_events.clear();
+
+			if res > 0 {
+				for i in 0..res {
+					match output_events[i].etype {
+						GenericEventType::AddReadET | GenericEventType::AddReadLT => {
+							if output_events[i].fd == wakeup_fd {
+								// read one byte for wakeup
+								let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+								let res = unsafe { read(wakeup_fd, cbuf, 1) };
+								if res <= 0 {
+									log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
+								}
+								let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+								guarded_data.wakeup_scheduled = false;
+							} else {
+								let conn_info = connection_info_map.get(&output_events[i].fd);
+								match conn_info {
+									Some(conn_info) => Self::process_read_event(
+										&output_events[i],
+										listener_guarded_data.clone(),
+										guarded_data.clone(),
+										conn_info.connection_id,
+										on_read.clone(),
+										on_client_read.clone(),
+										&mut connection_id_map,
+										&mut connection_info_map,
+										&mut write_buffers,
+										global_lock.clone(),
+									)?,
+									None => {
+										// looks to be spurious. connection already disconnected
+										log_multi!(
+											DEBUG,
+											MAIN_LOG,
+											"connection not found (add read): {}",
+											output_events[i].fd
+										);
+									}
+								}
+							}
+						}
+						GenericEventType::AddWriteET => {
+							let conn_info = connection_info_map.get(&output_events[i].fd);
+							match conn_info {
+								Some(conn_info) => Self::process_write_event(
+									&output_events[i],
+									conn_info.connection_id,
+									&mut write_buffers,
+									global_lock.clone(),
+									&mut connection_id_map,
+									&mut connection_info_map,
+									listener_guarded_data.clone(),
+								)?,
+								None => {
+									// looks to be spurious. connection already disconnected
+									log_multi!(
+										DEBUG,
+										MAIN_LOG,
+										"connection not found (add write): {}",
+										output_events[i].fd
+									);
+								}
+							}
+						} //_ => {}
+					}
+				}
 			}
 		}
 		Ok(())
@@ -1216,14 +1480,14 @@ where
 
 	#[cfg(target_os = "windows")]
 	fn get_events(
-		_selector: ConnectionHandle,
-		win_selector: *mut c_void,
+		selector: SelectorHandle,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
 		filter_set: &mut HashSet<ConnectionHandle>,
-	) -> Result<ConnectionHandle, Error> {
+		wakeup: bool,
+	) -> Result<usize, Error> {
 		for evt in input_events {
-			if evt.etype == GenericEventType::AddReadLT
+			if evt.etype == GenericEventType::AddReadET
 				|| evt.etype == GenericEventType::AddReadET
 				|| evt.etype == GenericEventType::DelWrite
 			{
@@ -1315,7 +1579,17 @@ where
 		}
 		let mut events: [epoll_event; MAX_EVENTS as usize] =
 			unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 1000) };
+		let results = unsafe {
+			epoll_wait(
+				win_selector,
+				events.as_mut_ptr(),
+				MAX_EVENTS,
+				match wakeup {
+					true => 1,
+					false => 1000,
+				},
+			)
+		};
 		let mut ret_count_adjusted = 0;
 
 		if results > 0 {
@@ -1368,12 +1642,13 @@ where
 
 	#[cfg(target_os = "linux")]
 	fn get_events(
-		epollfd: ConnectionHandle,
-		_win_selector: *mut c_void,
+		selector: SelectorHandle,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
 		filter_set: &mut HashSet<ConnectionHandle>,
-	) -> Result<ConnectionHandle, Error> {
+		wakeup: bool,
+	) -> Result<usize, Error> {
+		let epollfd = selector;
 		for evt in input_events {
 			let mut interest = EpollFlags::empty();
 
@@ -1448,7 +1723,14 @@ where
 
 		let empty_event = EpollEvent::new(EpollFlags::empty(), 0);
 		let mut events = [empty_event; MAX_EVENTS as usize];
-		let results = epoll_wait(epollfd, &mut events, 100);
+		let results = epoll_wait(
+			epollfd,
+			&mut events,
+			match wakeup {
+				true => 1,
+				false => 1000,
+			},
+		);
 
 		let mut ret_count_adjusted = 0;
 
@@ -1483,12 +1765,13 @@ where
 
 	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 	fn get_events(
-		queue: ConnectionHandle,
-		_win_selector: *mut c_void,
+		selector: SelectorHandle,
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
 		_filter_set: &HashSet<ConnectionHandle>,
-	) -> Result<ConnectionHandle, Error> {
+		wakeup: bool,
+	) -> Result<usize, Error> {
+		let queue = selector;
 		let mut kevs = vec![];
 		for ev in input_events {
 			kevs.push(ev.to_kev());
@@ -1503,7 +1786,6 @@ where
 				FilterFlag::empty(),
 			));
 		}
-
 		let ret_count = unsafe {
 			kevent(
 				queue,
@@ -1511,7 +1793,10 @@ where
 				kevs.len() as i32,
 				ret_kevs.as_mut_ptr(),
 				MAX_EVENTS,
-				&duration_to_timespec(std::time::Duration::from_millis(500)),
+				&duration_to_timespec(std::time::Duration::from_millis(match wakeup {
+					true => 1,
+					false => 1000,
+				})),
 			)
 		};
 
@@ -1539,7 +1824,7 @@ where
 					ret_count_adjusted += 1;
 					output_events.push(GenericEvent::new(
 						kev.ident.try_into().unwrap_or(0),
-						GenericEventType::AddReadET,
+						GenericEventType::AddReadLT,
 					));
 				}
 			}
@@ -1547,1125 +1832,160 @@ where
 
 		Ok(ret_count_adjusted)
 	}
+}
 
-	fn poll_loop(
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		callbacks: &Arc<Mutex<Callbacks<F, G, H, K>>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
-		selector: ConnectionHandle,
-		win_selector: *mut c_void,
-	) -> Result<(), Error> {
-		let thread_pool = StaticThreadPool::new()?;
-		thread_pool.start(4)?;
-		let global_lock = Arc::new(RwLock::new(true));
-		let mut seqno = 0u128;
-		let mut active_seqnos = HashSet::new();
+#[derive(Clone, Debug)]
+enum ConnectionType {
+	Outbound,
+	Inbound,
+	Listener,
+}
 
-		let rx = {
-			let guarded_data = guarded_data.lock().map_err(|e| {
-				let error: Error = ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-				error
-			})?;
-			guarded_data.wakeup_rx
-		};
-		let mut read_fd_type = Vec::new();
-		// preallocate some
-		read_fd_type.reserve(INITIAL_MAX_FDS);
-		for _ in 0..INITIAL_MAX_FDS {
-			read_fd_type.push(FdType::Unknown);
-		}
-		if rx >= INITIAL_MAX_FDS.try_into().unwrap_or(0) {
-			for _ in INITIAL_MAX_FDS..(rx + 1) as usize {
-				read_fd_type.push(FdType::Unknown);
+#[derive(Clone)]
+struct ConnectionInfo {
+	handle: ConnectionHandle,
+	connection_id: u128,
+	ctype: ConnectionType,
+	sender: Option<SyncSender<()>>,
+}
+
+struct GuardedData {
+	nconns: Vec<ConnectionInfo>,
+	cconns: Vec<ConnectionInfo>,
+	write_queue: Vec<WriteBuffer>,
+	wakeup_tx: ConnectionHandle,
+	wakeup_rx: ConnectionHandle,
+	wakeup_scheduled: bool,
+	stop: bool,
+}
+
+impl GuardedData {
+	fn wakeup(&mut self) -> Result<(), Error> {
+		if !self.wakeup_scheduled {
+			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+			let res = unsafe { write(self.wakeup_tx, buf, 1) };
+			if res <= 0 {
+				log_multi!(ERROR, MAIN_LOG, "Error writing to wakup tx {}", res);
 			}
-		}
-		read_fd_type[rx as usize] = FdType::Wakeup;
-		let mut use_on_client_read = Vec::new();
-		// preallocate some
-		use_on_client_read.reserve(INITIAL_MAX_FDS);
-		for _ in 0..INITIAL_MAX_FDS {
-			use_on_client_read.push(false);
-		}
-		if rx >= INITIAL_MAX_FDS.try_into().unwrap_or(0) {
-			for _ in INITIAL_MAX_FDS..(rx + 1) as usize {
-				use_on_client_read.push(false);
-			}
-		}
-
-		// add the wakeup pipe rx here
-		let mut output_events = vec![];
-		let mut input_events = vec![];
-		let mut filter_set = HashSet::new();
-		input_events.push(GenericEvent::new(rx, GenericEventType::AddReadLT));
-		Self::get_events(
-			selector,
-			win_selector,
-			input_events,
-			&mut output_events,
-			&mut filter_set,
-		)?;
-
-		let mut ret_count;
-		loop {
-			seqno += 1;
-			let write_queue;
-			let to_process;
-			let handler_events;
-			let write_pending;
-			let on_read;
-			let on_accept;
-			let on_close;
-			let on_client_read;
-			{
-				let mut guarded_data = guarded_data.lock().map_err(|e| {
-					let error: Error =
-						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-					error
-				})?;
-				write_queue = guarded_data.write_queue.clone();
-				to_process = guarded_data.fd_actions.clone();
-				handler_events = guarded_data.handler_events.clone();
-				write_pending = guarded_data.write_pending.clone();
-				guarded_data.write_queue.clear();
-				guarded_data.fd_actions.clear();
-				guarded_data.handler_events.clear();
-				guarded_data.write_pending.clear();
-
-				// check if a stop is needed
-				if guarded_data.stop {
-					thread_pool.stop()?;
-					#[cfg(unix)]
-					{
-						let res = unsafe { close(selector) };
-						if res != 0 {
-							info!("Error closing selector: {}", errno().to_string());
-						}
-						let res = unsafe { close(guarded_data.wakeup_fd) };
-						if res != 0 {
-							info!("Error closing selector: {}", errno().to_string());
-						}
-					}
-					#[cfg(target_os = "windows")]
-					{
-						let res = unsafe { epoll_close(win_selector) };
-						if res != 0 {
-							info!("Error closing win_selector: {}", errno().to_string());
-						}
-						let res = unsafe { ws2_32::closesocket(guarded_data.wakeup_fd) };
-						if res != 0 {
-							info!("Error closing selector: {}", errno().to_string());
-						}
-					}
-					break;
-				}
-			}
-			{
-				let callbacks = callbacks.lock().map_err(|e| {
-					let error: Error =
-						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-					error
-				})?;
-				on_read = callbacks.on_read.as_ref().unwrap().clone();
-				on_accept = callbacks.on_accept.as_ref().unwrap().clone();
-				on_close = callbacks.on_close.as_ref().unwrap().clone();
-				on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
-			}
-
-			for buffer in write_queue {
-				if fd_locks.len() <= buffer.fd as usize {
-					Self::check_and_set(
-						fd_locks,
-						buffer.fd as usize,
-						Arc::new(Mutex::new(StateInfo::new(
-							buffer.fd,
-							State::Normal,
-							buffer.write_buffer.connection_seqno,
-						))),
-					);
-				}
-				do_write(
-					buffer.fd,
-					&buffer.write_buffer.buffer,
-					buffer.write_buffer.offset.into(),
-					buffer.write_buffer.len.into(),
-					buffer.write_buffer.close,
-					Some(&fd_locks[buffer.fd as usize]),
-					buffer.write_buffer.connection_seqno,
-					guarded_data,
-				)?;
-			}
-
-			let mut evs: Vec<GenericEvent> = Vec::new();
-
-			for proc in to_process {
-				match proc.atype {
-					ActionType::AddStream => {
-						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadET));
-						active_seqnos.insert(proc.seqno);
-						let fd = proc.fd as uintptr_t;
-						// make sure there's enough space
-						let len = read_fd_type.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								read_fd_type.push(FdType::Unknown);
-							}
-						}
-
-						read_fd_type[fd] = FdType::Stream;
-
-						let len = use_on_client_read.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								use_on_client_read.push(false);
-							}
-						}
-						use_on_client_read[fd] = true;
-
-						if on_read_locks.len() <= fd as usize {
-							Self::check_and_set(
-								on_read_locks,
-								fd as usize,
-								Arc::new(Mutex::new(false)),
-							);
-						}
-
-						if fd_locks.len() <= fd as usize {
-							Self::check_and_set(
-								fd_locks,
-								fd as usize,
-								Arc::new(Mutex::new(StateInfo::new(
-									fd.try_into().unwrap_or(0),
-									State::Normal,
-									proc.seqno,
-								))),
-							);
-						}
-					}
-					ActionType::AddListener => {
-						evs.push(GenericEvent::new(proc.fd, GenericEventType::AddReadLT));
-						active_seqnos.insert(proc.seqno);
-						let fd = proc.fd as uintptr_t;
-
-						// make sure there's enough space
-						let len = read_fd_type.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								read_fd_type.push(FdType::Unknown);
-							}
-						}
-						read_fd_type[fd] = FdType::Listener;
-
-						let len = use_on_client_read.len();
-						if fd >= len {
-							for _ in len..fd + 1 {
-								use_on_client_read.push(false);
-							}
-						}
-						use_on_client_read[fd] = false;
-					}
-				}
-			}
-			// check if we accepted a connection
-			Self::process_handler_events(
-				handler_events,
-				write_pending,
-				&mut evs,
-				&mut read_fd_type,
-				&mut use_on_client_read,
-				on_close.clone(),
-				&thread_pool,
-				&global_lock,
-				fd_locks,
-				&mut active_seqnos,
-			)?;
-			let mut output_events = vec![];
-			ret_count = Self::get_events(
-				selector,
-				win_selector,
-				evs,
-				&mut output_events,
-				&mut filter_set,
-			)?;
-			// if no events are returned (on timeout), just bypass following logic and wait
-			if ret_count == 0 {
-				continue;
-			}
-			for event in output_events {
-				if event.etype == GenericEventType::AddWriteET {
-					let res = Self::process_event_write(
-						event.fd as ConnectionHandle,
-						&thread_pool,
-						guarded_data,
-						&global_lock,
-						fd_locks,
-					);
-					match res {
-						Ok(_) => {}
-						Err(e) => {
-							info!("Unexpected error in poll loop: {}", e.to_string());
-						}
-					}
-				}
-				if event.etype == GenericEventType::AddReadET
-					|| event.etype == GenericEventType::AddReadLT
-				{
-					let res = Self::process_event_read(
-						event.fd as ConnectionHandle,
-						&mut read_fd_type,
-						&thread_pool,
-						guarded_data,
-						on_read.clone(),
-						on_accept.clone(),
-						on_client_read.clone(),
-						use_on_client_read[event.fd as usize],
-						fd_locks,
-						on_read_locks,
-						seqno,
-						&global_lock,
-						&mut use_on_client_read,
-						&mut active_seqnos,
-					);
-
-					match res {
-						Ok(_) => {}
-						Err(e) => {
-							info!("Unexpected error in poll loop: {}", e.to_string());
-						}
-					}
-				}
-			}
-		}
-
-		Ok(())
-	}
-
-	fn write_loop(
-		fd: ConnectionHandle,
-		statefd: ConnectionHandle,
-		write_buffer: &mut WriteBuffer,
-	) -> Result<u16, Error> {
-		let initial_len = write_buffer.len;
-		loop {
-			if statefd != fd {
-				return Err(ErrorKind::StaleFdError(format!(
-					"write to closed fd: {}, statefd = {}",
-					fd, statefd,
-				))
-				.into());
-			}
-			#[cfg(unix)]
-			let len = {
-				let buf: *mut c_void = &mut write_buffer.buffer[(write_buffer.offset as usize)
-					..(write_buffer.offset as usize + write_buffer.len as usize)]
-					as *mut _ as *mut c_void;
-
-				unsafe { write(fd, buf, write_buffer.len.into()) }
-			};
-			#[cfg(target_os = "windows")]
-			let len = {
-				let buf: *mut i8 = &mut write_buffer.buffer
-					[(write_buffer.offset as usize)..(write_buffer.len as usize)]
-					as *mut _ as *mut i8;
-
-				unsafe { ws2_32::send(fd, buf, (write_buffer.len - write_buffer.offset).into(), 0) }
-			};
-			if len >= 0 {
-				if len == (write_buffer.len as i32).try_into().unwrap_or(0) {
-					// we're done
-					write_buffer.offset += len as u16;
-					write_buffer.len -= len as u16;
-					return Ok(initial_len);
-				} else {
-					// update values and write again
-					write_buffer.offset += len as u16;
-					write_buffer.len -= len as u16;
-				}
-			} else {
-				if errno().0 == EAGAIN {
-					// break because we're edge triggered.
-					// a new event occurs.
-
-					return Ok(initial_len - write_buffer.len);
-				} else {
-					// this is an actual write error.
-					// close the connection.
-					return Err(
-						ErrorKind::ConnectionCloseError(format!("connection closed",)).into(),
-					);
-				}
-			}
-		}
-	}
-
-	fn do_close(
-		fd: ConnectionHandle,
-		seqno: u128,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-	) -> Result<(), Error> {
-		let state = fd_locks[fd as usize].lock();
-		match state {
-			Ok(mut state) => {
-				if state.fd == fd {
-					if state.state == State::Closing {
-						#[cfg(unix)]
-						let res = unsafe { close(state.fd) };
-						#[cfg(target_os = "windows")]
-						let res = unsafe { ws2_32::closesocket(state.fd) };
-						if res == 0 {
-							state.state = State::Closed;
-						} else {
-							let e = errno();
-							info!("error closing socket: {}", e.to_string());
-							return Err(
-								ErrorKind::InternalError("Already closed".to_string()).into()
-							);
-						}
-					} else {
-						return Err(ErrorKind::InternalError("Already closed".to_string()).into());
-					}
-				} else {
-					return Err(ErrorKind::InternalError("FD mismatch".to_string()).into());
-				}
-			}
-			Err(e) => {
-				info!(
-					"unexpected error obtaining fd_lock to close: {}, fd={}, seqno={}",
-					e.to_string(),
-					fd,
-					seqno
-				);
-				return Err(ErrorKind::InternalError("can't obtain lock".to_string()).into());
-			}
-		}
-		Ok(())
-	}
-
-	fn write_until_block(
-		fd: ConnectionHandle,
-		state_info: &mut StateInfo,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-	) -> Result<bool, Error> {
-		let mut complete = true;
-		loop {
-			let (ret, total_len, front_close, front_seqno) = {
-				let front = state_info.write_buffer.front_mut();
-				if front.is_none() {
-					break;
-				}
-				let front = front.unwrap();
-				let total_len = front.len;
-				(
-					Self::write_loop(fd, state_info.fd, front),
-					total_len,
-					front.close,
-					front.connection_seqno,
-				)
-			};
-
-			match ret {
-				Ok(len) => {
-					if len == total_len {
-						if front_close {
-							Self::push_handler_event_with_fd_lock(
-								fd,
-								HandlerEventType::Close,
-								guarded_data,
-								state_info,
-								false,
-								front_seqno,
-							)?;
-						}
-						state_info.write_buffer.pop_front();
-					} else {
-						// we didn't complete, we need to break
-						// we had to block so a new
-						// edge triggered event will occur
-						complete = false;
-						break;
-					}
-				}
-				Err(e) => {
-					info!("write error: {}", e);
-					Self::push_handler_event_with_fd_lock(
-						fd,
-						HandlerEventType::Close,
-						guarded_data,
-						state_info,
-						false,
-						front_seqno,
-					)?;
-					break;
-				}
-			}
-		}
-
-		Ok(complete)
-	}
-
-	fn process_event_write(
-		fd: ConnectionHandle,
-		thread_pool: &StaticThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		global_lock: &Arc<RwLock<bool>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-	) -> Result<(), Error> {
-		#[cfg(target_os = "windows")]
-		{
-			// if windows push pause event before proceeding
-			let guarded_data = guarded_data.lock();
-			match guarded_data {
-				Ok(mut guarded_data) => {
-					let nevent = HandlerEvent::new(fd, HandlerEventType::PauseWrite, 0);
-					guarded_data.handler_events.push(nevent);
-				}
-				Err(e) => {
-					info!(
-						"unexpected error getting guareded_data lock: {}",
-						e.to_string()
-					);
-				}
-			}
-		}
-
-		let state_info = fd_locks[fd as usize].clone();
-		let guarded_data = guarded_data.clone();
-		let global_lock = global_lock.clone();
-		#[cfg(target_os = "windows")]
-		let mut fd_locks = fd_locks.clone();
-		thread_pool
-			.execute(async move {
-				#[cfg(target_os = "windows")]
-				let mut seqno = 0;
-				#[cfg(target_os = "windows")]
-				let mut complete = true;
-				{
-					let lock = global_lock.read();
-					match lock {
-						Ok(_) => {}
-						Err(e) => info!("Unexpected error obtaining write lock: {}", e),
-					}
-					{
-						let state_info = state_info.lock();
-						match state_info {
-							Ok(mut state_info) => {
-								#[cfg(target_os = "windows")]
-								{
-									seqno = state_info.seqno;
-								}
-								let res =
-									Self::write_until_block(fd, &mut state_info, &guarded_data);
-								#[cfg(target_os = "windows")]
-								match res {
-									Ok(c) => {
-										complete = c;
-									}
-									Err(e) => {
-										info!(
-											"unexpected error in process_event_write: {}",
-											e.to_string()
-										);
-									}
-								}
-								#[cfg(unix)]
-								match res {
-									Ok(_) => {}
-									Err(e) => {
-										info!(
-											"unexpected error in process_event_write: {}",
-											e.to_string()
-										);
-									}
-								}
-							}
-							Err(e) => {
-								info!(
-									"unexpected error with locking write_buffer: {}",
-									e.to_string()
-								);
-							}
-						}
-					}
-				}
-
-				#[cfg(target_os = "windows")]
-				{
-					if !complete {
-						let res = Self::push_handler_event(
-							fd,
-							HandlerEventType::ResumeWrite,
-							&guarded_data,
-							&mut fd_locks,
-							false,
-							seqno,
-						);
-						match res {
-							Ok(_) => {}
-							Err(e) => {
-								info!("Error pushing handler event: {}", e);
-							}
-						}
-					}
-				}
-			})
-			.map_err(|e| {
-				let error: Error =
-					ErrorKind::InternalError(format!("write thread pool error: {}", e)).into();
-				error
-			})?;
-
-		Ok(())
-	}
-
-	fn ensure_allocations(
-		fd: ConnectionHandle,
-		read_fd_type: &mut Vec<FdType>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
-		use_on_client_read: &mut Vec<bool>,
-		seqno: u128,
-	) -> Result<(), Error> {
-		let len = read_fd_type.len();
-		if fd as usize >= len {
-			for _ in len..(fd + 100) as usize + 1 {
-				read_fd_type.push(FdType::Unknown);
-			}
-		}
-
-		if on_read_locks.len() <= fd as usize {
-			Self::check_and_set(
-				on_read_locks,
-				(fd + 100) as usize,
-				Arc::new(Mutex::new(false)),
-			);
-		}
-
-		if fd_locks.len() <= fd as usize {
-			Self::check_and_set(
-				fd_locks,
-				(fd + 100) as usize,
-				Arc::new(Mutex::new(StateInfo::new(fd, State::Normal, seqno))),
-			);
-		}
-
-		if use_on_client_read.len() <= fd as usize {
-			Self::check_and_set(use_on_client_read, (fd + 100) as usize, false);
-		}
-
-		{
-			let state = fd_locks[fd as usize].lock();
-			match state {
-				Ok(mut state) => {
-					*state = StateInfo::new(fd, State::Normal, seqno);
-				}
-				Err(e) => {
-					info!("Error getting seqno: {}", e.to_string());
-					return Err(ErrorKind::InternalError(
-						"unexpected error obtaining seqno".to_string(),
-					)
-					.into());
-				}
-			}
-		}
-		Ok(())
-	}
-
-	fn process_event_read(
-		fd: ConnectionHandle,
-		read_fd_type: &mut Vec<FdType>,
-		thread_pool: &StaticThreadPool,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		on_read: Pin<Box<F>>,
-		on_accept: Pin<Box<G>>,
-		on_client_read: Pin<Box<K>>,
-		use_on_client_read: bool,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		on_read_locks: &mut Vec<Arc<Mutex<bool>>>,
-		seqno: u128,
-		global_lock: &Arc<RwLock<bool>>,
-		use_client_on_read: &mut Vec<bool>,
-		active_seqnos: &mut HashSet<u128>,
-	) -> Result<(), Error> {
-		let fd_type = &read_fd_type[fd as usize];
-		match fd_type {
-			FdType::Listener => {
-				let lock = global_lock.write();
-				match lock {
-					Ok(_) => {}
-					Err(e) => info!("Unexpected error obtaining read lock, {}", e),
-				}
-				#[cfg(unix)]
-				let res = unsafe {
-					accept(
-						fd,
-						&mut libc::sockaddr {
-							..std::mem::zeroed()
-						},
-						&mut (std::mem::size_of::<libc::sockaddr>() as u32)
-							.try_into()
-							.unwrap_or(0),
-					)
-				};
-
-				#[cfg(target_os = "windows")]
-				let res = unsafe {
-					ws2_32::accept(
-						fd,
-						&mut winapi::ws2def::SOCKADDR {
-							..std::mem::zeroed()
-						},
-						&mut (std::mem::size_of::<winapi::ws2def::SOCKADDR>() as u32)
-							.try_into()
-							.unwrap_or(0),
-					)
-				};
-				if res > 0 {
-					active_seqnos.insert(seqno);
-					Self::ensure_allocations(
-						res,
-						read_fd_type,
-						fd_locks,
-						on_read_locks,
-						use_client_on_read,
-						seqno,
-					)?;
-
-					// set non-blocking
-					#[cfg(unix)]
-					{
-						let fcntl_res = unsafe { fcntl(res, libc::F_SETFL, libc::O_NONBLOCK) };
-						if fcntl_res < 0 {
-							let e = errno().to_string();
-							return Err(
-								ErrorKind::InternalError(format!("fcntl error: {}", e)).into()
-							);
-						}
-					}
-					#[cfg(target_os = "windows")]
-					{
-						let fionbio = 0x8004667eu32;
-						let ioctl_res =
-							unsafe { ws2_32::ioctlsocket(res, fionbio as c_int, &mut 1) };
-
-						if ioctl_res != 0 {
-							info!("complete fion with error: {}", errno().to_string());
-						}
-
-						let sockoptres = unsafe {
-							ws2_32::setsockopt(
-								res,
-								winapi::SOL_SOCKET,
-								winapi::SO_SNDBUF,
-								&WINSOCK_BUF_SIZE as *const _ as *const i8,
-								std::mem::size_of_val(&WINSOCK_BUF_SIZE) as winapi::c_int,
-							)
-						};
-
-						if sockoptres != 0 {
-							info!("setsockopt resulted in error: {}", errno().to_string());
-						}
-					}
-
-					let accept_res = Self::process_accept_result(fd, res, &guarded_data, fd_locks);
-					match accept_res {
-						Ok(_) => {
-							let wh = WriteHandle::new(
-								res,
-								guarded_data.clone(),
-								seqno,
-								Some(fd_locks[res as usize].clone()),
-							);
-							let accept_res = (on_accept)(seqno as u128, wh);
-							match accept_res {
-								Ok(_) => {}
-								Err(e) => {
-									info!("on_accept callback resulted in: {}", e.to_string())
-								}
-							}
-						}
-						Err(e) => {
-							info!("process_accept_result resulted in: {}", e.to_string())
-						}
-					}
-
-					Ok(())
-				} else {
-					Self::process_accept_err(fd, "accept error".to_string())
-				}?;
-			}
-			FdType::Stream => {
-				#[cfg(target_os = "windows")]
-				{
-					// if windows push pause event before proceeding
-					let guarded_data = guarded_data.lock();
-					match guarded_data {
-						Ok(mut guarded_data) => {
-							let nevent = HandlerEvent::new(fd, HandlerEventType::PauseRead, seqno);
-							guarded_data.handler_events.push(nevent);
-						}
-						Err(e) => {
-							info!(
-								"unexpected error getting guareded_data lock: {}",
-								e.to_string()
-							);
-						}
-					}
-				}
-
-				let guarded_data = guarded_data.clone();
-				let fd_lock = fd_locks[fd as usize].clone();
-				let mut fd_locks = fd_locks.clone();
-				let on_read_locks = on_read_locks.clone();
-				let global_lock = global_lock.clone();
-				thread_pool
-					.execute(async move {
-						let lock = global_lock.read();
-						match lock {
-							Ok(_) => {}
-							Err(e) => info!("Unexpected error obtaining read lock: {}", e),
-						}
-						let mut buf = [0u8; BUFFER_SIZE];
-						loop {
-							let on_read_lock = on_read_locks[fd as usize].lock();
-							match on_read_lock {
-								Ok(_) => {}
-								Err(e) => {
-									info!("unexpected error obtaining on_read_lock: {}", e);
-								}
-							}
-							let (seqno, len) = {
-								let fd_lock = fd_lock.lock();
-								let seqno = match fd_lock {
-									Ok(ref state_info) => (*state_info).seqno,
-									Err(e) => {
-										info!(
-											"Unexpected Error obtaining read lock: {}",
-											e.to_string()
-										);
-										break;
-									}
-								};
-								#[cfg(unix)]
-								let len = {
-									let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
-									unsafe { read(fd, cbuf, BUFFER_SIZE) }
-								};
-								#[cfg(target_os = "windows")]
-								let len = {
-									let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
-									unsafe {
-										ws2_32::recv(
-											fd,
-											cbuf,
-											BUFFER_SIZE.try_into().unwrap_or(0),
-											0,
-										)
-									}
-								};
-
-								(seqno, len)
-							};
-
-							if len >= 0 {
-								let _ = Self::process_read_result(
-									fd,
-									len as usize,
-									buf,
-									&guarded_data,
-									&mut fd_locks,
-									on_read.clone(),
-									on_client_read.clone(),
-									use_on_client_read,
-									seqno,
-								);
-								if len == 0 {
-									break;
-								}
-
-								// break on windows
-								#[cfg(target_os = "windows")]
-								{
-									break;
-								}
-							} else {
-								let e = errno();
-								if e.0 != EAGAIN {
-									let _ = Self::process_read_err(
-										fd,
-										e.to_string(),
-										&guarded_data,
-										&mut fd_locks,
-										seqno,
-									);
-								}
-								break;
-							};
-						}
-						// resume read here - windows
-						#[cfg(target_os = "windows")]
-						{
-							let res = Self::push_handler_event(
-								fd,
-								HandlerEventType::ResumeRead,
-								&guarded_data,
-								&mut fd_locks,
-								true,
-								seqno,
-							);
-							match res {
-								Ok(_) => {}
-								Err(e) => {
-									info!("Error pushing handler event: {}", e);
-								}
-							}
-						}
-					})
-					.map_err(|e| {
-						let error: Error =
-							ErrorKind::InternalError(format!("read thread pool error: {}", e))
-								.into();
-						error
-					})?;
-			}
-			FdType::Unknown => {
-				info!("unexpected fd_type (unknown) for fd: {}", fd);
-			}
-			FdType::Wakeup => {
-				#[cfg(unix)]
-				{
-					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-					unsafe { read(fd, cbuf, 1) }
-				};
-				#[cfg(target_os = "windows")]
-				{
-					let cbuf: *mut i8 = &mut [0u8; 1] as *mut _ as *mut i8;
-					unsafe { ws2_32::recv(fd, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) }
-				};
-
-				let mut guarded_data = guarded_data.lock().map_err(|e| {
-					let error: Error =
-						ErrorKind::InternalError(format!("Poison Error: {}", e)).into();
-					error
-				})?;
-				guarded_data.wakeup_scheduled = false;
-			}
-		}
-		Ok(())
-	}
-
-	fn process_read_result(
-		fd: ConnectionHandle,
-		len: usize,
-		buf: [u8; BUFFER_SIZE],
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		on_read: Pin<Box<F>>,
-		on_client_read: Pin<Box<K>>,
-		use_on_client_read: bool,
-		connection_seqno: u128,
-	) -> Result<(), Error> {
-		if len > 0 {
-			// build write handle
-			let wh = WriteHandle::new(
-				fd,
-				guarded_data.clone(),
-				connection_seqno,
-				Some(fd_locks[fd as usize].clone()),
-			);
-
-			let result = match use_on_client_read {
-				true => (on_client_read)(&buf, len, wh),
-				false => (on_read)(&buf, len, wh),
-			};
-
-			match result {
-				Ok(_) => {}
-				Err(e) => {
-					info!("Client callback resulted in error: {}", e.to_string());
-				}
-			}
-		} else {
-			// close
-			Self::push_handler_event(
-				fd,
-				HandlerEventType::Close,
-				guarded_data,
-				fd_locks,
-				false,
-				connection_seqno,
-			)?;
-		}
-		Ok(())
-	}
-
-	fn process_read_err(
-		fd: ConnectionHandle,
-		_error: String,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		connection_seqno: u128,
-	) -> Result<(), Error> {
-		Self::push_handler_event(
-			fd,
-			HandlerEventType::Close,
-			guarded_data,
-			fd_locks,
-			false,
-			connection_seqno,
-		)?;
-		Ok(())
-	}
-
-	fn process_accept_result(
-		_acceptor: ConnectionHandle,
-		nfd: ConnectionHandle,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-	) -> Result<(), Error> {
-		Self::push_handler_event(
-			nfd,
-			HandlerEventType::Accept,
-			guarded_data,
-			fd_locks,
-			false,
-			0,
-		)
-		.map_err(|e| {
-			let error: Error =
-				ErrorKind::InternalError(format!("push handler event error: {}", e.to_string()))
-					.into();
-			error
-		})?;
-		Ok(())
-	}
-
-	fn process_accept_err(_acceptor: ConnectionHandle, error: String) -> Result<(), Error> {
-		info!("error on acceptor: {}", error);
-		Ok(())
-	}
-
-	fn push_handler_event_with_fd_lock(
-		fd: ConnectionHandle,
-		event_type: HandlerEventType,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		state: &mut StateInfo,
-		wakeup: bool,
-		seqno: u128,
-	) -> Result<(), Error> {
-		if event_type == HandlerEventType::Close {
-			if state.state == State::Normal {
-				state.state = State::Closing;
-			} else {
-				return Ok(()); // nothing more to do
-			}
-		}
-
-		Self::generic_handler_complete(fd, guarded_data, event_type, seqno, wakeup)?;
-		Ok(())
-	}
-
-	fn push_handler_event(
-		fd: ConnectionHandle,
-		event_type: HandlerEventType,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		fd_locks: &mut Vec<Arc<Mutex<StateInfo>>>,
-		wakeup: bool,
-		seqno: u128,
-	) -> Result<(), Error> {
-		if event_type == HandlerEventType::Close {
-			match fd_locks[fd as usize].lock() {
-				Ok(mut state) => {
-					if state.fd == fd {
-						if state.state == State::Normal {
-							state.state = State::Closing;
-						} else {
-							return Ok(()); // return nothing more to do
-						}
-					} else {
-						return Ok(()); // return nothing more to do
-					}
-				}
-				Err(e) => {
-					info!(
-                        "unexpected error obtaining lock for fd_lock push_handler_event, e={},fd={},event_type={:?},seqno={}",
-                        e.to_string(),
-                        fd,
-                        event_type,
-                        seqno,
-                    );
-					return Ok(()); // we continue with this error
-				}
-			}
-		}
-		Self::generic_handler_complete(fd, guarded_data, event_type, seqno, wakeup)?;
-		Ok(())
-	}
-
-	fn generic_handler_complete(
-		fd: ConnectionHandle,
-		guarded_data: &Arc<Mutex<GuardedData>>,
-		event_type: HandlerEventType,
-		seqno: u128,
-		wakeup: bool,
-	) -> Result<(), Error> {
-		{
-			let guarded_data = guarded_data.lock();
-			let mut wakeup_fd = 0;
-			let mut wakeup_scheduled = false;
-			match guarded_data {
-				Ok(mut guarded_data) => {
-					let nevent = HandlerEvent::new(fd, event_type.clone(), seqno);
-					guarded_data.handler_events.push(nevent);
-
-					if wakeup {
-						wakeup_scheduled = guarded_data.wakeup_scheduled;
-						if !wakeup_scheduled {
-							guarded_data.wakeup_scheduled = true;
-						}
-						wakeup_fd = guarded_data.wakeup_fd;
-					}
-				}
-				Err(e) => {
-					info!("Unexpected handler error: {}", e.to_string());
-				}
-			}
-			if wakeup && !wakeup_scheduled {
-				#[cfg(unix)]
-				{
-					let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-					unsafe {
-						write(wakeup_fd, buf, 1);
-					}
-				}
-				#[cfg(target_os = "windows")]
-				{
-					let buf: *mut i8 = &mut [0i8; 1] as *mut _ as *mut i8;
-					unsafe {
-						ws2_32::send(wakeup_fd, buf, 1, 0);
-					}
-				}
-			}
+			self.wakeup_scheduled = true;
 		}
 		Ok(())
 	}
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WriteBuffer {
+	len: u16,
+	offset: u16,
+	buffer: [u8; BUFFER_SIZE],
+	close: bool,
+	connection_id: u128,
+}
+
+struct Callbacks<F, G, H, K> {
+	on_read: Option<Pin<Box<F>>>,
+	on_accept: Option<Pin<Box<G>>>,
+	on_close: Option<Pin<Box<H>>>,
+	on_client_read: Option<Pin<Box<K>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamWriteBuffer {
+	fd: ConnectionHandle,
+	write_buffer: WriteBuffer,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ActionType {
+	AddStream,
+	AddListener,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum GenericEventType {
+	AddReadET,
+	AddReadLT,
+	//	DelRead,
+	AddWriteET,
+	//	DelWrite,
+}
+
+#[derive(Debug, Clone)]
+struct GenericEvent {
+	fd: ConnectionHandle,
+	etype: GenericEventType,
+}
+
+impl GenericEvent {
+	fn new(fd: ConnectionHandle, etype: GenericEventType) -> Self {
+		GenericEvent { fd, etype }
+	}
+
+	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+	fn to_kev(&self) -> kevent {
+		kevent::new(
+			self.fd as uintptr_t,
+			match &self.etype {
+				GenericEventType::AddReadET => EventFilter::EVFILT_READ,
+				GenericEventType::AddReadLT => EventFilter::EVFILT_READ,
+				//GenericEventType::DelRead => EventFilter::EVFILT_READ,
+				GenericEventType::AddWriteET => EventFilter::EVFILT_WRITE,
+				//GenericEventType::DelWrite => EventFilter::EVFILT_WRITE,
+			},
+			match &self.etype {
+				GenericEventType::AddReadET => EventFlag::EV_ADD | EventFlag::EV_CLEAR,
+				GenericEventType::AddReadLT => EventFlag::EV_ADD,
+				//GenericEventType::DelRead => EventFlag::EV_DELETE,
+				GenericEventType::AddWriteET => EventFlag::EV_ADD | EventFlag::EV_CLEAR,
+				//GenericEventType::DelWrite => EventFlag::EV_DELETE,
+			},
+			FilterFlag::empty(),
+		)
+	}
+}
+
+fn write_data(
+	handle: ConnectionHandle,
+	buf: &[u8],
+	global_lock: &Arc<RwLock<bool>>,
+) -> Result<isize, Error> {
+	let _lock = nioruntime_util::lockr!(global_lock);
+	#[cfg(unix)]
+	let len = {
+		let cbuf: *const c_void = buf as *const _ as *const c_void;
+		unsafe { write(handle, cbuf, buf.len().into()) }
+	};
+	#[cfg(target_os = "windows")]
+	let len = {
+		let cbuf: *const i8 = &buf as *const _ as *const i8;
+		unsafe { ws2_32::send(handle, cbuf, (buf.len()).into(), 0) }
+	};
+
+	Ok(len)
+}
+
+#[cfg(unix)]
+type SelectorHandle = i32;
+#[cfg(target_os = "windows")]
+type SelectorHandle = *mut c_void;
+
 #[test]
 fn test_echo() -> Result<(), Error> {
 	use std::net::TcpListener;
 	use std::net::TcpStream;
+	use std::sync::Mutex;
 
 	let x = Arc::new(Mutex::new(0));
 	let x_clone = x.clone();
 
 	let listener = TcpListener::bind("127.0.0.1:9981")?;
 	let stream = TcpStream::connect("127.0.0.1:9981")?;
-	let mut eh = EventHandler::new();
+	let mut eh = EventHandler::new(EventHandlerConfig::default());
 
 	// echo
 	eh.set_on_read(|buf, len, wh| {
 		info!("server received: {} bytes", len);
-		let _ = wh.write(buf, 0, len, false);
+		let _ = wh.write(&buf[0..len]);
 		Ok(())
 	})?;
 
@@ -2691,12 +2011,12 @@ fn test_echo() -> Result<(), Error> {
 		}
 		Ok(())
 	})?;
-
 	eh.start()?;
 
 	eh.add_tcp_listener(&listener)?;
 	let wh = eh.add_tcp_stream(&stream)?;
-	wh.write(&[1, 2, 3, 4, 5], 0, 5, false)?;
+	// TODO: would be nice to eliminate this sleep
+	wh.write(&[1, 2, 3, 4, 5])?;
 	loop {
 		{
 			let x = x_clone.lock().unwrap();
@@ -2716,10 +2036,11 @@ fn test_close() -> Result<(), Error> {
 	use std::io::Write;
 	use std::net::TcpListener;
 	use std::net::TcpStream;
+	use std::sync::Mutex;
 
 	let listener = TcpListener::bind("127.0.0.1:9982")?;
 	let mut stream = TcpStream::connect("127.0.0.1:9982")?;
-	let mut eh = EventHandler::new();
+	let mut eh = EventHandler::new(EventHandlerConfig::default());
 
 	let read_buf = Arc::new(Mutex::new(vec![]));
 	eh.set_on_read(move |buf, len, wh| {
@@ -2743,12 +2064,13 @@ fn test_close() -> Result<(), Error> {
 		}
 		for i in 0..len {
 			if read_buf[i] == 8 {
-				wh.write(&[0], 0, 1, true)?;
+				wh.write(&[0])?;
+				wh.close()?;
 				read_buf.clear();
 				return Ok(());
 			}
 		}
-		wh.write(&[1], 0, 1, false)?;
+		wh.write(&[1])?;
 		read_buf.clear();
 		Ok(())
 	})?;
@@ -2759,20 +2081,17 @@ fn test_close() -> Result<(), Error> {
 
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
-
 	stream.write(&[1, 2, 3, 4, 5])?;
 	let mut buf = [0u8; 1000];
 	let len = stream.read(&mut buf)?;
 	assert_eq!(len, 1);
 	assert_eq!(buf[0], 1);
-
 	stream.write(&[8, 8, 8, 8, 8])?;
 	let len = stream.read(&mut buf)?;
 	assert_eq!(len, 1);
 	assert_eq!(buf[0], 0);
 	let len = stream.read(&mut buf)?;
 	assert_eq!(len, 0); // means connection closed
-
 	let mut stream2 = TcpStream::connect("127.0.0.1:9982")?;
 	stream2.write(&[7, 7, 7, 7, 7])?;
 	let len = stream2.read(&mut buf)?;
@@ -2789,7 +2108,7 @@ fn test_client() -> Result<(), Error> {
 
 	let listener = TcpListener::bind("127.0.0.1:9983")?;
 	let mut stream = TcpStream::connect("127.0.0.1:9983")?;
-	let mut eh = EventHandler::new();
+	let mut eh = EventHandler::new(EventHandlerConfig::default());
 
 	// echo
 	eh.set_on_read(|buf, len, wh| {
@@ -2800,7 +2119,10 @@ fn test_client() -> Result<(), Error> {
 			}
 			// close if len == 5, otherwise keep open
 			_ => {
-				let _ = wh.write(buf, 0, len, len == 5);
+				let _ = wh.write(&buf[0..len])?;
+				if len == 5 {
+					wh.close()?;
+				}
 			}
 		}
 		Ok(())
@@ -2828,10 +2150,11 @@ fn test_stop() -> Result<(), Error> {
 	use std::io::Write;
 	use std::net::TcpListener;
 	use std::net::TcpStream;
+	use std::sync::Mutex;
 
 	let listener = TcpListener::bind("127.0.0.1:9984")?;
 	let mut stream = TcpStream::connect("127.0.0.1:9984")?;
-	let mut eh = EventHandler::new();
+	let mut eh = EventHandler::new(EventHandlerConfig::default());
 	let x = Arc::new(Mutex::new(0));
 	let xclone = x.clone();
 
@@ -2872,10 +2195,11 @@ fn test_stop() -> Result<(), Error> {
 fn test_large_messages() -> Result<(), Error> {
 	use std::net::TcpListener;
 	use std::net::TcpStream;
+	use std::sync::Mutex;
 
 	let listener = TcpListener::bind("127.0.0.1:9933")?;
 	let stream = TcpStream::connect("127.0.0.1:9933")?;
-	let mut eh = EventHandler::new();
+	let mut eh = EventHandler::new(EventHandlerConfig::default());
 
 	eh.set_on_read(move |buf, len, wh| {
 		match len {
@@ -2885,7 +2209,10 @@ fn test_large_messages() -> Result<(), Error> {
 			}
 			// close if len == 5, otherwise keep open
 			_ => {
-				let _ = wh.write(buf, 0, len, len == 5);
+				let _ = wh.write(&buf[0..len])?;
+				if len == 5 {
+					wh.close()?;
+				}
 			}
 		}
 		Ok(())
@@ -2922,7 +2249,7 @@ fn test_large_messages() -> Result<(), Error> {
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
 	let wh = eh.add_tcp_stream(&stream)?;
-	wh.write(&msgbuf, 0, msgbuf.len(), false)?;
+	wh.write(&msgbuf[0..msgbuf.len()])?;
 	loop {
 		{
 			let complete = complete.lock().unwrap();
