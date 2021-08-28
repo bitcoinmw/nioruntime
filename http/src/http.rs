@@ -31,7 +31,7 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::num::ParseIntError;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -85,8 +85,10 @@ pub enum HttpVersion {
 type Housekeeper = fn() -> Result<(), Error>;
 
 type Callback = fn(
-	Arc<RwLock<ConnData>>,
-	&[u8],
+	&mut RwLockWriteGuard<ConnData>,
+	bool,
+	usize,
+	usize,
 	HttpMethod,
 	HttpConfig,
 	WriteHandle,
@@ -98,8 +100,10 @@ type Callback = fn(
 ) -> Result<(), Error>;
 
 fn empty_callback(
-	_: Arc<RwLock<ConnData>>,
-	_: &[u8],
+	_: &mut RwLockWriteGuard<ConnData>,
+	_: bool,
+	_: usize,
+	_: usize,
 	_: HttpMethod,
 	_: HttpConfig,
 	_: WriteHandle,
@@ -1360,14 +1364,7 @@ impl HttpServer {
 			}
 		};
 
-		/*
-				let thread_pool = thread_pool.read().map_err(|e| {
-					let error: Error =
-						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
-					error
-				})?;
-		*/
-		{
+		let log_item = {
 			let mut conn_data = conn_data.write().map_err(|e| {
 				let error: Error =
 					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
@@ -1383,297 +1380,23 @@ impl HttpServer {
 			for i in 0..len {
 				conn_data.buffer.push(buf[i]);
 			}
-		}
 
-		//		thread_pool.execute(async move {
-		match Self::process_request(
-			http_config,
-			conn_data,
-			wh,
-			http_context,
-			mappings,
-			extensions,
-		) {
-			Ok(_) => {}
-			Err(e) => {
-				log_multi!(
-					ERROR,
-					MAIN_LOG,
-					"unexpected error processing request: {}",
-					e.to_string()
-				);
-			}
-		}
-		//		})?;
-
-		Ok(())
-	}
-
-	fn process_request(
-		config: HttpConfig,
-		conn_data: Arc<RwLock<ConnData>>,
-		wh: WriteHandle,
-		http_context: Arc<RwLock<HttpContext>>,
-		mappings: HashSet<String>,
-		extensions: HashSet<String>,
-	) -> Result<(), Error> {
-		let conn_data_clone = conn_data.clone();
-		let mut log_item = None;
-		{
-			let mut conn_data = conn_data.write().map_err(|e| {
-				let error: Error =
-					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
-				error
-			})?;
-
-			if conn_data.needed_len != 0 && conn_data.buffer.len() < conn_data.needed_len {
-				// data not sufficient return and wait for more data
-				return Ok(());
-			} else {
-				conn_data.needed_len = 0;
-			}
-
-			let connection_id = conn_data.wh.get_connection_id();
-			// iterate through and try to find a double line break. If we find it,
-			// send to next function for processing and delete the data that we send.
-			loop {
-				let buffer = &mut conn_data.buffer;
-				let len = buffer.len();
-
-				if len <= 3 {
-					// not enough data, go away until more is available
-					break;
-				}
-				let mut end_buf;
-				let mut start_buf;
-				let mut update_needed_len = 0;
-				let mut has_content = false;
-				let mut processed_page = false;
-				for i in 3..len {
-					start_buf = i + 1;
-					end_buf = i;
-					if (buffer[i - 3] == '\r' as u8
-				&& buffer[i - 2] == '\n' as u8
-				&& buffer[i - 1] == '\r' as u8
-				&& buffer[i] == '\n' as u8)
-				// we are tolerant of the incorrect format too
-				|| (buffer[i - 1] == '\n' as u8 && buffer[i] == '\n' as u8)
-					{
-						// end of a request found.
-						if len < 6
-							|| (buffer[0..4] != ['G' as u8, 'E' as u8, 'T' as u8, ' ' as u8]
-								&& (buffer[0..5]
-									!= ['P' as u8, 'O' as u8, 'S' as u8, 'T' as u8, ' ' as u8]))
-						{
-							// only accept GET/POST for now
-							warn!(
-								"invalid request on connection_id = {}, data = '{:?}'",
-								connection_id,
-								std::str::from_utf8(&buffer[0..len]),
-							);
-							Self::send_bad_request_error(&wh)?;
-							break;
-						} else {
-							let method = if buffer[0] == 'G' as u8 {
-								HttpMethod::Get
-							} else {
-								HttpMethod::Post
-							};
-							let mut space_count = 0;
-							let mut uri = vec![];
-							let mut http_ver_string = vec![];
-
-							for j in 0..len {
-								if buffer[j] == ' ' as u8
-									|| buffer[j] == '\r' as u8 || buffer[j] == '\n' as u8
-								{
-									space_count += 1;
-								}
-								if space_count == 1 {
-									if buffer[j] != ' ' as u8 {
-										uri.push(buffer[j]);
-									}
-								} else if space_count == 2 {
-									if buffer[j] != ' ' as u8 {
-										http_ver_string.push(buffer[j]);
-									}
-								} else if space_count > 2 {
-									break;
-								}
-							}
-
-							// get headers
-							let mut nl_count = 0;
-							let mut headers_vec = vec![];
-							for j in 0..len {
-								if buffer[j] == '\n' as u8 {
-									nl_count += 1;
-									if j + 2 < len
-										&& buffer[j + 1] == '\r' as u8 && buffer[j + 2] == '\n' as u8
-									{
-										break;
-									}
-									headers_vec.push(vec![]);
-								}
-								if buffer[j] != '\n' as u8 && nl_count > 0 {
-									headers_vec[nl_count - 1].push(buffer[j]);
-								}
-							}
-
-							let mut sep_headers_vec = vec![];
-							let headers_vec_len = headers_vec.len();
-							let mut keep_alive = false;
-							let mut content_complete = true;
-							for j in 0..headers_vec_len {
-								let header_j_len = headers_vec[j].len();
-								sep_headers_vec.push((vec![], vec![]));
-								let mut found_sep = false;
-								let mut found_sep_plus_1 = false;
-								for k in 0..header_j_len {
-									if !found_sep && headers_vec[j][k] == ':' as u8 {
-										found_sep = true;
-									} else if !found_sep {
-										sep_headers_vec[j].0.push(headers_vec[j][k]);
-									} else {
-										if found_sep_plus_1 {
-											if headers_vec[j][k] != '\r' as u8
-												&& headers_vec[j][k] != '\n' as u8
-											{
-												sep_headers_vec[j].1.push(headers_vec[j][k]);
-											}
-										}
-										found_sep_plus_1 = true;
-									}
-								}
-								let header = std::str::from_utf8(&sep_headers_vec[j].0[..])?;
-								let value = std::str::from_utf8(&sep_headers_vec[j].1[..])?;
-								if header == "Connection" && value == "keep-alive" {
-									keep_alive = true;
-								}
-
-								if header == "Content-Length" {
-									has_content = true;
-									let content_len: Result<usize, ParseIntError> = value.parse();
-									match content_len {
-										Ok(content_len) => {
-											end_buf += content_len;
-											if end_buf >= len {
-												// we don't have enough data
-												// return here and wait for more
-												update_needed_len = end_buf;
-												content_complete = false;
-											}
-										}
-										Err(e) => {
-											log_multi!(
-												ERROR,
-												MAIN_LOG,
-												"Invalid content-len: {}, value={}",
-												e.to_string(),
-												value,
-											);
-										}
-									}
-								}
-							}
-
-							if !content_complete {
-								break;
-							}
-
-							// we know we have something to process now.
-							processed_page = true;
-
-							let http_ver_string = std::str::from_utf8(&http_ver_string[..])?;
-							let http_version = if http_ver_string == "HTTP/1.1" {
-								HttpVersion::V11
-							} else if http_ver_string == "HTTP/2.0" {
-								HttpVersion::V20
-							} else if http_ver_string == "HTTP/1.0" {
-								keep_alive = false;
-								HttpVersion::V10
-							} else {
-								// we don't know so go with 0.9 and turn off keep-alive
-								keep_alive = false;
-								HttpVersion::V09
-							};
-
-							let mut query_string = vec![];
-							let mut uri_path = vec![];
-							let mut start_query = false;
-							for j in 0..uri.len() {
-								if !start_query && uri[j] != '?' as u8 {
-									uri_path.push(uri[j]);
-								} else if !start_query && uri[j] == '?' as u8 {
-									start_query = true;
-								} else {
-									query_string.push(uri[j]);
-								}
-							}
-
-							let uri = std::str::from_utf8(&uri_path[..])?;
-							let query = std::str::from_utf8(&query_string[..])?;
-
-							if config.debug {
-								log_multi!(
-									DEBUG,
-									MAIN_LOG,
-									"method={:?},uri={},query={}",
-									method,
-									uri,
-									query
-								);
-							}
-
-							let last_dot = uri.rfind('.');
-							let extension = match last_dot {
-								Some(pos) => &uri[(pos + 1)..],
-								None => "",
-							}
-							.to_lowercase();
-
-							if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
-								(config.callback)(
-									conn_data_clone.clone(),
-									match has_content {
-										true => &buffer[start_buf..end_buf + 1],
-										false => &[0u8; 0],
-									},
-									method.clone(),
-									config.clone(),
-									wh.clone(),
-									http_version,
-									uri,
-									query,
-									sep_headers_vec.clone(),
-									keep_alive,
-								)?;
-							} else {
-								Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
-							}
-
-							log_item = Some(RequestLogItem::new(
-								uri.to_string(),
-								query.to_string(),
-								sep_headers_vec,
-								method,
-							));
-
-							buffer.drain(0..end_buf + 1);
-
-							break;
-						}
+			let log_item = {
+				match Self::process_request(http_config, &mut conn_data, wh, mappings, extensions) {
+					Ok(log_item) => log_item,
+					Err(e) => {
+						log_multi!(
+							ERROR,
+							MAIN_LOG,
+							"unexpected error processing request: {}",
+							e.to_string()
+						);
+						None
 					}
 				}
-				if !processed_page {
-					break;
-				}
-
-				if update_needed_len != 0 {
-					conn_data.needed_len = update_needed_len;
-				}
-			}
-		}
+			};
+			log_item
+		};
 
 		match log_item {
 			Some(log_item) => {
@@ -1690,6 +1413,282 @@ impl HttpServer {
 		}
 
 		Ok(())
+	}
+
+	fn process_request(
+		config: HttpConfig,
+		conn_data: &mut RwLockWriteGuard<ConnData>,
+		wh: WriteHandle,
+		mappings: HashSet<String>,
+		extensions: HashSet<String>,
+	) -> Result<Option<RequestLogItem>, Error> {
+		let mut log_item = None;
+		if conn_data.needed_len != 0 && conn_data.buffer.len() < conn_data.needed_len {
+			// data not sufficient return and wait for more data
+			return Ok(None);
+		} else {
+			conn_data.needed_len = 0;
+		}
+
+		let connection_id = conn_data.wh.get_connection_id();
+		// iterate through and try to find a double line break. If we find it,
+		// send to next function for processing and delete the data that we send.
+		loop {
+			//let buffer = &mut conn_data.buffer;
+			let len = conn_data.buffer.len();
+
+			if len <= 3 {
+				// not enough data, go away until more is available
+				break;
+			}
+			let mut end_buf;
+			let mut start_buf;
+			let mut update_needed_len = 0;
+			let mut has_content = false;
+			let mut processed_page = false;
+			for i in 3..len {
+				start_buf = i + 1;
+				end_buf = i;
+				if (conn_data.buffer[i - 3] == '\r' as u8
+				&& conn_data.buffer[i - 2] == '\n' as u8
+				&& conn_data.buffer[i - 1] == '\r' as u8
+				&& conn_data.buffer[i] == '\n' as u8)
+				// we are tolerant of the incorrect format too
+				|| (conn_data.buffer[i - 1] == '\n' as u8 && conn_data.buffer[i] == '\n' as u8)
+				{
+					// end of a request found.
+					if len < 6
+						|| (conn_data.buffer[0..4] != ['G' as u8, 'E' as u8, 'T' as u8, ' ' as u8]
+							&& (conn_data.buffer[0..5]
+								!= ['P' as u8, 'O' as u8, 'S' as u8, 'T' as u8, ' ' as u8]))
+					{
+						// only accept GET/POST for now
+						warn!(
+							"invalid request on connection_id = {}, data = '{:?}'",
+							connection_id,
+							std::str::from_utf8(&conn_data.buffer[0..len]),
+						);
+						Self::send_bad_request_error(&wh)?;
+						break;
+					} else {
+						let method = if conn_data.buffer[0] == 'G' as u8 {
+							HttpMethod::Get
+						} else {
+							HttpMethod::Post
+						};
+						let mut space_count = 0;
+						let mut uri = vec![];
+						let mut http_ver_string = vec![];
+
+						for j in 0..len {
+							if conn_data.buffer[j] == ' ' as u8
+								|| conn_data.buffer[j] == '\r' as u8
+								|| conn_data.buffer[j] == '\n' as u8
+							{
+								space_count += 1;
+							}
+							if space_count == 1 {
+								if conn_data.buffer[j] != ' ' as u8 {
+									uri.push(conn_data.buffer[j]);
+								}
+							} else if space_count == 2 {
+								if conn_data.buffer[j] != ' ' as u8 {
+									http_ver_string.push(conn_data.buffer[j]);
+								}
+							} else if space_count > 2 {
+								break;
+							}
+						}
+
+						// get headers
+						let mut nl_count = 0;
+						let mut headers_vec = vec![];
+						for j in 0..len {
+							if conn_data.buffer[j] == '\n' as u8 {
+								nl_count += 1;
+								if j + 2 < len
+									&& conn_data.buffer[j + 1] == '\r' as u8
+									&& conn_data.buffer[j + 2] == '\n' as u8
+								{
+									break;
+								}
+								headers_vec.push(vec![]);
+							}
+							if conn_data.buffer[j] != '\n' as u8 && nl_count > 0 {
+								headers_vec[nl_count - 1].push(conn_data.buffer[j]);
+							}
+						}
+
+						let mut sep_headers_vec = vec![];
+						let headers_vec_len = headers_vec.len();
+						let mut keep_alive = false;
+						let mut content_complete = true;
+						for j in 0..headers_vec_len {
+							let header_j_len = headers_vec[j].len();
+							sep_headers_vec.push((vec![], vec![]));
+							let mut found_sep = false;
+							let mut found_sep_plus_1 = false;
+							for k in 0..header_j_len {
+								if !found_sep && headers_vec[j][k] == ':' as u8 {
+									found_sep = true;
+								} else if !found_sep {
+									sep_headers_vec[j].0.push(headers_vec[j][k]);
+								} else {
+									if found_sep_plus_1 {
+										if headers_vec[j][k] != '\r' as u8
+											&& headers_vec[j][k] != '\n' as u8
+										{
+											sep_headers_vec[j].1.push(headers_vec[j][k]);
+										}
+									}
+									found_sep_plus_1 = true;
+								}
+							}
+							let header = std::str::from_utf8(&sep_headers_vec[j].0[..])?;
+							let value = std::str::from_utf8(&sep_headers_vec[j].1[..])?;
+							if header == "Connection" && value == "keep-alive" {
+								keep_alive = true;
+							}
+
+							if header == "Content-Length" {
+								has_content = true;
+								let content_len: Result<usize, ParseIntError> = value.parse();
+								match content_len {
+									Ok(content_len) => {
+										end_buf += content_len;
+										if end_buf >= len {
+											// we don't have enough data
+											// return here and wait for more
+											update_needed_len = end_buf;
+											content_complete = false;
+										}
+									}
+									Err(e) => {
+										log_multi!(
+											ERROR,
+											MAIN_LOG,
+											"Invalid content-len: {}, value={}",
+											e.to_string(),
+											value,
+										);
+									}
+								}
+							}
+						}
+
+						if !content_complete {
+							break;
+						}
+
+						// we know we have something to process now.
+						processed_page = true;
+
+						let http_ver_string = std::str::from_utf8(&http_ver_string[..])?;
+						let http_version = if http_ver_string == "HTTP/1.1" {
+							HttpVersion::V11
+						} else if http_ver_string == "HTTP/2.0" {
+							HttpVersion::V20
+						} else if http_ver_string == "HTTP/1.0" {
+							keep_alive = false;
+							HttpVersion::V10
+						} else {
+							// we don't know so go with 0.9 and turn off keep-alive
+							keep_alive = false;
+							HttpVersion::V09
+						};
+
+						let mut query_string = vec![];
+						let mut uri_path = vec![];
+						let mut start_query = false;
+						for j in 0..uri.len() {
+							if !start_query && uri[j] != '?' as u8 {
+								uri_path.push(uri[j]);
+							} else if !start_query && uri[j] == '?' as u8 {
+								start_query = true;
+							} else {
+								query_string.push(uri[j]);
+							}
+						}
+
+						let uri = std::str::from_utf8(&uri_path[..])?;
+						let query = std::str::from_utf8(&query_string[..])?;
+
+						if config.debug {
+							log_multi!(
+								DEBUG,
+								MAIN_LOG,
+								"method={:?},uri={},query={}",
+								method,
+								uri,
+								query
+							);
+						}
+
+						let last_dot = uri.rfind('.');
+						let extension = match last_dot {
+							Some(pos) => &uri[(pos + 1)..],
+							None => "",
+						}
+						.to_lowercase();
+
+						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
+							(config.callback)(
+								conn_data,
+								has_content,
+								start_buf,
+								end_buf + 1,
+								method.clone(),
+								config.clone(),
+								wh.clone(),
+								http_version,
+								uri,
+								query,
+								sep_headers_vec.clone(),
+								keep_alive,
+							)?;
+						} else {
+							Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
+						}
+
+						log_item = Some(RequestLogItem::new(
+							uri.to_string(),
+							query.to_string(),
+							sep_headers_vec,
+							method,
+						));
+
+						conn_data.buffer.drain(0..end_buf + 1);
+
+						break;
+					}
+				}
+			}
+			if !processed_page {
+				break;
+			}
+
+			if update_needed_len != 0 {
+				conn_data.needed_len = update_needed_len;
+			}
+		}
+
+		/*
+				match log_item {
+					Some(log_item) => {
+						let mut http_context = http_context.write().map_err(|e| {
+							let error: Error =
+								ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
+									.into();
+							error
+						})?;
+						http_context.log_queue.push(log_item);
+						http_context.stats.requests += 1;
+					}
+					None => {}
+				}
+		*/
+
+		Ok(log_item)
 	}
 
 	fn send_bad_request_error(wh: &WriteHandle) -> Result<(), Error> {
