@@ -183,6 +183,8 @@ pub struct HttpConfig {
 	pub on_panic: OnPanic,
 	/// The handler that is called every second by the Housekeeper thread.
 	pub on_housekeeper: Housekeeper,
+	/// The EventHandler Configuration
+	pub evh_config: EventHandlerConfig,
 	/// Whether or not to print debugging information to stdout.
 	pub debug: bool,
 }
@@ -211,6 +213,7 @@ impl Default for HttpConfig {
 			stats_log_max_age_millis: 6 * 1000 * 60 * 60, // 6 hr
 			last_request_timeout: 1000 * 120,             // 2 mins
 			read_timeout: 1000 * 30,                      // 30 seconds
+			evh_config: EventHandlerConfig::default(),
 			callback: empty_callback,
 			on_panic: empty_on_panic,
 			on_housekeeper: empty_housekeeper,

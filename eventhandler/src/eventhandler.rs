@@ -162,6 +162,7 @@ impl WriteHandle {
 	}
 }
 
+#[derive(Clone)]
 pub struct EventHandlerConfig {
 	pub thread_count: usize,
 }
