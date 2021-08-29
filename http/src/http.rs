@@ -1445,7 +1445,6 @@ impl HttpServer {
 		// iterate through and try to find a double line break. If we find it,
 		// send to next function for processing and delete the data that we send.
 		loop {
-			//let buffer = &mut conn_data.buffer;
 			let len = conn_data.buffer.len();
 
 			if len <= 3 {
