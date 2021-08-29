@@ -83,3 +83,32 @@ $ ./target/release/rustlet -c -x 1000 -t 100 -i 10
 ```
 
 As seen by the numbers above, throughput is slightly better under these circumstances on this particular piece of hardware (6 core intel CPU i5-9400 CPU @ 2.90GHz). Latency for both is in the sub millisecond range.
+
+NIO Runtime also has it's own benchmark included in the project itself. Here's the output of one such run of the benchmark:
+
+```
+$ ../nioruntime/target/release/nioruntime -c -x 1000 -t 100 -i 10 
+[2021-08-28 20:33:12]: Running client
+[2021-08-28 20:33:12]: Threads=100
+[2021-08-28 20:33:12]: Iterations=10
+[2021-08-28 20:33:12]: Requests per thread per iteration=1000
+[2021-08-28 20:33:12]: Request length: Max=100,Min=1
+--------------------------------------------------------------------------------
+[2021-08-28 20:33:12]: Iteration 1 complete. 
+[2021-08-28 20:33:13]: Iteration 2 complete. 
+[2021-08-28 20:33:13]: Iteration 3 complete. 
+[2021-08-28 20:33:14]: Iteration 4 complete. 
+[2021-08-28 20:33:14]: Iteration 5 complete. 
+[2021-08-28 20:33:15]: Iteration 6 complete. 
+[2021-08-28 20:33:15]: Iteration 7 complete. 
+[2021-08-28 20:33:15]: Iteration 8 complete. 
+[2021-08-28 20:33:16]: Iteration 9 complete. 
+[2021-08-28 20:33:16]: Iteration 10 complete. 
+--------------------------------------------------------------------------------
+[2021-08-28 20:33:16]: Test complete in 4245 ms
+[2021-08-28 20:33:16]: QPS=235571.26030624265
+[2021-08-28 20:33:16]: Average latency=0.304248039477ms
+[2021-08-28 20:33:16]: Max latency=145.604269ms
+```
+
+Without the overhead of HTTP and the Rustlet container, the performance of NIO Runtime is even better as seen by the numbers above.
