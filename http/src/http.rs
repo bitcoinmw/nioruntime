@@ -1016,13 +1016,16 @@ impl HttpServer {
 				(*log_queue).clear();
 			}
 			let stop = {
-				let http_context = http_context.read().map_err(|_e| {
+				let mut http_context = http_context.write().map_err(|_e| {
 					let error: Error = ErrorKind::InternalError(
 						"unexpected error obtaining http_context lock".to_string(),
 					)
 					.into();
 					error
 				})?;
+
+				let log_count: u64 = to_log.len().try_into().unwrap_or(0);
+				http_context.stats.requests += log_count;
 
 				http_context.stop
 			};
@@ -1398,40 +1401,24 @@ impl HttpServer {
 				conn_data.buffer.push(buf[i]);
 			}
 
-			let log_item = {
-				match Self::process_request(http_config, &mut conn_data, wh, mappings, extensions) {
-					Ok(log_item) => log_item,
-					Err(e) => {
-						log_multi!(
-							ERROR,
-							MAIN_LOG,
-							"unexpected error processing request: {}",
-							e.to_string()
-						);
-						None
-					}
+			match Self::process_request(http_config, &mut conn_data, wh, mappings, extensions) {
+				Ok(log_item) => log_item,
+				Err(e) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"unexpected error processing request: {}",
+						e.to_string()
+					);
+					None
 				}
-			};
-			log_item
+			}
 		};
 
 		match log_item {
 			Some(log_item) => {
-				{
-					let mut http_context = http_context.write().map_err(|e| {
-						let error: Error =
-							ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
-								.into();
-						error
-					})?;
-					//http_context.log_queue.push(log_item);
-					http_context.stats.requests += 1;
-				}
-
-				{
-					let mut log_queue = nioruntime_util::lockw!(log_queue);
-					log_queue.push(log_item);
-				}
+				let mut log_queue = nioruntime_util::lockw!(log_queue);
+				log_queue.push(log_item);
 			}
 			None => {}
 		}
@@ -1695,22 +1682,6 @@ impl HttpServer {
 				conn_data.needed_len = update_needed_len;
 			}
 		}
-
-		/*
-				match log_item {
-					Some(log_item) => {
-						let mut http_context = http_context.write().map_err(|e| {
-							let error: Error =
-								ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
-									.into();
-							error
-						})?;
-						http_context.log_queue.push(log_item);
-						http_context.stats.requests += 1;
-					}
-					None => {}
-				}
-		*/
 
 		Ok(log_item)
 	}
