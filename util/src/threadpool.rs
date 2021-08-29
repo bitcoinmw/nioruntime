@@ -22,11 +22,12 @@ use std::pin::Pin;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::thread;
 
 lazy_static! {
-	pub(crate) static ref STATIC_THREAD_POOL: Arc<Mutex<HashMap<u128, ThreadPoolImpl>>> =
-		Arc::new(Mutex::new(HashMap::new()));
+	pub(crate) static ref STATIC_THREAD_POOL: Arc<RwLock<HashMap<u128, ThreadPoolImpl>>> =
+		Arc::new(RwLock::new(HashMap::new()));
 }
 
 /// The static thread pool is a thread pool that can be used to execute futures. It is used
@@ -40,13 +41,13 @@ impl StaticThreadPool {
 	/// Build a new static thread pool or return an error if an error occurs.
 	///
 	/// This function builds a static thread pool. Note that it does not start
-	/// the thread pool. [`EventHandler.start`] must be called before using the thread pool.
+	/// the thread pool. [`StaticThreadPool.start`] must be called before using the thread pool.
 	///
 	/// Returns Ok(()) or Error if the static thread pool lock cannot be obtained.
 	pub fn new() -> Result<Self, Error> {
 		let tp = ThreadPoolImpl::new();
 		let id: u128 = rand::random::<u128>();
-		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+		let mut stp = STATIC_THREAD_POOL.write().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
 				"static thread pool lock error: {}",
 				e.to_string()
@@ -60,7 +61,7 @@ impl StaticThreadPool {
 	}
 
 	pub fn set_on_panic(&mut self, on_panic: OnPanic) -> Result<(), Error> {
-		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+		let mut stp = STATIC_THREAD_POOL.write().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
 				"static thread pool lock error: {}",
 				e.to_string()
@@ -85,11 +86,11 @@ impl StaticThreadPool {
 	/// Start the static thread pool.
 	///
 	/// Start the thread pool with the specified size. After calling this function,
-	/// [`Eventhandler.execute`] may be called to execute futures.
+	/// [`StaticThreadPool.execute`] may be called to execute futures.
 	///
 	/// * `size` - The number of threads for this thread pool to start.
 	pub fn start(&self, size: usize) -> Result<(), Error> {
-		let mut stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+		let mut stp = STATIC_THREAD_POOL.write().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
 				"static thread pool lock error: {}",
 				e.to_string()
@@ -116,7 +117,7 @@ impl StaticThreadPool {
 	/// Stop this thread pool free all resources used by the thread pool and terminate
 	/// all running threads.
 	pub fn stop(&self) -> Result<(), Error> {
-		let stp = STATIC_THREAD_POOL.lock().map_err(|e| {
+		let stp = STATIC_THREAD_POOL.write().map_err(|e| {
 			let error: Error = ErrorKind::InternalError(format!(
 				"static thread pool lock error: {}",
 				e.to_string()
@@ -148,7 +149,7 @@ impl StaticThreadPool {
 	where
 		F: Future<Output = ()> + Send + Sync + 'static,
 	{
-		let stp = crate::lock!(STATIC_THREAD_POOL);
+		let stp = crate::lockr!(STATIC_THREAD_POOL);
 
 		let tp = stp.get(&self.id);
 		match tp {
