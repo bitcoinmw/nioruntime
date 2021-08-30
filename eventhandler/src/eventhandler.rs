@@ -762,23 +762,46 @@ where
 			let on_read = callbacks.on_read.as_ref().unwrap().clone();
 			let on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
 			let global_lock = global_lock.clone();
-			spawn(move || {
-				match Self::rwthread(
-					selectors[i + 1],
-					listener_guarded_data,
-					guarded_data,
-					on_read,
-					on_client_read,
-					global_lock,
-				) {
+			spawn(move || loop {
+				let selectors = selectors.clone();
+				let listener_guarded_data = listener_guarded_data.clone();
+				let guarded_data = guarded_data.clone();
+				let guarded_data_clone = guarded_data.clone();
+				let on_read = on_read.clone();
+				let on_client_read = on_client_read.clone();
+				let global_lock = global_lock.clone();
+				let jh = spawn(move || {
+					match Self::rwthread(
+						selectors[i + 1],
+						listener_guarded_data,
+						guarded_data_clone,
+						on_read,
+						on_client_read,
+						global_lock,
+					) {
+						Ok(_) => {}
+						Err(e) => {
+							log_multi!(
+								ERROR,
+								MAIN_LOG,
+								"rwthread generated error: {}",
+								e.to_string()
+							);
+						}
+					}
+				});
+
+				{
+					let guarded_data = guarded_data.write().unwrap();
+					if guarded_data.stop {
+						break;
+					}
+				}
+
+				match jh.join() {
 					Ok(_) => {}
 					Err(e) => {
-						log_multi!(
-							ERROR,
-							MAIN_LOG,
-							"rwthread generated error: {}",
-							e.to_string()
-						);
+						println!("thread panic! {:?}", e);
 					}
 				}
 			});
