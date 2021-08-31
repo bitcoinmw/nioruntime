@@ -64,6 +64,12 @@ type ConnectionHandle = i32;
 #[cfg(target_os = "windows")]
 type ConnectionHandle = u64;
 
+pub enum State {
+	Init,
+	HeadersChunked,
+	HeadersClose,
+}
+
 /// A handle that is associated with a particular connection and may be used for writing
 /// to the socket.
 ///
@@ -78,6 +84,7 @@ pub struct WriteHandle {
 	connection_id: u128,
 	guarded_data: Arc<RwLock<GuardedData>>,
 	global_lock: Arc<RwLock<bool>>,
+	pub callback_state: Arc<RwLock<State>>,
 }
 
 impl WriteHandle {
@@ -87,11 +94,13 @@ impl WriteHandle {
 		connection_id: u128,
 		global_lock: Arc<RwLock<bool>>,
 	) -> Self {
+		let callback_state = Arc::new(RwLock::new(State::Init));
 		WriteHandle {
 			fd,
 			guarded_data,
 			connection_id,
 			global_lock,
+			callback_state,
 		}
 	}
 
@@ -348,11 +357,14 @@ where
 		#[cfg(target_os = "windows")]
 		let (fd, connection_id) = self.add(stream.as_raw_socket(), ActionType::AddStream)?;
 
+		let callback_state = Arc::new(RwLock::new(State::Init));
+
 		Ok(WriteHandle {
 			fd,
 			connection_id,
 			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
 			global_lock: self.global_lock.clone(),
+			callback_state,
 		})
 	}
 
