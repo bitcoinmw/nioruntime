@@ -64,6 +64,7 @@ type ConnectionHandle = i32;
 #[cfg(target_os = "windows")]
 type ConnectionHandle = u64;
 
+#[derive(Eq, PartialEq, Debug)]
 pub enum State {
 	Init,
 	HeadersChunked,
@@ -94,7 +95,10 @@ impl WriteHandle {
 		connection_id: u128,
 		global_lock: Arc<RwLock<bool>>,
 	) -> Self {
-		let callback_state = Arc::new(RwLock::new(State::Init));
+		let callback_state = {
+			let guarded_data = guarded_data.write().unwrap();
+			guarded_data.callback_state.clone()
+		};
 		WriteHandle {
 			fd,
 			guarded_data,
@@ -358,7 +362,6 @@ where
 		let (fd, connection_id) = self.add(stream.as_raw_socket(), ActionType::AddStream)?;
 
 		let callback_state = Arc::new(RwLock::new(State::Init));
-
 		Ok(WriteHandle {
 			fd,
 			connection_id,
@@ -567,6 +570,7 @@ where
 				wakeup_rx: 0,
 				wakeup_scheduled: false,
 				stop: false,
+				callback_state: Arc::new(RwLock::new(State::Init)),
 			})));
 		}
 
@@ -2011,6 +2015,7 @@ struct GuardedData {
 	wakeup_rx: ConnectionHandle,
 	wakeup_scheduled: bool,
 	stop: bool,
+	callback_state: Arc<RwLock<State>>,
 }
 
 impl GuardedData {

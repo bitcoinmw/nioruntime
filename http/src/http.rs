@@ -1317,26 +1317,64 @@ impl HttpServer {
 	) -> Result<(bool, bool), Error> {
 		let conn_data = conn_data.write().map_err(|e| {
 			let conn_data = e.into_inner();
-			let res =
-				Self::write_headers(&conn_data.wh, &conn_data.config, true, false, vec![], None);
-			match res {
-				Ok(_) => {}
-				Err(e) => {
-					log_multi!(ERROR, MAIN_LOG, "error writing headers: {}", e.to_string(),);
+
+			{
+				let callback_state = conn_data.wh.callback_state.read();
+				if callback_state.is_ok() {
+					let callback_state = callback_state.unwrap();
+					if *callback_state == State::Init {
+						let res = Self::write_headers(
+							&conn_data.wh,
+							&conn_data.config,
+							true,
+							false,
+							vec![],
+							None,
+						);
+						match res {
+							Ok(_) => {}
+							Err(e) => {
+								log_multi!(
+									ERROR,
+									MAIN_LOG,
+									"error writing headers: {}",
+									e.to_string(),
+								);
+							}
+						}
+					}
 				}
 			}
-			let res = conn_data
-				.wh
-				.write("Internal Server error. See logs for details.".as_bytes());
-			match res {
-				Ok(_) => {}
-				Err(e) => {
-					log_multi!(
-						ERROR,
-						MAIN_LOG,
-						"error writing panic message: {}",
-						e.to_string(),
-					);
+			{
+				let callback_state = conn_data.wh.callback_state.read();
+				if callback_state.is_ok() {
+					let callback_state = callback_state.unwrap();
+					if *callback_state == State::HeadersChunked {
+						let byte_msg = format!(
+							"</br>{}</br>Internal Server Error. See logs for details.",
+							HEADER
+						);
+						let byte_msg = byte_msg.as_bytes();
+						let msg = format!("{:X}\r\n", byte_msg.len());
+						let _ = conn_data.wh.write(msg.as_bytes());
+						let _ = conn_data.wh.write(&byte_msg);
+						let _ = conn_data.wh.write("\r\n0\r\n\r\n".as_bytes());
+					} else {
+						let res = conn_data
+							.wh
+							.write("Internal Server Error. See logs for details.".as_bytes());
+						match res {
+							Ok(_) => {}
+							Err(e) => {
+								log_multi!(
+									ERROR,
+									MAIN_LOG,
+									"error writing panic message: {}",
+									e.to_string(),
+								);
+							}
+						}
+					}
 				}
 			}
 			match conn_data.wh.close() {
