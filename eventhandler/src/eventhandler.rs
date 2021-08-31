@@ -1480,6 +1480,8 @@ where
 			on_client_read.clone(),
 			guarded_data.clone(),
 		)?;
+		input_events.clear();
+		output_events.clear();
 
 		loop {
 			// see if there's any new write buffers to process
