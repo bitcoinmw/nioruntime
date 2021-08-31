@@ -231,19 +231,21 @@ impl Default for HttpConfig {
 pub struct ConnData {
 	buffer: Vec<u8>,
 	wh: WriteHandle,
+	config: HttpConfig,
 	create_time: u128,
 	last_request_time: u128,
 	needed_len: usize,
 }
 
 impl ConnData {
-	fn new(wh: WriteHandle) -> Self {
+	fn new(wh: WriteHandle, config: HttpConfig) -> Self {
 		let start = SystemTime::now();
 		let since_the_epoch = start
 			.duration_since(UNIX_EPOCH)
 			.expect("Time went backwards");
 		ConnData {
 			buffer: vec![],
+			config,
 			wh,
 			create_time: since_the_epoch.as_millis(),
 			last_request_time: 0,
@@ -276,7 +278,7 @@ impl HttpStats {
 	}
 }
 
-struct HttpContext {
+pub struct HttpContext {
 	stop: bool,
 	map: Arc<RwLock<HashMap<u128, Arc<RwLock<ConnData>>>>>,
 	stats: HttpStats,
@@ -318,7 +320,7 @@ pub struct HttpServer {
 	/// The config of this [`HttpServer`].
 	pub config: HttpConfig,
 	listener: Option<TcpListener>,
-	http_context: Option<Arc<RwLock<HttpContext>>>,
+	pub http_context: Option<Arc<RwLock<HttpContext>>>,
 	log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 	thread_pool: Option<Arc<RwLock<StaticThreadPool>>>,
 }
@@ -547,6 +549,7 @@ impl HttpServer {
 		let http_context_clone7 = http_context.clone();
 
 		let mut eh = EventHandler::new(EventHandlerConfig::default());
+		eh.set_on_panic(http_config.on_panic)?;
 
 		eh.set_on_read(move |buf, len, wh| {
 			Self::process_read(
@@ -630,7 +633,7 @@ impl HttpServer {
 			Self::stats_log(http_context_clone6, http_config_clone4.clone())
 		});
 
-		std::thread::spawn(move || Self::house_keeper(http_context_clone7, &http_config_clone5));
+		std::thread::spawn(move || Self::house_keeper(&http_context_clone7, &http_config_clone5));
 
 		log_multi!(INFO, MAIN_LOG, "Server Started");
 
@@ -700,7 +703,6 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		let response =
 			Self::build_headers(config, found, keep_alive, additional_headers, redirect)?;
-
 		let response = response.as_bytes();
 		wh.write(response)?;
 		if !found && !keep_alive {
@@ -1193,25 +1195,24 @@ impl HttpServer {
 		Ok(())
 	}
 
-	fn house_keeper(
-		http_context: Arc<RwLock<HttpContext>>,
+	pub fn do_house_keeping(
+		http_context: &Arc<RwLock<HttpContext>>,
 		http_config: &HttpConfig,
-	) -> Result<(), Error> {
-		loop {
-			std::thread::sleep(std::time::Duration::from_millis(1000));
+	) -> Result<bool, Error> {
+		let mut idledisc_incr = 0;
+		let mut rtimeout_incr = 0;
 
-			let mut idledisc_incr = 0;
-			let mut rtimeout_incr = 0;
+		{
+			let http_context = http_context.write().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
+				error
+			})?;
+
+			let mut del_list = vec![];
 
 			{
-				let http_context = http_context.write().map_err(|e| {
-					let error: Error =
-						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
-							.into();
-					error
-				})?;
-
-				let map = http_context.map.write().map_err(|e| {
+				let map = http_context.map.read().map_err(|e| {
 					let error: Error =
 						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
 							.into();
@@ -1225,20 +1226,25 @@ impl HttpServer {
 				let read_timeout = http_config.read_timeout;
 
 				for (k, v) in &*map {
-					let (idledisc, rtimeout) =
-						match Self::check_idle(time_now, v, last_request_timeout, read_timeout) {
-							Ok(x) => x,
-							Err(e) => {
-								log_multi!(
-									ERROR,
-									MAIN_LOG,
-									"error in check_idle (possible thread panic) ConnData for {}, err={}",
-									k,
-									e.to_string(),
-								);
-								(false, false)
-							}
-						};
+					let (idledisc, rtimeout) = match Self::check_idle(
+						time_now,
+						v,
+						last_request_timeout,
+						read_timeout,
+					) {
+						Ok(x) => x,
+						Err(e) => {
+							del_list.push(k.clone());
+							log_multi!(
+                                                                        ERROR,
+                                                                        MAIN_LOG,
+                                                                        "error in check_idle (possible thread panic) ConnData for {}, err={}",
+                                                                        k,
+                                                                        e.to_string(),
+                                                                );
+							(false, false)
+						}
+					};
 
 					if idledisc {
 						idledisc_incr += 1;
@@ -1247,33 +1253,57 @@ impl HttpServer {
 						rtimeout_incr += 1;
 					}
 				}
-
-				if http_context.stop {
-					break;
-				}
 			}
 
-			if idledisc_incr > 0 || rtimeout_incr > 0 {
-				let mut http_context = http_context.write().map_err(|e| {
+			{
+				let mut map = http_context.map.write().map_err(|e| {
 					let error: Error =
 						ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string()))
 							.into();
 					error
 				})?;
-				http_context.stats.idledisc += idledisc_incr;
-				http_context.stats.rtimeout += rtimeout_incr;
+				for d in del_list {
+					map.remove(&d);
+				}
 			}
 
-			match (http_config.on_housekeeper)() {
-				Ok(_) => {}
-				Err(e) => {
-					log_multi!(
-						ERROR,
-						MAIN_LOG,
-						"error in on_housekeeper, err={}",
-						e.to_string(),
-					);
-				}
+			if http_context.stop {
+				return Ok(true);
+			}
+		}
+
+		if idledisc_incr > 0 || rtimeout_incr > 0 {
+			let mut http_context = http_context.write().map_err(|e| {
+				let error: Error =
+					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
+				error
+			})?;
+			http_context.stats.idledisc += idledisc_incr;
+			http_context.stats.rtimeout += rtimeout_incr;
+		}
+
+		match (http_config.on_housekeeper)() {
+			Ok(_) => {}
+			Err(e) => {
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"error in on_housekeeper, err={}",
+					e.to_string(),
+				);
+			}
+		}
+		Ok(false)
+	}
+
+	fn house_keeper(
+		http_context: &Arc<RwLock<HttpContext>>,
+		http_config: &HttpConfig,
+	) -> Result<(), Error> {
+		loop {
+			std::thread::sleep(std::time::Duration::from_millis(1000));
+			if Self::do_house_keeping(http_context, http_config)? {
+				break;
 			}
 		}
 		Ok(())
@@ -1286,12 +1316,40 @@ impl HttpServer {
 		read_timeout: u128,
 	) -> Result<(bool, bool), Error> {
 		let conn_data = conn_data.write().map_err(|e| {
-			log_multi!(
-				ERROR,
-				MAIN_LOG,
-				"error closing conn_data from poison error: {}",
-				e.to_string(),
-			);
+			let conn_data = e.into_inner();
+			let res =
+				Self::write_headers(&conn_data.wh, &conn_data.config, true, false, vec![], None);
+			match res {
+				Ok(_) => {}
+				Err(e) => {
+					log_multi!(ERROR, MAIN_LOG, "error writing headers: {}", e.to_string(),);
+				}
+			}
+			let res = conn_data
+				.wh
+				.write("Internal Server error. See logs for details.".as_bytes());
+			match res {
+				Ok(_) => {}
+				Err(e) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"error writing panic message: {}",
+						e.to_string(),
+					);
+				}
+			}
+			match conn_data.wh.close() {
+				Ok(_) => {}
+				Err(e) => {
+					log_multi!(
+						ERROR,
+						MAIN_LOG,
+						"error closing conn_data from poison error: {}",
+						e.to_string(),
+					);
+				}
+			}
 			let error: Error =
 				ErrorKind::PoisonError(format!("poison error getting conn_data")).into();
 			error
@@ -1316,7 +1374,7 @@ impl HttpServer {
 	fn process_accept(
 		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
-		_http_config: HttpConfig,
+		http_config: HttpConfig,
 		id: u128,
 		wh: WriteHandle,
 	) -> Result<(), Error> {
@@ -1335,7 +1393,7 @@ impl HttpServer {
 			error
 		})?;
 
-		map.insert(id, Arc::new(RwLock::new(ConnData::new(wh))));
+		map.insert(id, Arc::new(RwLock::new(ConnData::new(wh, http_config))));
 		Ok(())
 	}
 

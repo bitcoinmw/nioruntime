@@ -61,6 +61,33 @@ macro_rules! lockr {
 	};
 }
 
+/// A macro that is used to lock a rwlock in read mode ignoring poison locks
+/// This code was used in many places, and this macro simplifies it.
+#[macro_export]
+macro_rules! lockrp {
+	($a:expr) => {
+		match $a.read() {
+			Ok(data) => data,
+			Err(e) => e.into_inner(),
+		}
+	};
+}
+
+/// A macro that is used to lock a rwlock in write mode ignoring poison locks
+/// This code was used in many places, and this macro simplifies it.
+#[macro_export]
+macro_rules! lockwp {
+	($a:expr) => {
+		match $a.write() {
+			Ok(data) => data,
+			Err(e) => e.into_inner(),
+		}
+	};
+}
+
+/// A macro that is used to lock a rwlock in write mode ignoring poison locks
+/// This code was used in many places, and this macro simplifies it.
+
 /// Base Error struct which is used throught this crate and other crates
 #[derive(Debug, Fail)]
 pub struct Error {

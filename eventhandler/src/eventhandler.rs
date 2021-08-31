@@ -25,8 +25,11 @@ use std::net::{TcpListener, TcpStream};
 use std::pin::Pin;
 use std::sync::mpsc::sync_channel;
 use std::sync::mpsc::SyncSender;
+use std::sync::RwLockWriteGuard;
 use std::sync::{Arc, RwLock};
 use std::thread::spawn;
+
+pub type OnPanic = fn() -> Result<(), Error>;
 
 // linux deps
 #[cfg(target_os = "linux")]
@@ -260,6 +263,7 @@ pub struct EventHandler<F, G, H, K> {
 	guarded_data: Vec<Arc<RwLock<GuardedData>>>,
 	callbacks: Arc<RwLock<Callbacks<F, G, H, K>>>,
 	global_lock: Arc<RwLock<bool>>,
+	on_panic: Option<OnPanic>,
 }
 
 impl<F, G, H, K> EventHandler<F, G, H, K>
@@ -414,6 +418,11 @@ where
 		Ok(())
 	}
 
+	pub fn set_on_panic(&mut self, on_panic: OnPanic) -> Result<(), Error> {
+		self.on_panic = Some(on_panic);
+		Ok(())
+	}
+
 	/// This sets the on_accept callback for this [`EventHandler`].
 	///
 	/// As described in [`EventHandler::add_tcp_listener`], this callback is executed when a new connection is
@@ -556,6 +565,7 @@ where
 			guarded_data,
 			callbacks,
 			global_lock,
+			on_panic: None,
 		}
 	}
 
@@ -721,6 +731,7 @@ where
 	fn start_generic(&mut self, selectors: Vec<SelectorHandle>) -> Result<(), Error> {
 		self.ensure_handlers()?;
 
+		let on_panic = self.on_panic.clone();
 		let global_lock = &self.global_lock;
 		let global_lock_clone = global_lock.clone();
 		let selectors_clone = selectors.clone();
@@ -762,6 +773,31 @@ where
 			let on_read = callbacks.on_read.as_ref().unwrap().clone();
 			let on_client_read = callbacks.on_client_read.as_ref().unwrap().clone();
 			let global_lock = global_lock.clone();
+			let connection_id_map = Arc::new(RwLock::new(HashMap::new()));
+			let connection_info_map = Arc::new(RwLock::new(HashMap::new()));
+			let hash_set = Arc::new(RwLock::new(HashSet::new()));
+			let write_buffers = Arc::new(RwLock::new(HashMap::new()));
+			let input_events = Arc::new(RwLock::new(Vec::new()));
+			let output_events = Arc::new(RwLock::new(Vec::new()));
+			let on_panic = on_panic.clone();
+			let counter = Arc::new(RwLock::new(0));
+			let res = Arc::new(RwLock::new(0));
+
+			let wakeup_fd;
+
+			// add wakeup fd
+			{
+				let guarded_data = nioruntime_util::lockw!(guarded_data);
+				let mut input_events = nioruntime_util::lockw!(input_events);
+
+				input_events.push(GenericEvent {
+					fd: guarded_data.wakeup_rx,
+					etype: GenericEventType::AddReadLT,
+				});
+
+				wakeup_fd = guarded_data.wakeup_rx;
+			}
+
 			spawn(move || loop {
 				let selectors = selectors.clone();
 				let listener_guarded_data = listener_guarded_data.clone();
@@ -769,7 +805,16 @@ where
 				let guarded_data_clone = guarded_data.clone();
 				let on_read = on_read.clone();
 				let on_client_read = on_client_read.clone();
+				let on_panic = on_panic.clone();
 				let global_lock = global_lock.clone();
+				let connection_id_map = connection_id_map.clone();
+				let connection_info_map = connection_info_map.clone();
+				let write_buffers = write_buffers.clone();
+				let hash_set = hash_set.clone();
+				let input_events = input_events.clone();
+				let output_events = output_events.clone();
+				let counter = counter.clone();
+				let res = res.clone();
 				let jh = spawn(move || {
 					match Self::rwthread(
 						selectors[i + 1],
@@ -778,6 +823,15 @@ where
 						on_read,
 						on_client_read,
 						global_lock,
+						connection_info_map,
+						connection_id_map,
+						hash_set,
+						write_buffers,
+						wakeup_fd,
+						input_events,
+						output_events,
+						counter,
+						res,
 					) {
 						Ok(_) => {}
 						Err(e) => {
@@ -800,9 +854,19 @@ where
 
 				match jh.join() {
 					Ok(_) => {}
-					Err(e) => {
-						println!("thread panic! {:?}", e);
+					Err(_e) => {
+						log_multi!(ERROR, MAIN_LOG, "thread panic!");
 					}
+				}
+
+				match on_panic {
+					Some(on_panic) => match (on_panic)() {
+						Ok(_) => {}
+						Err(e) => {
+							println!("on_panic generated error: {}", e.to_string());
+						}
+					},
+					None => {}
 				}
 			});
 		}
@@ -1187,6 +1251,7 @@ where
 				ctype: ConnectionType::Inbound,
 				sender: None,
 			});
+			listener_guarded_data.wakeup()?;
 		}
 
 		Ok(())
@@ -1288,6 +1353,7 @@ where
 						ctype: ConnectionType::Inbound,
 						sender: None,
 					});
+					listener_guarded_data.wakeup()?;
 				}
 				Ok(do_close)
 			}
@@ -1338,6 +1404,8 @@ where
 			ret
 		};
 
+		let mut hash_set = HashSet::new();
+
 		for write_buffer in write_queue {
 			let list = write_buffers.get_mut(&write_buffer.connection_id);
 			let connection_info = connection_id_map.get(&write_buffer.connection_id);
@@ -1358,11 +1426,20 @@ where
 						fd: connection_info.handle,
 						etype: GenericEventType::AddWriteET,
 					};
-					input_events.push(ge);
+					if hash_set.get(&connection_info.handle).is_none() {
+						hash_set.insert(connection_info.handle);
+						input_events.push(ge);
+					}
 				}
 				None => {
 					// the connection already closed
-					log_multi!(DEBUG, MAIN_LOG, "connection not found write_buffer");
+					log_multi!(
+						INFO,
+						MAIN_LOG,
+						"connection not found write_buffer: '{}', map='{:?}'",
+						write_buffer.connection_id,
+						connection_id_map
+					);
 				}
 			}
 		}
@@ -1377,24 +1454,41 @@ where
 		on_read: Pin<Box<F>>,
 		on_client_read: Pin<Box<K>>,
 		global_lock: Arc<RwLock<bool>>,
+		connection_info_map: Arc<RwLock<HashMap<ConnectionHandle, ConnectionInfo>>>,
+		connection_id_map: Arc<RwLock<HashMap<u128, ConnectionInfo>>>,
+		hash_set: Arc<RwLock<HashSet<ConnectionHandle>>>,
+		write_buffers: Arc<RwLock<HashMap<u128, LinkedList<WriteBuffer>>>>,
+		wakeup_fd: ConnectionHandle,
+		input_events: Arc<RwLock<Vec<GenericEvent>>>,
+		output_events: Arc<RwLock<Vec<GenericEvent>>>,
+		counter: Arc<RwLock<usize>>,
+		res: Arc<RwLock<usize>>,
 	) -> Result<(), Error> {
-		let mut connection_info_map = HashMap::new();
-		let mut connection_id_map = HashMap::new();
-		let mut hash_set = HashSet::new();
-		let mut input_events = vec![];
-		let mut output_events = vec![];
-		let mut write_buffers = HashMap::new();
-		let wakeup_fd;
+		let mut connection_info_map = nioruntime_util::lockwp!(connection_info_map);
+		let mut connection_id_map = nioruntime_util::lockwp!(connection_id_map);
+		let mut hash_set = nioruntime_util::lockwp!(hash_set);
+		let mut write_buffers = nioruntime_util::lockwp!(write_buffers);
+		let mut input_events = nioruntime_util::lockwp!(input_events);
+		let mut output_events = nioruntime_util::lockwp!(output_events);
+		let mut counter = nioruntime_util::lockwp!(counter);
+		let mut res = nioruntime_util::lockwp!(res);
 
-		// add wakeup fd
-		{
-			let guarded_data = nioruntime_util::lockw!(guarded_data);
-			input_events.push(GenericEvent {
-				fd: guarded_data.wakeup_rx,
-				etype: GenericEventType::AddReadLT,
-			});
-			wakeup_fd = guarded_data.wakeup_rx;
-		}
+		// handle panic in progress events here
+		*counter += 1;
+		Self::process_events(
+			&mut counter,
+			&mut res,
+			&output_events,
+			wakeup_fd,
+			listener_guarded_data.clone(),
+			&mut connection_info_map,
+			&mut connection_id_map,
+			&mut write_buffers,
+			global_lock.clone(),
+			on_read.clone(),
+			on_client_read.clone(),
+			guarded_data.clone(),
+		)?;
 
 		loop {
 			// see if there's any new write buffers to process
@@ -1421,84 +1515,118 @@ where
 				let _ = unsafe { ws2_32::closesocket(selector) };
 				break;
 			}
-
-			output_events.clear();
-			let res = Self::get_events(
+			*res = Self::get_events(
 				selector,
 				input_events.clone(),
 				&mut output_events,
 				&mut hash_set,
 				wakeup,
 			)?;
-			input_events.clear();
 
-			if res > 0 {
-				for i in 0..res {
-					match output_events[i].etype {
-						GenericEventType::AddReadET | GenericEventType::AddReadLT => {
-							if output_events[i].fd == wakeup_fd {
-								// read one byte for wakeup
-								let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-								let res = unsafe { read(wakeup_fd, cbuf, 1) };
-								if res <= 0 {
-									log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
-								}
-								let mut guarded_data = nioruntime_util::lockw!(guarded_data);
-								guarded_data.wakeup_scheduled = false;
-							} else {
-								let conn_info = connection_info_map.get(&output_events[i].fd);
-								match conn_info {
-									Some(conn_info) => Self::process_read_event(
-										&output_events[i],
-										listener_guarded_data.clone(),
-										guarded_data.clone(),
-										conn_info.connection_id,
-										on_read.clone(),
-										on_client_read.clone(),
-										&mut connection_id_map,
-										&mut connection_info_map,
-										&mut write_buffers,
-										global_lock.clone(),
-									)?,
-									None => {
-										// looks to be spurious. connection already disconnected
-										log_multi!(
-											DEBUG,
-											MAIN_LOG,
-											"connection not found (add read): {}",
-											output_events[i].fd
-										);
-									}
-								}
+			*counter = 0;
+			Self::process_events(
+				&mut counter,
+				&mut res,
+				&output_events,
+				wakeup_fd,
+				listener_guarded_data.clone(),
+				&mut connection_info_map,
+				&mut connection_id_map,
+				&mut write_buffers,
+				global_lock.clone(),
+				on_read.clone(),
+				on_client_read.clone(),
+				guarded_data.clone(),
+			)?;
+
+			output_events.clear();
+			input_events.clear();
+		}
+		Ok(())
+	}
+
+	fn process_events(
+		counter: &mut RwLockWriteGuard<usize>,
+		res: &mut RwLockWriteGuard<usize>,
+		output_events: &Vec<GenericEvent>,
+		wakeup_fd: ConnectionHandle,
+		listener_guarded_data: Arc<RwLock<GuardedData>>,
+		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
+		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
+		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
+		global_lock: Arc<RwLock<bool>>,
+		on_read: Pin<Box<F>>,
+		on_client_read: Pin<Box<K>>,
+		guarded_data: Arc<RwLock<GuardedData>>,
+	) -> Result<(), Error> {
+		if **res > 0 {
+			for i in **counter..**res {
+				match output_events[i].etype {
+					GenericEventType::AddReadET | GenericEventType::AddReadLT => {
+						if output_events[i].fd == wakeup_fd {
+							// read one byte for wakeup
+							let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+							let res = unsafe { read(wakeup_fd, cbuf, 1) };
+							if res <= 0 {
+								log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
 							}
-						}
-						GenericEventType::AddWriteET => {
+							let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+							guarded_data.wakeup_scheduled = false;
+						} else {
 							let conn_info = connection_info_map.get(&output_events[i].fd);
 							match conn_info {
-								Some(conn_info) => Self::process_write_event(
+								Some(conn_info) => Self::process_read_event(
 									&output_events[i],
-									conn_info.connection_id,
-									&mut write_buffers,
-									global_lock.clone(),
-									&mut connection_id_map,
-									&mut connection_info_map,
 									listener_guarded_data.clone(),
+									guarded_data.clone(),
+									conn_info.connection_id,
+									on_read.clone(),
+									on_client_read.clone(),
+									connection_id_map,
+									connection_info_map,
+									write_buffers,
+									global_lock.clone(),
 								)?,
 								None => {
 									// looks to be spurious. connection already disconnected
 									log_multi!(
 										DEBUG,
 										MAIN_LOG,
-										"connection not found (add write): {}",
+										"connection not found (add read): {}",
 										output_events[i].fd
 									);
 								}
 							}
-						} //_ => {}
+						}
 					}
+					GenericEventType::AddWriteET => {
+						let conn_info = connection_info_map.get(&output_events[i].fd);
+						match conn_info {
+							Some(conn_info) => Self::process_write_event(
+								&output_events[i],
+								conn_info.connection_id,
+								write_buffers,
+								global_lock.clone(),
+								connection_id_map,
+								connection_info_map,
+								listener_guarded_data.clone(),
+							)?,
+							None => {
+								// looks to be spurious. connection already disconnected
+								log_multi!(
+									DEBUG,
+									MAIN_LOG,
+									"connection not found (add write): {}",
+									output_events[i].fd
+								);
+							}
+						}
+					} //_ => {}
 				}
+				**counter += 1;
 			}
 		}
+
 		Ok(())
 	}
 
@@ -1819,16 +1947,11 @@ where
 			)
 		};
 
-		// This error appears to happen occasionally when thousands of
-		// connections per second are connecting/disconnecting.
-		// it appears harmless as all connections are processed correctly.
-		// So for the time being, we will comment this out so it doesn't
-		// pollute the logs.
 		if ret_count < 0 {
 			info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
 		}
 
-		let mut ret_count_adjusted = 0;
+		let mut ret_count_adjusted = output_events.len();
 		for i in 0..ret_count {
 			let kev = ret_kevs[i as usize];
 			if !kev.flags.contains(EventFlag::EV_DELETE) {
@@ -1860,7 +1983,7 @@ enum ConnectionType {
 	Listener,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ConnectionInfo {
 	handle: ConnectionHandle,
 	connection_id: u128,
@@ -1920,7 +2043,7 @@ enum ActionType {
 	AddListener,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Eq, Hash)]
 enum GenericEventType {
 	AddReadET,
 	AddReadLT,
@@ -1929,7 +2052,7 @@ enum GenericEventType {
 	//	DelWrite,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 struct GenericEvent {
 	fd: ConnectionHandle,
 	etype: GenericEventType,
