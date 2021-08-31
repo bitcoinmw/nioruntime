@@ -1369,7 +1369,6 @@ where
 						ctype: ConnectionType::Inbound,
 						sender: None,
 					});
-					listener_guarded_data.wakeup()?;
 				}
 				Ok(do_close)
 			}
