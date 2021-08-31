@@ -1700,8 +1700,10 @@ impl HttpServer {
 						.to_lowercase();
 
 						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
-							let mut callback_state = nioruntime_util::lockw!(wh.callback_state);
-							*callback_state = State::Init;
+							{
+								let mut callback_state = nioruntime_util::lockw!(wh.callback_state);
+								*callback_state = State::Init;
+							}
 							(config.callback)(
 								conn_data,
 								has_content,
