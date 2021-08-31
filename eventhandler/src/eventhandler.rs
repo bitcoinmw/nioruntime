@@ -44,14 +44,16 @@ use crate::duration_to_timespec;
 use kqueue_sys::EventFilter::{self, EVFILT_READ, EVFILT_WRITE};
 #[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
 use kqueue_sys::{kevent, kqueue, EventFlag, FilterFlag};
+#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+use libc::uintptr_t;
 
 // unix deps
 #[cfg(unix)]
-use libc::{close, fcntl, pipe, read, uintptr_t, write};
+use libc::{close, fcntl, pipe, read, write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-info!();
+debug!();
 
 const MAIN_LOG: &str = "mainlog";
 const BUFFER_SIZE: usize = 1024;
@@ -921,13 +923,13 @@ where
 			}
 		}
 
+		let _lock = nioruntime_util::lockw!(global_lock);
 		for conn in cconns {
 			let connection_id = conn.connection_id;
 			let fd = conn.handle;
 			(on_close)(connection_id)?;
 
 			{
-				let _lock = nioruntime_util::lockw!(global_lock);
 				#[cfg(unix)]
 				let res = unsafe { close(fd) };
 				#[cfg(target_os = "windows")]
@@ -1256,18 +1258,19 @@ where
 
 		if disconnect {
 			let fd = event.fd;
-			connection_id_map.remove(&connection_id);
-			connection_info_map.remove(&fd);
-			write_buffers.remove(&connection_id);
+			if connection_id_map.remove(&connection_id).is_some() {
+				connection_info_map.remove(&fd);
+				write_buffers.remove(&connection_id);
 
-			let mut listener_guarded_data = nioruntime_util::lockw!(listener_guarded_data);
-			listener_guarded_data.cconns.push(ConnectionInfo {
-				handle: fd,
-				connection_id,
-				ctype: ConnectionType::Inbound,
-				sender: None,
-			});
-			listener_guarded_data.wakeup()?;
+				let mut listener_guarded_data = nioruntime_util::lockw!(listener_guarded_data);
+				listener_guarded_data.cconns.push(ConnectionInfo {
+					handle: fd,
+					connection_id,
+					ctype: ConnectionType::Inbound,
+					sender: None,
+				});
+				listener_guarded_data.wakeup()?;
+			}
 		}
 
 		Ok(())
@@ -1358,52 +1361,25 @@ where
 				}
 
 				if do_close {
-					connection_id_map.remove(&connection_id);
-					connection_info_map.remove(&fd);
-					write_buffers.remove(&connection_id);
+					if connection_id_map.remove(&connection_id).is_some() {
+						connection_info_map.remove(&fd);
+						write_buffers.remove(&connection_id);
 
-					let mut listener_guarded_data = nioruntime_util::lockw!(listener_guarded_data);
-					listener_guarded_data.cconns.push(ConnectionInfo {
-						handle: fd,
-						connection_id,
-						ctype: ConnectionType::Inbound,
-						sender: None,
-					});
+						let mut listener_guarded_data =
+							nioruntime_util::lockw!(listener_guarded_data);
+						listener_guarded_data.cconns.push(ConnectionInfo {
+							handle: fd,
+							connection_id,
+							ctype: ConnectionType::Inbound,
+							sender: None,
+						});
+					}
 				}
 				Ok(do_close)
 			}
 		} else {
 			Ok(false)
 		}
-	}
-
-	fn _close(
-		connection_id: u128,
-		fd: ConnectionHandle,
-		on_close: Pin<Box<H>>,
-		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
-		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
-		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
-		global_lock: Arc<RwLock<bool>>,
-	) -> Result<(), Error> {
-		connection_id_map.remove(&connection_id);
-		connection_info_map.remove(&fd);
-		write_buffers.remove(&connection_id);
-		(on_close)(connection_id)?;
-		{
-			let _lock = nioruntime_util::lockw!(global_lock);
-			#[cfg(unix)]
-			let res = unsafe { close(fd) };
-			#[cfg(target_os = "windows")]
-			let res = unsafe { ws2_32::closesocket(fd) };
-			if res != 0 {
-				let e = errno();
-				info!("error closing socket: {}", e.to_string());
-				return Err(ErrorKind::InternalError("Already closed".to_string()).into());
-			}
-		}
-
-		Ok(())
 	}
 
 	fn process_writes(
@@ -1894,7 +1870,7 @@ where
 			},
 		);
 
-		let mut ret_count_adjusted = 0;
+		let mut ret_count_adjusted = output_events.len();
 
 		match results {
 			Ok(results) => {
