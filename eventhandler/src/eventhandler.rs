@@ -895,6 +895,7 @@ where
 		input_events: &mut Vec<GenericEvent>,
 		global_lock: Arc<RwLock<bool>>,
 		on_close: Pin<Box<H>>,
+		active_connection_ids: &mut HashSet<u128>,
 	) -> Result<bool, Error> {
 		let stop;
 		let nconns;
@@ -922,6 +923,9 @@ where
 
 		let _lock = nioruntime_util::lockw!(global_lock);
 		for conn in cconns {
+			if !active_connection_ids.remove(&conn.connection_id) {
+				continue;
+			}
 			let connection_id = conn.connection_id;
 			let fd = conn.handle;
 			(on_close)(connection_id)?;
@@ -951,6 +955,7 @@ where
 		global_lock: Arc<RwLock<bool>>,
 		wakeup_fd: ConnectionHandle,
 		listener_guarded_data: &Arc<RwLock<GuardedData>>,
+		active_connection_ids: &mut HashSet<u128>,
 	) -> Result<(), Error> {
 		for i in 0..count {
 			let event = &events[i];
@@ -1039,6 +1044,8 @@ where
 				let mut rng = rand::thread_rng();
 				let connection_id = rng.gen();
 
+				active_connection_ids.insert(connection_id);
+
 				let wh = WriteHandle::new(
 					res,
 					guarded_data[index].clone(),
@@ -1071,6 +1078,7 @@ where
 		global_lock: Arc<RwLock<bool>>,
 	) -> Result<(), Error> {
 		let mut hash_set = HashSet::new();
+		let mut active_connection_ids = HashSet::new();
 		let mut input_events = vec![];
 		let mut output_events = vec![];
 		let mut next_index = 0;
@@ -1093,6 +1101,7 @@ where
 				&mut input_events,
 				global_lock.clone(),
 				on_close.clone(),
+				&mut active_connection_ids,
 			)?;
 
 			if stop {
@@ -1122,6 +1131,7 @@ where
 				global_lock.clone(),
 				wakeup_fd,
 				&guarded_data,
+				&mut active_connection_ids,
 			)?;
 		}
 		Ok(())
