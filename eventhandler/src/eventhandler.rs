@@ -895,7 +895,7 @@ where
 		input_events: &mut Vec<GenericEvent>,
 		global_lock: Arc<RwLock<bool>>,
 		on_close: Pin<Box<H>>,
-		active_connection_ids: &mut HashSet<u128>,
+		cid_map: &mut HashMap<ConnectionHandle, u128>,
 	) -> Result<bool, Error> {
 		let stop;
 		let nconns;
@@ -923,12 +923,18 @@ where
 
 		let _lock = nioruntime_util::lockw!(global_lock);
 		for conn in cconns {
-			if !active_connection_ids.remove(&conn.connection_id) {
-				continue;
-			}
 			let connection_id = conn.connection_id;
 			let fd = conn.handle;
 			(on_close)(connection_id)?;
+
+			let lookup = cid_map.remove(&fd);
+			if lookup.is_none() {
+				continue;
+			}
+			let lookup = lookup.unwrap();
+			if lookup != connection_id {
+				continue;
+			}
 
 			{
 				#[cfg(unix)]
@@ -954,20 +960,12 @@ where
 		on_accept: Pin<Box<G>>,
 		global_lock: Arc<RwLock<bool>>,
 		wakeup_fd: ConnectionHandle,
-		listener_guarded_data: &Arc<RwLock<GuardedData>>,
-		active_connection_ids: &mut HashSet<u128>,
+		cid_map: &mut HashMap<ConnectionHandle, u128>,
 	) -> Result<(), Error> {
 		for i in 0..count {
 			let event = &events[i];
 			if event.fd == wakeup_fd {
-				// read one byte for wakeup
-				let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-				let res = unsafe { read(wakeup_fd, cbuf, 1) };
-				if res <= 0 {
-					log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
-				}
-				let mut guarded_data = nioruntime_util::lockw!(listener_guarded_data);
-				guarded_data.wakeup_scheduled = false;
+				// don't process here. Process in the main loop
 				continue;
 			}
 
@@ -1044,8 +1042,6 @@ where
 				let mut rng = rand::thread_rng();
 				let connection_id = rng.gen();
 
-				active_connection_ids.insert(connection_id);
-
 				let wh = WriteHandle::new(
 					res,
 					guarded_data[index].clone(),
@@ -1053,6 +1049,7 @@ where
 					global_lock.clone(),
 				);
 				(on_accept)(connection_id, wh)?;
+				cid_map.insert(res, connection_id);
 				{
 					let mut guarded_data_next = nioruntime_util::lockw!(guarded_data_next);
 					guarded_data_next.nconns.push(ConnectionInfo {
@@ -1077,8 +1074,8 @@ where
 		on_close: Pin<Box<H>>,
 		global_lock: Arc<RwLock<bool>>,
 	) -> Result<(), Error> {
+		let mut cid_map = HashMap::new();
 		let mut hash_set = HashSet::new();
-		let mut active_connection_ids = HashSet::new();
 		let mut input_events = vec![];
 		let mut output_events = vec![];
 		let mut next_index = 0;
@@ -1094,6 +1091,8 @@ where
 			wakeup_fd = guarded_data.wakeup_rx;
 		}
 
+		let mut wakeup = false;
+
 		loop {
 			// get new handles
 			let stop = Self::update_listener_input_events(
@@ -1101,7 +1100,7 @@ where
 				&mut input_events,
 				global_lock.clone(),
 				on_close.clone(),
-				&mut active_connection_ids,
+				&mut cid_map,
 			)?;
 
 			if stop {
@@ -1118,8 +1117,24 @@ where
 				input_events.clone(),
 				&mut output_events,
 				&mut hash_set,
-				false,
+				wakeup,
 			)?;
+
+			{
+				let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+				if guarded_data.wakeup_scheduled {
+					wakeup = true;
+					guarded_data.wakeup_scheduled = false;
+					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+					let res = unsafe { read(wakeup_fd, cbuf, 1) };
+					if res <= 0 {
+						log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
+					}
+				} else {
+					wakeup = false;
+				}
+			}
+
 			input_events.clear();
 
 			Self::process_listener_events(
@@ -1130,8 +1145,7 @@ where
 				on_accept.clone(),
 				global_lock.clone(),
 				wakeup_fd,
-				&guarded_data,
-				&mut active_connection_ids,
+				&mut cid_map,
 			)?;
 		}
 		Ok(())
@@ -1200,6 +1214,7 @@ where
 				return Ok((false, false, false));
 			}
 		} else {
+			let error = errno();
 			if errno().0 == EAGAIN {
 				// break because we're edge triggered.
 				// a new event occurs.
@@ -1208,12 +1223,14 @@ where
 			} else {
 				// this is an actual write error.
 				// close the connection.
+				info!("write error: {}", error.to_string());
 				return Ok((true, true, true));
 			}
 		}
 	}
 
 	fn process_write_event(
+		selector: SelectorHandle,
 		event: &GenericEvent,
 		connection_id: u128,
 		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
@@ -1221,6 +1238,7 @@ where
 		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
 		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
 		listener_guarded_data: Arc<RwLock<GuardedData>>,
+		filter_set: &mut HashSet<ConnectionHandle>,
 	) -> Result<(), Error> {
 		let mut disconnect = false;
 		let list = write_buffers.get_mut(&connection_id);
@@ -1266,6 +1284,7 @@ where
 			if connection_id_map.remove(&connection_id).is_some() {
 				connection_info_map.remove(&fd);
 				write_buffers.remove(&connection_id);
+				Self::remove_handle(selector, fd, filter_set)?;
 
 				let mut listener_guarded_data = nioruntime_util::lockw!(listener_guarded_data);
 				listener_guarded_data.cconns.push(ConnectionInfo {
@@ -1282,6 +1301,7 @@ where
 	}
 
 	fn process_read_event(
+		selector: SelectorHandle,
 		event: &GenericEvent,
 		listener_guarded_data: Arc<RwLock<GuardedData>>,
 		guarded_data: Arc<RwLock<GuardedData>>,
@@ -1292,6 +1312,7 @@ where
 		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
 		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
 		global_lock: Arc<RwLock<bool>>,
+		hash_set: &mut HashSet<ConnectionHandle>,
 	) -> Result<(), Error> {
 		loop {
 			let mut buf = [0u8; BUFFER_SIZE];
@@ -1310,6 +1331,7 @@ where
 				len
 			};
 			if !Self::process_read_result(
+				selector,
 				event.fd,
 				listener_guarded_data.clone(),
 				guarded_data.clone(),
@@ -1322,6 +1344,7 @@ where
 				connection_info_map,
 				write_buffers,
 				global_lock.clone(),
+				hash_set,
 			)? {
 				break;
 			}
@@ -1330,6 +1353,7 @@ where
 	}
 
 	fn process_read_result(
+		selector: SelectorHandle,
 		fd: ConnectionHandle,
 		listener_guarded_data: Arc<RwLock<GuardedData>>,
 		guarded_data: Arc<RwLock<GuardedData>>,
@@ -1342,6 +1366,7 @@ where
 		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
 		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
 		global_lock: Arc<RwLock<bool>>,
+		filter_set: &mut HashSet<ConnectionHandle>,
 	) -> Result<bool, Error> {
 		let connection_info = connection_id_map.get(&connection_id);
 		if connection_info.is_some() {
@@ -1358,8 +1383,8 @@ where
 				Ok(true)
 			} else {
 				let mut do_close = true;
+				let e = errno();
 				if len < 0 {
-					let e = errno();
 					if e.0 == EAGAIN {
 						do_close = false;
 					}
@@ -1369,6 +1394,7 @@ where
 					if connection_id_map.remove(&connection_id).is_some() {
 						connection_info_map.remove(&fd);
 						write_buffers.remove(&connection_id);
+						Self::remove_handle(selector, fd, filter_set)?;
 
 						let mut listener_guarded_data =
 							nioruntime_util::lockw!(listener_guarded_data);
@@ -1378,11 +1404,18 @@ where
 							ctype: ConnectionType::Inbound,
 							sender: None,
 						});
+						listener_guarded_data.wakeup()?;
 					}
 				}
-				Ok(do_close)
+				Ok(false)
 			}
 		} else {
+			if len > 0 {
+				error!(
+					"error reading {} bytes on unknown fd = {}, cid={}",
+					len, fd, connection_id
+				);
+			}
 			Ok(false)
 		}
 	}
@@ -1472,6 +1505,7 @@ where
 		// handle panic in progress events here
 		*counter += 1;
 		Self::process_events(
+			selector,
 			&mut counter,
 			&mut res,
 			&output_events,
@@ -1484,6 +1518,7 @@ where
 			on_read.clone(),
 			on_client_read.clone(),
 			guarded_data.clone(),
+			&mut hash_set,
 		)?;
 
 		if *res != 0 {
@@ -1544,6 +1579,7 @@ where
 
 			*counter = 0;
 			Self::process_events(
+				selector,
 				&mut counter,
 				&mut res,
 				&output_events,
@@ -1556,6 +1592,7 @@ where
 				on_read.clone(),
 				on_client_read.clone(),
 				guarded_data.clone(),
+				&mut hash_set,
 			)?;
 
 			output_events.clear();
@@ -1565,6 +1602,7 @@ where
 	}
 
 	fn process_events(
+		selector: SelectorHandle,
 		counter: &mut RwLockWriteGuard<usize>,
 		res: &mut RwLockWriteGuard<usize>,
 		output_events: &Vec<GenericEvent>,
@@ -1577,6 +1615,7 @@ where
 		on_read: Pin<Box<F>>,
 		on_client_read: Pin<Box<K>>,
 		guarded_data: Arc<RwLock<GuardedData>>,
+		filter_set: &mut HashSet<ConnectionHandle>,
 	) -> Result<(), Error> {
 		if **res > 0 {
 			for i in **counter..**res {
@@ -1588,6 +1627,7 @@ where
 							let conn_info = connection_info_map.get(&output_events[i].fd);
 							match conn_info {
 								Some(conn_info) => Self::process_read_event(
+									selector,
 									&output_events[i],
 									listener_guarded_data.clone(),
 									guarded_data.clone(),
@@ -1598,6 +1638,7 @@ where
 									connection_info_map,
 									write_buffers,
 									global_lock.clone(),
+									filter_set,
 								)?,
 								None => {
 									// looks to be spurious. connection already disconnected
@@ -1615,6 +1656,7 @@ where
 						let conn_info = connection_info_map.get(&output_events[i].fd);
 						match conn_info {
 							Some(conn_info) => Self::process_write_event(
+								selector,
 								&output_events[i],
 								conn_info.connection_id,
 								write_buffers,
@@ -1622,6 +1664,7 @@ where
 								connection_id_map,
 								connection_info_map,
 								listener_guarded_data.clone(),
+								filter_set,
 							)?,
 							None => {
 								// looks to be spurious. connection already disconnected
@@ -1638,7 +1681,75 @@ where
 				**counter += 1;
 			}
 		}
+		Ok(())
+	}
 
+	#[cfg(target_os = "windows")]
+	fn remove_handle(
+		selector: SelectorHandle,
+		connection_handle: ConnectionHandle,
+		filter_set: &mut HashSet<ConnectionHandle>,
+	) -> Result<(), Error> {
+		Ok(())
+	}
+
+	#[cfg(target_os = "linux")]
+	fn remove_handle(
+		selector: SelectorHandle,
+		connection_handle: ConnectionHandle,
+		filter_set: &mut HashSet<ConnectionHandle>,
+	) -> Result<(), Error> {
+		filter_set.remove(&connection_handle);
+		let interest = EpollFlags::empty();
+
+		let mut event = EpollEvent::new(interest, connection_handle.try_into().unwrap_or(0));
+		let res = epoll_ctl(
+			selector,
+			EpollOp::EpollCtlDel,
+			connection_handle,
+			&mut event,
+		);
+		match res {
+			Ok(_) => {}
+			Err(e) => info!("Error epoll_ctl4: {}, fd={}, delete", e, connection_handle),
+		}
+
+		Ok(())
+	}
+
+	#[cfg(any(target_os = "macos", dragonfly, freebsd, netbsd, openbsd))]
+	fn remove_handle(
+		selector: SelectorHandle,
+		connection_handle: ConnectionHandle,
+		_filter_set: &mut HashSet<ConnectionHandle>,
+	) -> Result<(), Error> {
+		let mut kevs = vec![];
+		kevs.push(kevent::new(
+			connection_handle as uintptr_t,
+			EventFilter::EVFILT_READ,
+			EventFlag::EV_DELETE,
+			FilterFlag::empty(),
+		));
+
+		let mut ret_kevs = vec![];
+		let ret_count = unsafe {
+			kevent(
+				selector,
+				kevs.as_ptr(),
+				kevs.len() as i32,
+				ret_kevs.as_mut_ptr(),
+				0,
+				&duration_to_timespec(std::time::Duration::from_millis(0)),
+			)
+		};
+
+		if ret_count < 0 {
+			info!(
+				"Error in kevent (remove handle): kevs={:?}, error={}",
+				kevs,
+				errno()
+			);
+		}
 		Ok(())
 	}
 
@@ -1908,7 +2019,6 @@ where
 				info!("Error with epoll wait = {}", e.to_string());
 			}
 		}
-
 		Ok(ret_count_adjusted)
 	}
 
