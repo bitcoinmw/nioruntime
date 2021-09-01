@@ -173,7 +173,6 @@ impl WriteHandle {
 				end = data.len();
 			}
 		}
-
 		guarded_data.wakeup()?;
 
 		Ok(())
@@ -896,15 +895,13 @@ where
 		input_events: &mut Vec<GenericEvent>,
 		global_lock: Arc<RwLock<bool>>,
 		on_close: Pin<Box<H>>,
-	) -> Result<(bool, bool), Error> {
+	) -> Result<bool, Error> {
 		let stop;
-		let wakeup;
 		let nconns;
 		let cconns;
 		{
 			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
 			stop = guarded_data.stop;
-			wakeup = guarded_data.wakeup_scheduled;
 			nconns = guarded_data.nconns.clone();
 			cconns = guarded_data.cconns.clone();
 			guarded_data.nconns.clear();
@@ -942,7 +939,7 @@ where
 			}
 		}
 
-		Ok((stop, wakeup))
+		Ok(stop)
 	}
 
 	fn process_listener_events(
@@ -1091,7 +1088,7 @@ where
 
 		loop {
 			// get new handles
-			let (stop, wakeup) = Self::update_listener_input_events(
+			let stop = Self::update_listener_input_events(
 				&guarded_data,
 				&mut input_events,
 				global_lock.clone(),
@@ -1112,7 +1109,7 @@ where
 				input_events.clone(),
 				&mut output_events,
 				&mut hash_set,
-				wakeup,
+				false,
 			)?;
 			input_events.clear();
 
@@ -1136,14 +1133,12 @@ where
 		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
 		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
 		hash_set: &mut HashSet<ConnectionHandle>,
-	) -> Result<(bool, bool), Error> {
+	) -> Result<bool, Error> {
 		let nconns;
 		let stop;
-		let wakeup;
 		{
 			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
 			stop = guarded_data.stop;
-			wakeup = guarded_data.wakeup_scheduled;
 			nconns = guarded_data.nconns.clone();
 			guarded_data.nconns.clear();
 		}
@@ -1163,7 +1158,7 @@ where
 			}
 		}
 
-		Ok((stop, wakeup))
+		Ok(stop)
 	}
 
 	fn do_write(
@@ -1480,8 +1475,13 @@ where
 			on_client_read.clone(),
 			guarded_data.clone(),
 		)?;
-		input_events.clear();
+
+		if *res != 0 {
+			input_events.clear();
+		}
 		output_events.clear();
+
+		let mut wakeup = false;
 
 		loop {
 			// see if there's any new write buffers to process
@@ -1493,7 +1493,7 @@ where
 			)?;
 
 			// get new handles
-			let (stop, wakeup) = Self::update_rw_input_events(
+			let stop = Self::update_rw_input_events(
 				guarded_data.clone(),
 				&mut input_events,
 				&mut connection_info_map,
@@ -1508,6 +1508,7 @@ where
 				let _ = unsafe { ws2_32::closesocket(selector) };
 				break;
 			}
+
 			*res = Self::get_events(
 				selector,
 				input_events.clone(),
@@ -1515,6 +1516,21 @@ where
 				&mut hash_set,
 				wakeup,
 			)?;
+
+			{
+				let mut guarded_data = nioruntime_util::lockw!(guarded_data);
+				if guarded_data.wakeup_scheduled {
+					wakeup = true;
+					guarded_data.wakeup_scheduled = false;
+					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
+					let res = unsafe { read(wakeup_fd, cbuf, 1) };
+					if res <= 0 {
+						log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
+					}
+				} else {
+					wakeup = false;
+				}
+			}
 
 			*counter = 0;
 			Self::process_events(
@@ -1557,14 +1573,7 @@ where
 				match output_events[i].etype {
 					GenericEventType::AddReadET | GenericEventType::AddReadLT => {
 						if output_events[i].fd == wakeup_fd {
-							// read one byte for wakeup
-							let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-							let res = unsafe { read(wakeup_fd, cbuf, 1) };
-							if res <= 0 {
-								log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
-							}
-							let mut guarded_data = nioruntime_util::lockw!(guarded_data);
-							guarded_data.wakeup_scheduled = false;
+							// ignore wakeupfd here process in main loop.
 						} else {
 							let conn_info = connection_info_map.get(&output_events[i].fd);
 							match conn_info {
@@ -1724,17 +1733,7 @@ where
 		}
 		let mut events: [epoll_event; MAX_EVENTS as usize] =
 			unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-		let results = unsafe {
-			epoll_wait(
-				win_selector,
-				events.as_mut_ptr(),
-				MAX_EVENTS,
-				match wakeup {
-					true => 1,
-					false => 1000,
-				},
-			)
-		};
+		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 3000) };
 		let mut ret_count_adjusted = 0;
 
 		if results > 0 {
@@ -1867,8 +1866,8 @@ where
 			epollfd,
 			&mut events,
 			match wakeup {
-				true => 1,
-				false => 1000,
+				true => 0,
+				false => 3000,
 			},
 		);
 
@@ -1935,7 +1934,7 @@ where
 				MAX_EVENTS,
 				&duration_to_timespec(std::time::Duration::from_millis(match wakeup {
 					true => 1,
-					false => 1000,
+					false => 3000,
 				})),
 			)
 		};

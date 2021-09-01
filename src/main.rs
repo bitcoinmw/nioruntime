@@ -238,9 +238,6 @@ fn real_main() -> Result<(), Error> {
 
 	if http {
 		let config = HttpConfig {
-			//request_log_max_age_millis: 30_000,
-			//main_log_max_age_millis: 30_000,
-			//stats_log_max_age_millis: 30_000,
 			debug: false,
 			..Default::default()
 		};
