@@ -17,7 +17,6 @@ use dirs;
 pub use nioruntime_evh::{EventHandler, EventHandlerConfig, State, WriteHandle};
 use nioruntime_log::*;
 use nioruntime_util::threadpool::OnPanic;
-use nioruntime_util::threadpool::StaticThreadPool;
 use nioruntime_util::{Error, ErrorKind};
 use num_format::{Locale, ToFormattedString};
 use rand::Rng;
@@ -144,8 +143,6 @@ pub struct HttpConfig {
 	pub port: u16,
 	/// The root directory of the http daemon. By default ~/.niohttpd is used.
 	pub root_dir: String,
-	/// Size of the thread_pool. The default value is 6.
-	pub thread_pool_size: usize,
 	/// The name of the server. The default is `"NIORuntime Httpd <version>"`
 	pub server_name: String,
 	/// Which parameters to log into the request log. The default values are:
@@ -199,7 +196,6 @@ impl Default for HttpConfig {
 			host: "0.0.0.0".to_string(),
 			port: 8080,
 			root_dir: "~/.niohttpd".to_string(),
-			thread_pool_size: 6,
 			server_name: "NIORuntime Httpd".to_string(),
 			request_log_params: vec![
 				"method".to_string(),
@@ -322,7 +318,6 @@ pub struct HttpServer {
 	listener: Option<TcpListener>,
 	pub http_context: Option<Arc<RwLock<HttpContext>>>,
 	log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
-	thread_pool: Option<Arc<RwLock<StaticThreadPool>>>,
 }
 
 impl HttpServer {
@@ -365,7 +360,6 @@ impl HttpServer {
 			listener: None,
 			http_context: None,
 			log_queue,
-			thread_pool: None,
 		}
 	}
 
@@ -456,7 +450,7 @@ impl HttpServer {
 			INFO,
 			MAIN_LOG,
 			"thread_pool_size:     '{}'",
-			self.config.thread_pool_size
+			self.config.evh_config.thread_count,
 		);
 		log_multi!(
 			INFO,
@@ -529,14 +523,6 @@ impl HttpServer {
 		let http_config_clone4 = http_config.clone();
 		let http_config_clone5 = http_config.clone();
 
-		let mut thread_pool = StaticThreadPool::new()?;
-		thread_pool.set_on_panic(self.config.on_panic)?;
-		thread_pool.start(self.config.thread_pool_size)?;
-		let thread_pool = Arc::new(RwLock::new(thread_pool));
-		let thread_pool_clone = thread_pool.clone();
-		let thread_pool_clone2 = thread_pool.clone();
-		let thread_pool_clone3 = thread_pool.clone();
-
 		let http_context = HttpContext::new();
 
 		let http_context = Arc::new(RwLock::new(http_context));
@@ -548,12 +534,11 @@ impl HttpServer {
 		let http_context_clone6 = http_context.clone();
 		let http_context_clone7 = http_context.clone();
 
-		let mut eh = EventHandler::new(EventHandlerConfig::default());
+		let mut eh = EventHandler::new(http_config.evh_config.clone());
 		eh.set_on_panic(http_config.on_panic)?;
 
 		eh.set_on_read(move |buf, len, wh| {
 			Self::process_read(
-				thread_pool_clone.clone(),
 				http_context.clone(),
 				http_config.clone(),
 				buf,
@@ -564,7 +549,6 @@ impl HttpServer {
 		})?;
 		eh.set_on_accept(move |id, wh| {
 			Self::process_accept(
-				thread_pool_clone2.clone(),
 				http_context_clone.clone(),
 				http_config_clone.clone(),
 				id,
@@ -573,18 +557,12 @@ impl HttpServer {
 		})?;
 		eh.set_on_client_read(|_, _, _| Ok(()))?;
 		eh.set_on_close(move |id| {
-			Self::process_close(
-				thread_pool_clone3.clone(),
-				http_context_clone2.clone(),
-				http_config_clone2.clone(),
-				id,
-			)
+			Self::process_close(http_context_clone2.clone(), http_config_clone2.clone(), id)
 		})?;
 		eh.start()?;
 		eh.add_tcp_listener(&listener)?;
 		self.listener = Some(listener);
 		self.http_context = Some(http_context_clone3);
-		self.thread_pool = Some(thread_pool);
 
 		std::thread::spawn(move || loop {
 			std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1410,7 +1388,6 @@ impl HttpServer {
 	}
 
 	fn process_accept(
-		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
 		http_config: HttpConfig,
 		id: u128,
@@ -1436,7 +1413,6 @@ impl HttpServer {
 	}
 
 	fn process_read(
-		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
 		http_config: HttpConfig,
 		buf: &[u8],
@@ -1900,7 +1876,6 @@ impl HttpServer {
 	}
 
 	fn process_close(
-		_thread_pool: Arc<RwLock<StaticThreadPool>>,
 		http_context: Arc<RwLock<HttpContext>>,
 		_http_config: HttpConfig,
 		id: u128,
