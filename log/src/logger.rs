@@ -809,7 +809,7 @@ impl LogParams {
 	/// This function rotates logs
 	pub fn rotate(&mut self) -> Result<(), Error> {
 		let now: DateTime<Utc> = Utc::now();
-		let rotation_string = now.format(".r_%m_%e_%Y_%T").to_string().replace(":", "-");
+		let rotation_string = now.format(".r_%m_%d_%Y_%T").to_string().replace(":", "-");
 		let file_path = match self.config.file_path.rfind(".") {
 			Some(pos) => &self.config.file_path[0..pos],
 			_ => &self.config.file_path,
