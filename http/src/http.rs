@@ -1776,6 +1776,13 @@ impl HttpServer {
 			if update_needed_len != 0 {
 				conn_data.needed_len = update_needed_len;
 			}
+
+			{
+				let is_async = *nioruntime_util::lockr!(conn_data.is_async);
+				if is_async {
+					break; // don't process the next page if we're in async mode
+				}
+			}
 		}
 
 		Ok(log_item)
