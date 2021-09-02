@@ -39,7 +39,7 @@ debug!();
 const MAIN_LOG: &str = "mainlog";
 const STATS_LOG: &str = "statslog";
 const HEADER: &str =
-	"-----------------------------------------------------------------------------------------------";
+	"-----------------------------------------------------------------------------------------------------------------------";
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -49,6 +49,8 @@ struct RequestLogItem {
 	query: String,
 	headers: Vec<(Vec<u8>, Vec<u8>)>,
 	method: HttpMethod,
+	elapsed: u128,
+	is_async: bool,
 }
 
 impl RequestLogItem {
@@ -57,12 +59,16 @@ impl RequestLogItem {
 		query: String,
 		headers: Vec<(Vec<u8>, Vec<u8>)>,
 		method: HttpMethod,
+		elapsed: u128,
+		is_async: bool,
 	) -> Self {
 		RequestLogItem {
 			uri,
 			query,
 			headers,
 			method,
+			elapsed,
+			is_async,
 		}
 	}
 }
@@ -175,6 +181,9 @@ pub struct HttpConfig {
 	/// and no additional requests are made for two minutes, the connection will be
 	/// closed.
 	pub last_request_timeout: u128,
+	/// The amount of time in milliseconds between printing out to the statistical
+	/// log. The default is 5000 (5 seconds).
+	pub stats_frequency: u64,
 	/// The amount of time in milliseconds before disconnecting a connection. By
 	/// default, this is 30 seconds. This is different than `last_request_timeout`
 	/// in that that parameter is used if a request has already been made on a connection.
@@ -211,6 +220,7 @@ impl Default for HttpConfig {
 			request_log_max_age_millis: 1000 * 60 * 60,   // 1 hr
 			main_log_max_size: 10 * 1024 * 1024,          // 10 mb
 			main_log_max_age_millis: 6 * 1000 * 60 * 60,  // 6 hr
+			stats_frequency: 5000,                        // 5 seconds
 			stats_log_max_size: 10 * 1024 * 1024,         // 10 mb
 			stats_log_max_age_millis: 6 * 1000 * 60 * 60, // 6 hr
 			last_request_timeout: 1000 * 120,             // 2 mins
@@ -234,6 +244,7 @@ pub struct ConnData {
 	last_request_time: u128,
 	needed_len: usize,
 	is_async: Arc<RwLock<bool>>,
+	begin_request_time: u128,
 }
 
 impl ConnData {
@@ -250,6 +261,7 @@ impl ConnData {
 			last_request_time: 0,
 			needed_len: 0,
 			is_async: Arc::new(RwLock::new(false)),
+			begin_request_time: 0,
 		}
 	}
 
@@ -264,6 +276,9 @@ struct HttpStats {
 	connects: u64,
 	idledisc: u64,
 	rtimeout: u64,
+	lat_sum: u128,
+	lat_requests: u64,
+	max_lat: u128,
 }
 
 impl HttpStats {
@@ -274,6 +289,9 @@ impl HttpStats {
 			connects: 0,
 			idledisc: 0,
 			rtimeout: 0,
+			lat_sum: 0,
+			lat_requests: 0,
+			max_lat: 0,
 		}
 	}
 }
@@ -509,6 +527,12 @@ impl HttpServer {
 			MAIN_LOG,
 			"stats_log_max_age:    '{}'",
 			Self::format_time(self.config.stats_log_max_age_millis)
+		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"stats_frequency:      '{}'",
+			Self::format_time(self.config.stats_frequency.into())
 		);
 		log_multi!(
 			INFO,
@@ -789,7 +813,7 @@ impl HttpServer {
 		}
 	}
 
-	fn format_qps(num: f64) -> String {
+	fn format_float(num: f64) -> String {
 		if num < 10.0 {
 			format!("{:.7}", num)
 		} else if num < 100.0 {
@@ -811,7 +835,7 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		let start = Instant::now();
 		let header_titles =
-"Statistical Log V_1.0:     REQUESTS       CONNS    CONNECTS         QPS   IDLE_DISC    RTIMEOUT"
+"Statistical Log V_1.0:     REQUESTS       CONNS    CONNECTS         QPS   IDLE_DISC    RTIMEOUT     AVG_LAT     MAX_LAT"
 .to_string();
 		let file_header = format!("{}\n{}", header_titles, HEADER);
 		log_config_multi!(
@@ -831,8 +855,18 @@ impl HttpServer {
 		let mut last_connects = 0;
 		let mut last_idledisc = 0;
 		let mut last_rtimeout = 0;
+		let mut last_lat_sum = 0;
+		let mut last_lat_reqs = 0;
+		let mut max_lat_perm = 0;
 		loop {
-			std::thread::sleep(std::time::Duration::from_millis(5000));
+			{
+				let mut http_context = nioruntime_util::lockw!(http_context);
+				http_context.stats.max_lat = 0;
+			}
+
+			std::thread::sleep(std::time::Duration::from_millis(
+				http_config.stats_frequency,
+			));
 
 			let http_context = http_context.read().map_err(|_| {
 				let error: Error =
@@ -877,31 +911,51 @@ impl HttpServer {
 					)
 				};
 
+				let avg_lat = if http_context.stats.lat_requests == 0 {
+					0.0
+				} else {
+					http_context.stats.lat_sum as f64
+						/ (http_context.stats.lat_requests * 1_000_000) as f64
+				};
+				let max_lat = max_lat_perm as f64 / 1_000_000 as f64;
+
 				log_no_ts_multi!(
 					INFO,
 					STATS_LOG,
-					"{}: {:12}{:12}{:12}   {}{:12}{:12}",
+					"{}: {:12}{:12}{:12}   {}{:12}{:12}   {}   {}",
 					format_elapsed_time,
 					http_context.stats.requests,
 					http_context.stats.conns,
 					http_context.stats.connects,
-					Self::format_qps(http_context.stats.requests as f64 / secs as f64),
+					Self::format_float(http_context.stats.requests as f64 / secs as f64),
 					http_context.stats.idledisc,
 					http_context.stats.rtimeout,
+					Self::format_float(avg_lat),
+					Self::format_float(max_lat),
 				);
 				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
 			}
+
 			let qps = (http_context.stats.requests - last_requests) as f64 / 5 as f64;
+			let avg_lat = if http_context.stats.lat_requests - last_lat_reqs == 0 {
+				0.0
+			} else {
+				(http_context.stats.lat_sum - last_lat_sum) as f64
+					/ ((http_context.stats.lat_requests - last_lat_reqs) * 1_000_000) as f64
+			};
+			let max_lat = http_context.stats.max_lat as f64 / 1_000_000 as f64;
 			log_multi!(
 				INFO,
 				STATS_LOG,
-				"{:12}{:12}{:12}   {}{:12}{:12}",
+				"{:12}{:12}{:12}   {}{:12}{:12}   {}   {}",
 				http_context.stats.requests - last_requests,
 				http_context.stats.conns,
 				http_context.stats.connects - last_connects,
-				Self::format_qps(qps),
+				Self::format_float(qps),
 				http_context.stats.idledisc - last_idledisc,
 				http_context.stats.rtimeout - last_rtimeout,
+				Self::format_float(avg_lat),
+				Self::format_float(max_lat),
 			);
 
 			if http_context.stop {
@@ -955,6 +1009,13 @@ impl HttpServer {
 			last_connects = http_context.stats.connects;
 			last_rtimeout = http_context.stats.rtimeout;
 			last_idledisc = http_context.stats.idledisc;
+			last_lat_sum = http_context.stats.lat_sum;
+			last_lat_reqs = http_context.stats.lat_requests;
+			max_lat_perm = if http_context.stats.max_lat > max_lat_perm {
+				http_context.stats.max_lat
+			} else {
+				max_lat_perm
+			};
 		}
 
 		Ok(())
@@ -975,6 +1036,10 @@ impl HttpServer {
 				header, http_config.request_log_separator_char, http_config.request_log_params[i],
 			);
 		}
+		header = format!(
+			"{}{}{}",
+			header, http_config.request_log_separator_char, "ProcTime"
+		);
 		log.config(
 			Some(format!("{}/logs/request.log", http_config.root_dir)),
 			http_config.request_log_max_size,
@@ -1010,22 +1075,34 @@ impl HttpServer {
 
 				let log_count: u64 = to_log.len().try_into().unwrap_or(0);
 				http_context.stats.requests += log_count;
+				for item in &to_log {
+					if item.elapsed != 0 {
+						http_context.stats.lat_requests += 1;
+						http_context.stats.lat_sum += item.elapsed;
+						if item.elapsed > http_context.stats.max_lat {
+							http_context.stats.max_lat = item.elapsed;
+						}
+					}
+				}
 
 				http_context.stop
 			};
 
 			for item in to_log {
-				let res = Self::log_item(item, &mut log, &hash_set, &http_config, &mut header_map);
+				if !item.is_async {
+					let res =
+						Self::log_item(item, &mut log, &hash_set, &http_config, &mut header_map);
 
-				match res {
-					Ok(_) => {}
-					Err(e) => {
-						log_multi!(
-							ERROR,
-							MAIN_LOG,
-							"Unexpected error with request log: {}",
-							e.to_string()
-						);
+					match res {
+						Ok(_) => {}
+						Err(e) => {
+							log_multi!(
+								ERROR,
+								MAIN_LOG,
+								"Unexpected error with request log: {}",
+								e.to_string()
+							);
+						}
 					}
 				}
 			}
@@ -1170,6 +1247,17 @@ impl HttpServer {
 					}
 				}
 			}
+		}
+
+		if item.elapsed != 0 {
+			log_line = format!(
+				"{}{}{}ms",
+				log_line,
+				http_config.request_log_separator_char,
+				item.elapsed as f64 / 1_000_000 as f64
+			);
+		} else {
+			log_line = format!("{}{}", log_line, http_config.request_log_separator_char,);
 		}
 
 		log.log(&log_line)?;
@@ -1460,7 +1548,7 @@ impl HttpServer {
 			}
 		};
 
-		let log_item = {
+		let log_items = {
 			let mut conn_data = conn_data.write().map_err(|e| {
 				let error: Error =
 					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
@@ -1494,17 +1582,16 @@ impl HttpServer {
 						"unexpected error processing request: {}",
 						e.to_string()
 					);
-					None
+					vec![]
 				}
 			}
 		};
 
-		match log_item {
-			Some(log_item) => {
-				let mut log_queue = nioruntime_util::lockw!(log_queue);
-				log_queue.push(log_item);
+		{
+			let mut log_queue = nioruntime_util::lockw!(log_queue);
+			for item in log_items {
+				log_queue.push(item);
 			}
-			None => {}
 		}
 
 		Ok(())
@@ -1517,17 +1604,37 @@ impl HttpServer {
 		wh: WriteHandle,
 		mappings: HashSet<String>,
 		extensions: HashSet<String>,
-	) -> Result<Option<RequestLogItem>, Error> {
+	) -> Result<Vec<RequestLogItem>, Error> {
+		let mut log_vec = vec![];
+		if (*conn_data).begin_request_time != 0 {
+			// async request completing
+			let start = SystemTime::now();
+			let since_the_epoch = start
+				.duration_since(UNIX_EPOCH)
+				.expect("Time went backwards")
+				.as_nanos();
+			let diff = since_the_epoch - (*conn_data).begin_request_time;
+			log_vec.push(RequestLogItem::new(
+				"".to_string(),
+				"".to_string(),
+				vec![],
+				HttpMethod::Get,
+				diff,
+				true,
+			));
+
+			(*conn_data).begin_request_time = 0;
+		}
+
 		{
 			let is_async = *nioruntime_util::lockr!(conn_data.is_async);
 			if is_async {
-				return Ok(None);
+				return Ok(log_vec);
 			}
 		}
-		let mut log_item = None;
 		if conn_data.needed_len != 0 && conn_data.buffer.len() < conn_data.needed_len {
 			// data not sufficient return and wait for more data
-			return Ok(None);
+			return Ok(log_vec);
 		} else {
 			conn_data.needed_len = 0;
 		}
@@ -1732,6 +1839,11 @@ impl HttpServer {
 						}
 						.to_lowercase();
 
+						let start = SystemTime::now();
+						let since_the_epoch = start
+							.duration_since(UNIX_EPOCH)
+							.expect("Time went backwards");
+						(*conn_data).begin_request_time = since_the_epoch.as_nanos();
 						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
 							{
 								let mut callback_state = nioruntime_util::lockw!(wh.callback_state);
@@ -1756,11 +1868,29 @@ impl HttpServer {
 							Self::send_response(&config, &wh, http_version, uri, keep_alive)?;
 						}
 
-						log_item = Some(RequestLogItem::new(
+						let elapsed = {
+							let is_async = *nioruntime_util::lockr!(conn_data.is_async);
+							if !is_async {
+								let start = SystemTime::now();
+								let since_the_epoch = start
+									.duration_since(UNIX_EPOCH)
+									.expect("Time went backwards")
+									.as_nanos();
+								let diff = since_the_epoch - (*conn_data).begin_request_time;
+								(*conn_data).begin_request_time = 0;
+								diff
+							} else {
+								0
+							}
+						};
+
+						log_vec.push(RequestLogItem::new(
 							uri.to_string(),
 							query.to_string(),
 							sep_headers_vec,
 							method,
+							elapsed,
+							false,
 						));
 
 						conn_data.buffer.drain(0..end_buf + 1);
@@ -1785,7 +1915,7 @@ impl HttpServer {
 			}
 		}
 
-		Ok(log_item)
+		Ok(log_vec)
 	}
 
 	fn send_bad_request_error(wh: &WriteHandle) -> Result<(), Error> {
