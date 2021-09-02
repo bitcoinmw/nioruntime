@@ -132,6 +132,20 @@ impl WriteHandle {
 		Ok(())
 	}
 
+	pub fn async_recheck(&self) -> Result<(), Error> {
+		let mut guarded_data = nioruntime_util::lockw!(self.guarded_data);
+		let conn = ConnectionInfo {
+			handle: self.fd,
+			connection_id: self.connection_id,
+			ctype: ConnectionType::Inbound,
+			sender: None,
+		};
+		guarded_data.aconns.push(conn);
+		guarded_data.wakeup()?;
+
+		Ok(())
+	}
+
 	fn _nbwrite(&self, data: &[u8]) -> Result<usize, Error> {
 		let len = write_data(self.fd, data, &self.global_lock)?;
 		Ok(len.try_into().unwrap_or(0))
@@ -566,6 +580,7 @@ where
 			guarded_data.push(Arc::new(RwLock::new(GuardedData {
 				nconns: vec![],
 				write_queue: vec![],
+				aconns: vec![],
 				cconns: vec![],
 				wakeup_tx: 0,
 				wakeup_rx: 0,
@@ -1157,14 +1172,29 @@ where
 		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
 		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
 		hash_set: &mut HashSet<ConnectionHandle>,
+		global_lock: Arc<RwLock<bool>>,
+		on_read: Pin<Box<F>>,
 	) -> Result<bool, Error> {
 		let nconns;
 		let stop;
+		let aconns;
 		{
 			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
 			stop = guarded_data.stop;
 			nconns = guarded_data.nconns.clone();
+			aconns = guarded_data.aconns.clone();
+			guarded_data.aconns.clear();
 			guarded_data.nconns.clear();
+		}
+
+		for conn in aconns {
+			let wh = WriteHandle::new(
+				conn.handle,
+				guarded_data.clone(),
+				conn.connection_id,
+				global_lock.clone(),
+			);
+			(on_read)(&[0u8; 0], 0, wh)?;
 		}
 
 		for conn in nconns {
@@ -1544,6 +1574,8 @@ where
 				&mut connection_info_map,
 				&mut connection_id_map,
 				&mut hash_set,
+				global_lock.clone(),
+				on_read.clone(),
 			)?;
 
 			if stop {
@@ -2106,6 +2138,7 @@ struct ConnectionInfo {
 struct GuardedData {
 	nconns: Vec<ConnectionInfo>,
 	cconns: Vec<ConnectionInfo>,
+	aconns: Vec<ConnectionInfo>,
 	write_queue: Vec<WriteBuffer>,
 	wakeup_tx: ConnectionHandle,
 	wakeup_rx: ConnectionHandle,

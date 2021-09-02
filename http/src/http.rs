@@ -84,6 +84,7 @@ pub enum HttpVersion {
 type Housekeeper = fn() -> Result<(), Error>;
 
 type Callback = fn(
+	Arc<RwLock<bool>>,
 	&mut RwLockWriteGuard<ConnData>,
 	bool,
 	usize,
@@ -99,6 +100,7 @@ type Callback = fn(
 ) -> Result<(), Error>;
 
 fn empty_callback(
+	_: Arc<RwLock<bool>>,
 	_: &mut RwLockWriteGuard<ConnData>,
 	_: bool,
 	_: usize,
@@ -231,6 +233,7 @@ pub struct ConnData {
 	create_time: u128,
 	last_request_time: u128,
 	needed_len: usize,
+	is_async: Arc<RwLock<bool>>,
 }
 
 impl ConnData {
@@ -246,6 +249,7 @@ impl ConnData {
 			create_time: since_the_epoch.as_millis(),
 			last_request_time: 0,
 			needed_len: 0,
+			is_async: Arc::new(RwLock::new(false)),
 		}
 	}
 
@@ -1462,6 +1466,7 @@ impl HttpServer {
 					ErrorKind::PoisonError(format!("unexpected error: {}", e.to_string())).into();
 				error
 			})?;
+			let conn_data_is_async = conn_data.is_async.clone();
 
 			let start = SystemTime::now();
 			let since_the_epoch = start
@@ -1473,7 +1478,14 @@ impl HttpServer {
 				conn_data.buffer.push(buf[i]);
 			}
 
-			match Self::process_request(http_config, &mut conn_data, wh, mappings, extensions) {
+			match Self::process_request(
+				conn_data_is_async,
+				http_config,
+				&mut conn_data,
+				wh,
+				mappings,
+				extensions,
+			) {
 				Ok(log_item) => log_item,
 				Err(e) => {
 					log_multi!(
@@ -1499,12 +1511,19 @@ impl HttpServer {
 	}
 
 	fn process_request(
+		conn_data_is_async: Arc<RwLock<bool>>,
 		config: HttpConfig,
 		conn_data: &mut RwLockWriteGuard<ConnData>,
 		wh: WriteHandle,
 		mappings: HashSet<String>,
 		extensions: HashSet<String>,
 	) -> Result<Option<RequestLogItem>, Error> {
+		{
+			let is_async = *nioruntime_util::lockr!(conn_data.is_async);
+			if is_async {
+				return Ok(None);
+			}
+		}
 		let mut log_item = None;
 		if conn_data.needed_len != 0 && conn_data.buffer.len() < conn_data.needed_len {
 			// data not sufficient return and wait for more data
@@ -1719,6 +1738,7 @@ impl HttpServer {
 								*callback_state = State::Init;
 							}
 							(config.callback)(
+								conn_data_is_async.clone(),
 								conn_data,
 								has_content,
 								start_buf,
