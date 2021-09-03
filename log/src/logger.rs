@@ -791,6 +791,8 @@ pub struct LogConfig {
 	pub show_timestamp: bool,
 	/// Whether or not to print the log lines to standard output. By default, this is set to true.
 	pub show_stdout: bool,
+	/// delete the rotated log immidiately (only used for testing)
+	pub delete_rotation: bool,
 }
 
 impl Default for LogConfig {
@@ -802,6 +804,7 @@ impl Default for LogConfig {
 			file_header: "".to_string(),
 			show_timestamp: true,
 			show_stdout: true,
+			delete_rotation: false,
 		}
 	}
 }
@@ -821,7 +824,11 @@ impl LogParams {
 			rotation_string,
 			rand::random::<u64>(),
 		);
-		std::fs::rename(&self.config.file_path, file_path.clone())?;
+		if self.config.delete_rotation {
+			std::fs::remove_file(&self.config.file_path)?;
+		} else {
+			std::fs::rename(&self.config.file_path, file_path.clone())?;
+		}
 		self.file = Some(
 			OpenOptions::new()
 				.append(true)
@@ -934,6 +941,7 @@ impl Log {
 			config.show_timestamp,
 			&config.file_header,
 			config.show_stdout,
+			config.delete_rotation,
 		)?;
 		Ok(())
 	}
@@ -947,6 +955,7 @@ impl Log {
 		show_timestamp: bool,
 		file_header: &str,
 		show_stdout: bool,
+		delete_rotation: bool,
 	) -> Result<(), Error> {
 		// create file with append option and create option
 		let file = match file_path.clone() {
@@ -1001,6 +1010,7 @@ impl Log {
 				show_timestamp,
 				file_header,
 				show_stdout,
+				delete_rotation,
 			},
 			has_rotated: false,
 		});

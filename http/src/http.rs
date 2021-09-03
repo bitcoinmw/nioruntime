@@ -172,6 +172,8 @@ pub struct HttpConfig {
 	pub request_log_max_size: u64,
 	/// The maximum age in milliseconds of the request log.
 	pub request_log_max_age_millis: u128,
+	/// Whether to delete the request log on every rotation. (Only used for testing)
+	pub delete_request_rotation: bool,
 	/// The maximum size in bytes of the main log.
 	pub main_log_max_size: u64,
 	/// The maximum age in milliseconds of the main log.
@@ -222,6 +224,7 @@ impl Default for HttpConfig {
 			request_log_separator_char: '|',
 			request_log_max_size: 10 * 1024 * 1024,       // 10 mb
 			request_log_max_age_millis: 1000 * 60 * 60,   // 1 hr
+			delete_request_rotation: false,               // do not delete
 			main_log_max_size: 10 * 1024 * 1024,          // 10 mb
 			main_log_max_age_millis: 6 * 1000 * 60 * 60,  // 6 hr
 			stats_frequency: 5000,                        // 5 seconds
@@ -536,12 +539,17 @@ impl HttpServer {
 			"stats_frequency:      '{}'",
 			Self::format_time(self.config.stats_frequency.into())
 		);
-		log_multi!(
-			INFO,
-			MAIN_LOG,
-			"debug:                '{}'",
-			self.config.debug
-		);
+		if self.config.debug {
+			log_multi!(WARN, MAIN_LOG, "WARNING! flag set:    'debug'");
+		}
+		if self.config.delete_request_rotation {
+			log_multi!(
+				WARN,
+				MAIN_LOG,
+				"WARNING! flag set:    'delete_request_rotation'"
+			);
+		}
+
 		log_no_ts_multi!(INFO, MAIN_LOG, "{}", HEADER);
 
 		let listener = TcpListener::bind(addr.clone())?;
@@ -1049,6 +1057,7 @@ impl HttpServer {
 			true,
 			&header,
 			false,
+			http_config.delete_request_rotation,
 		)?;
 
 		let len = http_config.request_log_params.len();
