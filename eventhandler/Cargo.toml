@@ -25,6 +25,7 @@ errno = "0.2.7"
 libc = "^0.2.17"
 rand = "0.8.4"
 futures = "0.3.0"
+rustls = "0.20.0-beta1"
 
 nioruntime_util = { path = "../util" }
 nioruntime_log  = { path = "../log"  }

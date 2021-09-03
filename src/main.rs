@@ -301,7 +301,10 @@ fn real_main() -> Result<(), Error> {
 	} else {
 		let listener = TcpListener::bind("127.0.0.1:9999")?;
 		info!("Listener Started");
-		let mut eh = EventHandler::new(EventHandlerConfig { thread_count: 6 });
+		let mut eh = EventHandler::new(EventHandlerConfig {
+			thread_count: 6,
+			tls_config: None,
+		});
 
 		let buffers: Arc<Mutex<HashMap<u128, Arc<Mutex<Buffer>>>>> =
 			Arc::new(Mutex::new(HashMap::new()));

@@ -17,6 +17,7 @@ use libc::{accept, c_int, c_void, EAGAIN};
 use nioruntime_log::*;
 use nioruntime_util::{Error, ErrorKind};
 use rand::Rng;
+use rustls::{ServerConfig, ServerConnection};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::LinkedList;
@@ -139,6 +140,7 @@ impl WriteHandle {
 			connection_id: self.connection_id,
 			ctype: ConnectionType::Inbound,
 			sender: None,
+			tls_conn: None,
 		};
 		guarded_data.aconns.push(conn);
 		guarded_data.wakeup()?;
@@ -196,11 +198,17 @@ impl WriteHandle {
 #[derive(Clone)]
 pub struct EventHandlerConfig {
 	pub thread_count: usize,
+	/// The optional TLS config. If not specified, the server will run in non-ssl
+	/// mode.
+	pub tls_config: Option<ServerConfig>,
 }
 
 impl Default for EventHandlerConfig {
 	fn default() -> EventHandlerConfig {
-		EventHandlerConfig { thread_count: 6 }
+		EventHandlerConfig {
+			thread_count: 6,
+			tls_config: None,
+		}
 	}
 }
 
@@ -734,6 +742,7 @@ where
 				ConnectionType::Outbound
 			},
 			sender: Some(tx.clone()),
+			tls_conn: None,
 		};
 
 		{
@@ -763,6 +772,7 @@ where
 	fn start_generic(&mut self, selectors: Vec<SelectorHandle>) -> Result<(), Error> {
 		self.ensure_handlers()?;
 
+		let config = self.config.clone();
 		let on_panic = self.on_panic.clone();
 		let global_lock = &self.global_lock;
 		let global_lock_clone = global_lock.clone();
@@ -784,6 +794,7 @@ where
 				on_accept.clone(),
 				on_close.clone(),
 				global_lock_clone.clone(),
+				&config,
 			) {
 				Ok(_) => {}
 				Err(e) => {
@@ -976,6 +987,7 @@ where
 		global_lock: Arc<RwLock<bool>>,
 		wakeup_fd: ConnectionHandle,
 		cid_map: &mut HashMap<ConnectionHandle, u128>,
+		config: &EventHandlerConfig,
 	) -> Result<(), Error> {
 		for i in 0..count {
 			let event = &events[i];
@@ -1066,12 +1078,28 @@ where
 				(on_accept)(connection_id, wh)?;
 				cid_map.insert(res, connection_id);
 				{
+					let tls_conn = if config.tls_config.is_some() {
+						let tls_config =
+							Arc::new(ServerConfig::clone(config.tls_config.as_ref().unwrap()));
+						match ServerConnection::new(tls_config) {
+							Ok(tls_conn) => Some(Arc::new(tls_conn)),
+							Err(e) => {
+								error!("Error building tls_connection: {}", e.to_string());
+								None
+							}
+						}
+					} else {
+						None
+					};
+
 					let mut guarded_data_next = nioruntime_util::lockw!(guarded_data_next);
+
 					guarded_data_next.nconns.push(ConnectionInfo {
 						handle: res,
 						connection_id,
 						ctype: ConnectionType::Inbound,
 						sender: None,
+						tls_conn,
 					});
 					guarded_data_next.wakeup()?;
 				}
@@ -1088,6 +1116,7 @@ where
 		on_accept: Pin<Box<G>>,
 		on_close: Pin<Box<H>>,
 		global_lock: Arc<RwLock<bool>>,
+		config: &EventHandlerConfig,
 	) -> Result<(), Error> {
 		let mut cid_map = HashMap::new();
 		let mut hash_set = HashSet::new();
@@ -1161,6 +1190,7 @@ where
 				global_lock.clone(),
 				wakeup_fd,
 				&mut cid_map,
+				config,
 			)?;
 		}
 		Ok(())
@@ -1206,6 +1236,17 @@ where
 				etype: GenericEventType::AddReadET,
 			};
 			input_events.push(ge);
+
+			match conn.tls_conn {
+				Some(_tls_conn) => {
+					let ge = GenericEvent {
+						fd: conn.handle,
+						etype: GenericEventType::AddWriteET,
+					};
+					input_events.push(ge);
+				}
+				None => {}
+			}
 
 			if conn.sender.is_some() {
 				let _ = conn.sender.unwrap().send(());
@@ -1322,63 +1363,12 @@ where
 					connection_id,
 					ctype: ConnectionType::Inbound,
 					sender: None,
+					tls_conn: None,
 				});
 				listener_guarded_data.wakeup()?;
 			}
 		}
 
-		Ok(())
-	}
-
-	fn process_read_event(
-		selector: SelectorHandle,
-		event: &GenericEvent,
-		listener_guarded_data: Arc<RwLock<GuardedData>>,
-		guarded_data: Arc<RwLock<GuardedData>>,
-		connection_id: u128,
-		on_read: Pin<Box<F>>,
-		on_client_read: Pin<Box<K>>,
-		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
-		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
-		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
-		global_lock: Arc<RwLock<bool>>,
-		hash_set: &mut HashSet<ConnectionHandle>,
-	) -> Result<(), Error> {
-		loop {
-			let mut buf = [0u8; BUFFER_SIZE];
-			let len = {
-				let _lock = nioruntime_util::lockr!(global_lock);
-				#[cfg(unix)]
-				let len = {
-					let cbuf: *mut c_void = &mut buf as *mut _ as *mut c_void;
-					unsafe { read(event.fd, cbuf, BUFFER_SIZE) }
-				};
-				#[cfg(target_os = "windows")]
-				let len = {
-					let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
-					unsafe { ws2_32::recv(event.fd, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) }
-				};
-				len
-			};
-			if !Self::process_read_result(
-				selector,
-				event.fd,
-				listener_guarded_data.clone(),
-				guarded_data.clone(),
-				&buf,
-				len,
-				connection_id,
-				on_read.clone(),
-				on_client_read.clone(),
-				connection_id_map,
-				connection_info_map,
-				write_buffers,
-				global_lock.clone(),
-				hash_set,
-			)? {
-				break;
-			}
-		}
 		Ok(())
 	}
 
@@ -1433,6 +1423,7 @@ where
 							connection_id,
 							ctype: ConnectionType::Inbound,
 							sender: None,
+							tls_conn: None,
 						});
 						listener_guarded_data.wakeup()?;
 					}
@@ -1658,20 +1649,67 @@ where
 						} else {
 							let conn_info = connection_info_map.get(&output_events[i].fd);
 							match conn_info {
-								Some(conn_info) => Self::process_read_event(
-									selector,
-									&output_events[i],
-									listener_guarded_data.clone(),
-									guarded_data.clone(),
-									conn_info.connection_id,
-									on_read.clone(),
-									on_client_read.clone(),
-									connection_id_map,
-									connection_info_map,
-									write_buffers,
-									global_lock.clone(),
-									filter_set,
-								)?,
+								Some(conn_info) => {
+									let handle = conn_info.handle;
+									let connection_id = conn_info.connection_id;
+									match &conn_info.tls_conn {
+										Some(_tls_conn) => {
+											// for now tls not implemented
+											loop {
+												let mut buf = [0u8; BUFFER_SIZE];
+												let len = Self::do_read(
+													handle,
+													&mut buf,
+													global_lock.clone(),
+												)?;
+												if !Self::process_read_result(
+													selector,
+													handle,
+													listener_guarded_data.clone(),
+													guarded_data.clone(),
+													&buf,
+													len,
+													connection_id,
+													on_read.clone(),
+													on_client_read.clone(),
+													connection_id_map,
+													connection_info_map,
+													write_buffers,
+													global_lock.clone(),
+													filter_set,
+												)? {
+													break;
+												}
+											}
+										}
+										None => loop {
+											let mut buf = [0u8; BUFFER_SIZE];
+											let len = Self::do_read(
+												handle,
+												&mut buf,
+												global_lock.clone(),
+											)?;
+											if !Self::process_read_result(
+												selector,
+												handle,
+												listener_guarded_data.clone(),
+												guarded_data.clone(),
+												&buf,
+												len,
+												connection_id,
+												on_read.clone(),
+												on_client_read.clone(),
+												connection_id_map,
+												connection_info_map,
+												write_buffers,
+												global_lock.clone(),
+												filter_set,
+											)? {
+												break;
+											}
+										},
+									}
+								}
 								None => {
 									// looks to be spurious. connection already disconnected
 									log_multi!(
@@ -1686,18 +1724,25 @@ where
 					}
 					GenericEventType::AddWriteET => {
 						let conn_info = connection_info_map.get(&output_events[i].fd);
+
 						match conn_info {
-							Some(conn_info) => Self::process_write_event(
-								selector,
-								&output_events[i],
-								conn_info.connection_id,
-								write_buffers,
-								global_lock.clone(),
-								connection_id_map,
-								connection_info_map,
-								listener_guarded_data.clone(),
-								filter_set,
-							)?,
+							Some(conn_info) => {
+								match &conn_info.tls_conn {
+									Some(_tls_conn) => { // for now tls not implemented
+									}
+									None => Self::process_write_event(
+										selector,
+										&output_events[i],
+										conn_info.connection_id,
+										write_buffers,
+										global_lock.clone(),
+										connection_id_map,
+										connection_info_map,
+										listener_guarded_data.clone(),
+										filter_set,
+									)?,
+								}
+							}
 							None => {
 								// looks to be spurious. connection already disconnected
 								log_multi!(
@@ -1714,6 +1759,33 @@ where
 			}
 		}
 		Ok(())
+	}
+
+	fn _do_tls_read(
+		_handle: ConnectionHandle,
+		_buf: &mut [u8],
+		_global_lock: Arc<RwLock<bool>>,
+	) -> Result<isize, Error> {
+		Ok(0)
+	}
+
+	fn do_read(
+		handle: ConnectionHandle,
+		buf: &mut [u8],
+		global_lock: Arc<RwLock<bool>>,
+	) -> Result<isize, Error> {
+		let _lock = nioruntime_util::lockr!(global_lock);
+		#[cfg(unix)]
+		let len = {
+			let cbuf: *mut c_void = buf as *mut _ as *mut c_void;
+			unsafe { read(handle, cbuf, BUFFER_SIZE) }
+		};
+		#[cfg(target_os = "windows")]
+		let len = {
+			let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
+			unsafe { ws2_32::recv(handle, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) }
+		};
+		Ok(len)
 	}
 
 	#[cfg(target_os = "windows")]
@@ -2133,6 +2205,7 @@ struct ConnectionInfo {
 	connection_id: u128,
 	ctype: ConnectionType,
 	sender: Option<SyncSender<()>>,
+	tls_conn: Option<Arc<ServerConnection>>,
 }
 
 struct GuardedData {
