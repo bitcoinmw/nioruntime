@@ -1442,18 +1442,11 @@ where
 	}
 
 	fn process_writes(
-		guarded_data: Arc<RwLock<GuardedData>>,
+		write_queue: Vec<WriteBuffer>,
 		write_buffers: &mut HashMap<u128, LinkedList<WriteBuffer>>,
 		input_events: &mut Vec<GenericEvent>,
 		connection_id_map: &mut HashMap<u128, ConnectionInfo>,
 	) -> Result<(), Error> {
-		let write_queue = {
-			let mut guarded_data = nioruntime_util::lockw!(guarded_data);
-			let ret = guarded_data.write_queue.clone();
-			guarded_data.write_queue.clear();
-			ret
-		};
-
 		let mut hash_set = HashSet::new();
 
 		for write_buffer in write_queue {
@@ -1550,14 +1543,6 @@ where
 		let mut wakeup = false;
 
 		loop {
-			// see if there's any new write buffers to process
-			Self::process_writes(
-				guarded_data.clone(),
-				&mut write_buffers,
-				&mut input_events,
-				&mut connection_id_map,
-			)?;
-
 			// get new handles
 			let stop = Self::update_rw_input_events(
 				guarded_data.clone(),
@@ -1585,7 +1570,7 @@ where
 				wakeup,
 			)?;
 
-			{
+			let write_queue = {
 				let mut guarded_data = nioruntime_util::lockw!(guarded_data);
 				if guarded_data.wakeup_scheduled {
 					wakeup = true;
@@ -1598,7 +1583,19 @@ where
 				} else {
 					wakeup = false;
 				}
-			}
+				let ret = guarded_data.write_queue.clone();
+				guarded_data.write_queue.clear();
+				ret
+			};
+
+			input_events.clear();
+
+			Self::process_writes(
+				write_queue,
+				&mut write_buffers,
+				&mut input_events,
+				&mut connection_id_map,
+			)?;
 
 			*counter = 0;
 			Self::process_events(
@@ -1619,7 +1616,6 @@ where
 			)?;
 
 			output_events.clear();
-			input_events.clear();
 		}
 		Ok(())
 	}
