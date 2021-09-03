@@ -14,6 +14,7 @@
 
 use bytefmt;
 use dirs;
+use lazy_static::lazy_static;
 pub use nioruntime_evh::{EventHandler, EventHandlerConfig, State, WriteHandle};
 use nioruntime_log::*;
 use nioruntime_util::threadpool::OnPanic;
@@ -32,9 +33,12 @@ use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Instant;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 debug!();
+
+lazy_static! {
+	static ref START_TIME: Instant = Instant::now();
+}
 
 const MAIN_LOG: &str = "mainlog";
 const STATS_LOG: &str = "statslog";
@@ -249,15 +253,13 @@ pub struct ConnData {
 
 impl ConnData {
 	fn new(wh: WriteHandle, config: HttpConfig) -> Self {
-		let start = SystemTime::now();
-		let since_the_epoch = start
-			.duration_since(UNIX_EPOCH)
-			.expect("Time went backwards");
+		let start = Instant::now();
+		let since_start = start.duration_since(*START_TIME);
 		ConnData {
 			buffer: vec![],
 			config,
 			wh,
-			create_time: since_the_epoch.as_millis(),
+			create_time: since_start.as_millis(),
 			last_request_time: 0,
 			needed_len: 0,
 			is_async: Arc::new(RwLock::new(false)),
@@ -1289,9 +1291,9 @@ impl HttpServer {
 					error
 				})?;
 
-				let now = SystemTime::now();
-				let since_the_epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards");
-				let time_now = since_the_epoch.as_millis();
+				let now = Instant::now();
+				let since_start = now.duration_since(*START_TIME);
+				let time_now = since_start.as_millis();
 				let last_request_timeout = http_config.last_request_timeout;
 				let read_timeout = http_config.read_timeout;
 
@@ -1556,11 +1558,9 @@ impl HttpServer {
 			})?;
 			let conn_data_is_async = conn_data.is_async.clone();
 
-			let start = SystemTime::now();
-			let since_the_epoch = start
-				.duration_since(UNIX_EPOCH)
-				.expect("Time went backwards");
-			conn_data.last_request_time = since_the_epoch.as_millis();
+			let start = Instant::now();
+			let since_start = start.duration_since(*START_TIME);
+			conn_data.last_request_time = since_start.as_millis();
 
 			for i in 0..len {
 				conn_data.buffer.push(buf[i]);
@@ -1608,12 +1608,9 @@ impl HttpServer {
 		let mut log_vec = vec![];
 		if (*conn_data).begin_request_time != 0 {
 			// async request completing
-			let start = SystemTime::now();
-			let since_the_epoch = start
-				.duration_since(UNIX_EPOCH)
-				.expect("Time went backwards")
-				.as_nanos();
-			let diff = since_the_epoch - (*conn_data).begin_request_time;
+			let start = Instant::now();
+			let since_start = start.duration_since(*START_TIME).as_nanos();
+			let diff = since_start - (*conn_data).begin_request_time;
 			log_vec.push(RequestLogItem::new(
 				"".to_string(),
 				"".to_string(),
@@ -1839,11 +1836,9 @@ impl HttpServer {
 						}
 						.to_lowercase();
 
-						let start = SystemTime::now();
-						let since_the_epoch = start
-							.duration_since(UNIX_EPOCH)
-							.expect("Time went backwards");
-						(*conn_data).begin_request_time = since_the_epoch.as_nanos();
+						let start = Instant::now();
+						let since_start = start.duration_since(*START_TIME);
+						(*conn_data).begin_request_time = since_start.as_nanos();
 						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
 							{
 								let mut callback_state = nioruntime_util::lockw!(wh.callback_state);
@@ -1871,12 +1866,9 @@ impl HttpServer {
 						let elapsed = {
 							let is_async = *nioruntime_util::lockr!(conn_data.is_async);
 							if !is_async {
-								let start = SystemTime::now();
-								let since_the_epoch = start
-									.duration_since(UNIX_EPOCH)
-									.expect("Time went backwards")
-									.as_nanos();
-								let diff = since_the_epoch - (*conn_data).begin_request_time;
+								let start = Instant::now();
+								let since_start = start.duration_since(*START_TIME).as_nanos();
+								let diff = since_start - (*conn_data).begin_request_time;
 								(*conn_data).begin_request_time = 0;
 								diff
 							} else {

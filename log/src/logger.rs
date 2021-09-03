@@ -25,7 +25,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::Instant;
 
 pub const TRACE: i32 = 0;
 pub const DEBUG: i32 = 1;
@@ -38,6 +38,7 @@ lazy_static! {
 	/// This is the static holder of all log objects. Generally this
 	/// should not be called directly. See [`log`] instead.
 	pub static ref STATIC_LOG: Arc<Mutex<HashMap<String, Log>>> = Arc::new(Mutex::new(HashMap::new()));
+	static ref START_TIME: Instant = Instant::now();
 }
 
 /// Log at the 'fatal' (5) log level. This macro calls the default logger. To configure this
@@ -828,10 +829,7 @@ impl LogParams {
 				.open(&self.config.file_path)?,
 		);
 
-		let time_now = SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_millis();
+		let time_now = Instant::now().duration_since(*START_TIME).as_millis();
 
 		let mut file = self.file.as_ref().unwrap();
 		let line_bytes = self.config.file_header.as_bytes();
@@ -847,10 +845,7 @@ impl LogParams {
 
 	pub fn rotation_status(&mut self) -> Result<RotationStatus, Error> {
 		// get current time
-		let time_now = SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_millis();
+		let time_now = Instant::now().duration_since(*START_TIME).as_millis();
 		if self.file.is_some()
 			&& (self.cur_size >= self.config.max_size
 				|| time_now.saturating_sub(self.init_age_millis) > self.config.max_age_millis)
@@ -873,10 +868,7 @@ impl LogParams {
 			self.cur_size += 23;
 		}
 		// get current time
-		let time_now = SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_millis();
+		let time_now = Instant::now().duration_since(*START_TIME).as_millis();
 
 		// check if rotation is needed
 		if self.file.is_some()
@@ -971,10 +963,7 @@ impl Log {
 		};
 
 		// age is only relative to start logging time
-		let init_age_millis = SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.expect("Time went backwards")
-			.as_millis();
+		let init_age_millis = Instant::now().duration_since(*START_TIME).as_millis();
 		let file_path = match file_path {
 			Some(file_path) => Some(
 				canonicalize(PathBuf::from(file_path))?

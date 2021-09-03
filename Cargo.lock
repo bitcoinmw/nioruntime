@@ -593,6 +593,7 @@ dependencies = [
  "chrono",
  "dirs",
  "fsutils",
+ "lazy_static",
  "nioruntime_evh",
  "nioruntime_log",
  "nioruntime_util",
