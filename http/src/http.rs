@@ -253,8 +253,8 @@ pub struct ConnData {
 
 impl ConnData {
 	fn new(wh: WriteHandle, config: HttpConfig) -> Self {
-		let start = Instant::now();
-		let since_start = start.duration_since(*START_TIME);
+		let start_time = *START_TIME;
+		let since_start = Instant::now().duration_since(start_time);
 		ConnData {
 			buffer: vec![],
 			config,
@@ -1291,8 +1291,8 @@ impl HttpServer {
 					error
 				})?;
 
-				let now = Instant::now();
-				let since_start = now.duration_since(*START_TIME);
+				let start_time = *START_TIME;
+				let since_start = Instant::now().duration_since(start_time);
 				let time_now = since_start.as_millis();
 				let last_request_timeout = http_config.last_request_timeout;
 				let read_timeout = http_config.read_timeout;
@@ -1558,8 +1558,8 @@ impl HttpServer {
 			})?;
 			let conn_data_is_async = conn_data.is_async.clone();
 
-			let start = Instant::now();
-			let since_start = start.duration_since(*START_TIME);
+			let start_time = *START_TIME;
+			let since_start = Instant::now().duration_since(start_time);
 			conn_data.last_request_time = since_start.as_millis();
 
 			for i in 0..len {
@@ -1608,8 +1608,8 @@ impl HttpServer {
 		let mut log_vec = vec![];
 		if (*conn_data).begin_request_time != 0 {
 			// async request completing
-			let start = Instant::now();
-			let since_start = start.duration_since(*START_TIME).as_nanos();
+			let start_time = *START_TIME;
+			let since_start = Instant::now().duration_since(start_time).as_nanos();
 			let diff = since_start - (*conn_data).begin_request_time;
 			log_vec.push(RequestLogItem::new(
 				"".to_string(),
@@ -1836,8 +1836,8 @@ impl HttpServer {
 						}
 						.to_lowercase();
 
-						let start = Instant::now();
-						let since_start = start.duration_since(*START_TIME);
+						let start_time = *START_TIME;
+						let since_start = Instant::now().duration_since(start_time);
 						(*conn_data).begin_request_time = since_start.as_nanos();
 						if mappings.get(uri).is_some() || extensions.get(&extension).is_some() {
 							{
@@ -1866,8 +1866,9 @@ impl HttpServer {
 						let elapsed = {
 							let is_async = *nioruntime_util::lockr!(conn_data.is_async);
 							if !is_async {
-								let start = Instant::now();
-								let since_start = start.duration_since(*START_TIME).as_nanos();
+								let start_time = *START_TIME;
+								let since_start =
+									Instant::now().duration_since(start_time).as_nanos();
 								let diff = since_start - (*conn_data).begin_request_time;
 								(*conn_data).begin_request_time = 0;
 								diff

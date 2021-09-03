@@ -829,7 +829,8 @@ impl LogParams {
 				.open(&self.config.file_path)?,
 		);
 
-		let time_now = Instant::now().duration_since(*START_TIME).as_millis();
+		let start_time = *START_TIME;
+		let time_now = Instant::now().duration_since(start_time).as_millis();
 
 		let mut file = self.file.as_ref().unwrap();
 		let line_bytes = self.config.file_header.as_bytes();
@@ -845,7 +846,8 @@ impl LogParams {
 
 	pub fn rotation_status(&mut self) -> Result<RotationStatus, Error> {
 		// get current time
-		let time_now = Instant::now().duration_since(*START_TIME).as_millis();
+		let start_time = *START_TIME;
+		let time_now = Instant::now().duration_since(start_time).as_millis();
 		if self.file.is_some()
 			&& (self.cur_size >= self.config.max_size
 				|| time_now.saturating_sub(self.init_age_millis) > self.config.max_age_millis)
@@ -868,7 +870,8 @@ impl LogParams {
 			self.cur_size += 23;
 		}
 		// get current time
-		let time_now = Instant::now().duration_since(*START_TIME).as_millis();
+		let start_time = *START_TIME;
+		let time_now = Instant::now().duration_since(start_time).as_millis();
 
 		// check if rotation is needed
 		if self.file.is_some()
@@ -963,7 +966,9 @@ impl Log {
 		};
 
 		// age is only relative to start logging time
-		let init_age_millis = Instant::now().duration_since(*START_TIME).as_millis();
+		let start_time = *START_TIME;
+		let init_age_millis = Instant::now().duration_since(start_time).as_millis();
+
 		let file_path = match file_path {
 			Some(file_path) => Some(
 				canonicalize(PathBuf::from(file_path))?
