@@ -1476,13 +1476,17 @@ impl HttpServer {
 		let mut idledisc = false;
 		let mut rtimeout = false;
 		if conn_data.last_request_time != 0
+			&& time_now > conn_data.last_request_time // overflow case
 			&& time_now - conn_data.last_request_time > last_request_timeout
 		{
 			conn_data.wh.close()?;
 			idledisc = true;
 		}
 
-		if conn_data.last_request_time == 0 && time_now - conn_data.create_time > read_timeout {
+		if conn_data.last_request_time == 0
+			&& time_now > conn_data.create_time // overflow case
+			&& time_now - conn_data.create_time > read_timeout
+		{
 			conn_data.wh.close()?;
 			rtimeout = true;
 		}
