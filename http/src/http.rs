@@ -342,6 +342,7 @@ pub struct HttpContext {
 	api_mappings: HashSet<String>,
 	api_extensions: HashSet<String>,
 	log_queue: Vec<RequestLogItem>,
+	last_log_queue_overflow_message_time: u128,
 }
 
 impl HttpContext {
@@ -353,6 +354,7 @@ impl HttpContext {
 			api_mappings: HashSet::new(),
 			api_extensions: HashSet::new(),
 			log_queue: vec![],
+			last_log_queue_overflow_message_time: 0,
 		}
 	}
 }
@@ -1792,10 +1794,18 @@ impl HttpServer {
 					log_queue.push(item);
 				}
 			} else {
-				println!(
-					"WARNING: log queue overflow. More than config.max_log_queue={} items queued. Dropping item.",
-					http_config.max_log_queue,
-				);
+				let start_time = *START_TIME;
+				let since_start = Instant::now().duration_since(start_time).as_nanos();
+				let diff = since_start - http_context.last_log_queue_overflow_message_time;
+				// print this a maximm of once per 5 seconds
+				if diff > 5_000_000 {
+					println!(
+						"WARNING: log queue overflow. More than config.max_log_queue={} items queued. Dropping item(s).",
+						http_config.max_log_queue,
+					);
+					http_context.last_log_queue_overflow_message_time =
+						Instant::now().duration_since(start_time).as_nanos();
+				}
 			}
 		}
 
