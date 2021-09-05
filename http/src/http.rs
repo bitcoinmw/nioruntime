@@ -341,6 +341,7 @@ pub struct HttpContext {
 	stats: HttpStats,
 	api_mappings: HashSet<String>,
 	api_extensions: HashSet<String>,
+	log_queue: Vec<RequestLogItem>,
 }
 
 impl HttpContext {
@@ -351,6 +352,7 @@ impl HttpContext {
 			stats: HttpStats::new(),
 			api_mappings: HashSet::new(),
 			api_extensions: HashSet::new(),
+			log_queue: vec![],
 		}
 	}
 }
@@ -378,7 +380,6 @@ pub struct HttpServer {
 	pub config: HttpConfig,
 	listener: Option<TcpListener>,
 	pub http_context: Option<Arc<RwLock<HttpContext>>>,
-	log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 }
 
 impl HttpServer {
@@ -414,13 +415,10 @@ impl HttpServer {
 			}
 		}
 
-		let log_queue = Arc::new(RwLock::new(vec![]));
-
 		HttpServer {
 			config: cloned_config,
 			listener: None,
 			http_context: None,
-			log_queue,
 		}
 	}
 
@@ -497,8 +495,6 @@ impl HttpServer {
 	/// is printed to the mainlog file location.
 	pub fn start(&mut self) -> Result<(), Error> {
 		let addr = format!("{}:{}", self.config.host, self.config.port,);
-		let log_queue = self.log_queue.clone();
-		let log_queue_clone = log_queue.clone();
 
 		log_config_multi!(
 			MAIN_LOG,
@@ -634,14 +630,7 @@ impl HttpServer {
 		eh.set_on_panic(http_config.on_panic)?;
 
 		eh.set_on_read(move |buf, len, wh| {
-			Self::process_read(
-				http_context.clone(),
-				http_config.clone(),
-				buf,
-				len,
-				wh,
-				log_queue.clone(),
-			)
+			Self::process_read(http_context.clone(), http_config.clone(), buf, len, wh)
 		})?;
 		eh.set_on_accept(move |id, wh| {
 			Self::process_accept(
@@ -696,11 +685,7 @@ impl HttpServer {
 		});
 
 		std::thread::spawn(move || {
-			Self::request_log(
-				http_context_clone5,
-				http_config_clone3.clone(),
-				log_queue_clone,
-			)
+			Self::request_log(http_context_clone5, http_config_clone3.clone())
 		});
 
 		std::thread::spawn(move || {
@@ -1245,7 +1230,6 @@ impl HttpServer {
 	fn request_log(
 		http_context: Arc<RwLock<HttpContext>>,
 		http_config: HttpConfig,
-		log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 	) -> Result<(), Error> {
 		let mut log = Log::new();
 
@@ -1281,32 +1265,10 @@ impl HttpServer {
 		let mut to_log;
 		loop {
 			std::thread::sleep(std::time::Duration::from_millis(100));
-			{
-				let mut log_queue = nioruntime_util::lockw!(log_queue);
-				to_log = log_queue.clone();
-				(*log_queue).clear();
-			}
 			let stop = {
-				let mut http_context = http_context.write().map_err(|_e| {
-					let error: Error = ErrorKind::InternalError(
-						"unexpected error obtaining http_context lock".to_string(),
-					)
-					.into();
-					error
-				})?;
-
-				let log_count: u64 = to_log.len().try_into().unwrap_or(0);
-				http_context.stats.requests += log_count;
-				for item in &to_log {
-					if item.elapsed != 0 {
-						http_context.stats.lat_requests += 1;
-						http_context.stats.lat_sum += item.elapsed;
-						if item.elapsed > http_context.stats.max_lat {
-							http_context.stats.max_lat = item.elapsed;
-						}
-					}
-				}
-
+				let mut http_context = nioruntime_util::lockw!(http_context);
+				to_log = http_context.log_queue.clone();
+				(*http_context).log_queue.clear();
 				http_context.stop
 			};
 
@@ -1737,7 +1699,6 @@ impl HttpServer {
 		buf: &[u8],
 		len: usize,
 		wh: WriteHandle,
-		log_queue: Arc<RwLock<Vec<RequestLogItem>>>,
 	) -> Result<(), Error> {
 		let (conn_data, mappings, extensions) = {
 			let http_context = http_context.write().map_err(|e| {
@@ -1813,7 +1774,19 @@ impl HttpServer {
 		};
 
 		{
-			let mut log_queue = nioruntime_util::lockw!(log_queue);
+			let mut http_context = nioruntime_util::lockw!(http_context);
+			http_context.stats.requests += log_items.len().try_into().unwrap_or(0);
+			for item in &log_items {
+				if item.elapsed != 0 {
+					http_context.stats.lat_requests += 1;
+					http_context.stats.lat_sum += item.elapsed;
+					if item.elapsed > http_context.stats.max_lat {
+						http_context.stats.max_lat = item.elapsed;
+					}
+				}
+			}
+
+			let log_queue = &mut http_context.log_queue;
 			if log_queue.len() < http_config.max_log_queue {
 				for item in log_items {
 					log_queue.push(item);
