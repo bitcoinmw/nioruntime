@@ -1633,49 +1633,21 @@ where
 		guarded_data: Arc<RwLock<GuardedData>>,
 		filter_set: &mut HashSet<ConnectionHandle>,
 	) -> Result<(), Error> {
-		if **res > 0 {
-			for i in **counter..**res {
-				match output_events[i].etype {
-					GenericEventType::AddReadET | GenericEventType::AddReadLT => {
-						if output_events[i].fd == wakeup_fd {
-							// ignore wakeupfd here process in main loop.
-						} else {
-							let conn_info = connection_info_map.get(&output_events[i].fd);
-							match conn_info {
-								Some(conn_info) => {
-									let handle = conn_info.handle;
-									let connection_id = conn_info.connection_id;
-									match &conn_info.tls_conn {
-										Some(_tls_conn) => {
-											// for now tls not implemented
-											loop {
-												let mut buf = [0u8; BUFFER_SIZE];
-												let len = Self::do_read(
-													handle,
-													&mut buf,
-													global_lock.clone(),
-												)?;
-												if !Self::process_read_result(
-													selector,
-													handle,
-													listener_guarded_data.clone(),
-													guarded_data.clone(),
-													&buf,
-													len,
-													connection_id,
-													on_read.clone(),
-													on_client_read.clone(),
-													connection_id_map,
-													connection_info_map,
-													write_buffers,
-													global_lock.clone(),
-													filter_set,
-												)? {
-													break;
-												}
-											}
-										}
-										None => loop {
+		for i in **counter..**res {
+			match output_events[i].etype {
+				GenericEventType::AddReadET | GenericEventType::AddReadLT => {
+					if output_events[i].fd == wakeup_fd {
+						// ignore wakeupfd here process in main loop.
+					} else {
+						let conn_info = connection_info_map.get(&output_events[i].fd);
+						match conn_info {
+							Some(conn_info) => {
+								let handle = conn_info.handle;
+								let connection_id = conn_info.connection_id;
+								match &conn_info.tls_conn {
+									Some(_tls_conn) => {
+										// for now tls not implemented
+										loop {
 											let mut buf = [0u8; BUFFER_SIZE];
 											let len = Self::do_read(
 												handle,
@@ -1700,40 +1672,31 @@ where
 											)? {
 												break;
 											}
-										},
+										}
 									}
-								}
-								None => {
-									// looks to be spurious. connection already disconnected
-									log_multi!(
-										DEBUG,
-										MAIN_LOG,
-										"connection not found (add read): {}",
-										output_events[i].fd
-									);
-								}
-							}
-						}
-					}
-					GenericEventType::AddWriteET => {
-						let conn_info = connection_info_map.get(&output_events[i].fd);
-
-						match conn_info {
-							Some(conn_info) => {
-								match &conn_info.tls_conn {
-									Some(_tls_conn) => { // for now tls not implemented
-									}
-									None => Self::process_write_event(
-										selector,
-										&output_events[i],
-										conn_info.connection_id,
-										write_buffers,
-										global_lock.clone(),
-										connection_id_map,
-										connection_info_map,
-										listener_guarded_data.clone(),
-										filter_set,
-									)?,
+									None => loop {
+										let mut buf = [0u8; BUFFER_SIZE];
+										let len =
+											Self::do_read(handle, &mut buf, global_lock.clone())?;
+										if !Self::process_read_result(
+											selector,
+											handle,
+											listener_guarded_data.clone(),
+											guarded_data.clone(),
+											&buf,
+											len,
+											connection_id,
+											on_read.clone(),
+											on_client_read.clone(),
+											connection_id_map,
+											connection_info_map,
+											write_buffers,
+											global_lock.clone(),
+											filter_set,
+										)? {
+											break;
+										}
+									},
 								}
 							}
 							None => {
@@ -1741,15 +1704,47 @@ where
 								log_multi!(
 									DEBUG,
 									MAIN_LOG,
-									"connection not found (add write): {}",
+									"connection not found (add read): {}",
 									output_events[i].fd
 								);
 							}
 						}
-					} //_ => {}
+					}
 				}
-				**counter += 1;
+				GenericEventType::AddWriteET => {
+					let conn_info = connection_info_map.get(&output_events[i].fd);
+
+					match conn_info {
+						Some(conn_info) => {
+							match &conn_info.tls_conn {
+								Some(_tls_conn) => { // for now tls not implemented
+								}
+								None => Self::process_write_event(
+									selector,
+									&output_events[i],
+									conn_info.connection_id,
+									write_buffers,
+									global_lock.clone(),
+									connection_id_map,
+									connection_info_map,
+									listener_guarded_data.clone(),
+									filter_set,
+								)?,
+							}
+						}
+						None => {
+							// looks to be spurious. connection already disconnected
+							log_multi!(
+								DEBUG,
+								MAIN_LOG,
+								"connection not found (add write): {}",
+								output_events[i].fd
+							);
+						}
+					}
+				} //_ => {}
 			}
+			**counter += 1;
 		}
 		Ok(())
 	}
