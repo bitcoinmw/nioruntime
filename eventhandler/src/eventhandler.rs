@@ -1542,6 +1542,9 @@ where
 			&mut hash_set,
 		)?;
 
+		if *res != 0 {
+			input_events.clear();
+		}
 		output_events.clear();
 
 		let mut wakeup = false;
