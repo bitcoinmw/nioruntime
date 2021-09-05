@@ -233,6 +233,9 @@ pub struct HttpConfig {
 	pub on_housekeeper: Housekeeper,
 	/// The EventHandler Configuration
 	pub evh_config: EventHandlerConfig,
+	/// The maximum number of entries to allow in the log queue before dropping logging items.
+	/// The default value is 100,000.
+	pub max_log_queue: usize,
 	/// Whether or not to print debugging information to stdout.
 	pub debug: bool,
 }
@@ -266,6 +269,7 @@ impl Default for HttpConfig {
 			callback: empty_callback,
 			on_panic: empty_on_panic,
 			on_housekeeper: empty_housekeeper,
+			max_log_queue: 100_000,
 			debug: false,
 		}
 	}
@@ -1764,7 +1768,7 @@ impl HttpServer {
 
 			match Self::process_request(
 				conn_data_is_async,
-				http_config,
+				http_config.clone(),
 				&mut conn_data,
 				wh,
 				mappings,
@@ -1785,8 +1789,15 @@ impl HttpServer {
 
 		{
 			let mut log_queue = nioruntime_util::lockw!(log_queue);
-			for item in log_items {
-				log_queue.push(item);
+			if log_queue.len() < http_config.max_log_queue {
+				for item in log_items {
+					log_queue.push(item);
+				}
+			} else {
+				println!(
+					"WARNING: log queue overflow. More than config.max_log_queue={} items queued. Dropping item.",
+					http_config.max_log_queue,
+				);
 			}
 		}
 
