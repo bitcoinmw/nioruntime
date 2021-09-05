@@ -573,6 +573,12 @@ impl HttpServer {
 			"stats_frequency:      '{}'",
 			Self::format_time(self.config.stats_frequency.into())
 		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"max_log_queue:        '{}'",
+			self.config.max_log_queue.to_formatted_string(&Locale::en),
+		);
 		if self.config.debug {
 			log_multi!(WARN, MAIN_LOG, "WARNING! flag set:    'debug'");
 		}
