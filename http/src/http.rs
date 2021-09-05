@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use bytefmt;
+use chrono::prelude::*;
 use dirs;
 use lazy_static::lazy_static;
 pub use nioruntime_evh::{EventHandler, EventHandlerConfig, State, WriteHandle};
@@ -40,6 +41,35 @@ lazy_static! {
 	static ref START_TIME: Instant = Instant::now();
 }
 
+const SUN_BYTES: &[u8] = "Sun, ".as_bytes();
+const MON_BYTES: &[u8] = "Mon, ".as_bytes();
+const TUE_BYTES: &[u8] = "Tue, ".as_bytes();
+const WED_BYTES: &[u8] = "Wed, ".as_bytes();
+const THU_BYTES: &[u8] = "Thu, ".as_bytes();
+const FRI_BYTES: &[u8] = "Fri, ".as_bytes();
+const SAT_BYTES: &[u8] = "Sat, ".as_bytes();
+const JAN_BYTES: &[u8] = "Jan ".as_bytes();
+const FEB_BYTES: &[u8] = "Feb ".as_bytes();
+const MAR_BYTES: &[u8] = "Mar ".as_bytes();
+const APR_BYTES: &[u8] = "Apr ".as_bytes();
+const MAY_BYTES: &[u8] = "May ".as_bytes();
+const JUN_BYTES: &[u8] = "Jun ".as_bytes();
+const JUL_BYTES: &[u8] = "Jul ".as_bytes();
+const AUG_BYTES: &[u8] = "Aug ".as_bytes();
+const SEP_BYTES: &[u8] = "Sep ".as_bytes();
+const OCT_BYTES: &[u8] = "Oct ".as_bytes();
+const NOV_BYTES: &[u8] = "Nov ".as_bytes();
+const DEC_BYTES: &[u8] = "Dec ".as_bytes();
+const DATE_PRE: &[u8] = "Date: ".as_bytes();
+const DATE_POST: &[u8] = "GMT\r\n".as_bytes();
+const SERVER_PRE: &[u8] = "Server: ".as_bytes();
+const RESPONSE_404: &str = "<html><body>404 Page not found!</body></html>";
+const CHUNKED_ENCODING: &[u8] = "Transfer-Encoding: chunked\r\n".as_bytes();
+const NOT_FOUND_NO_CONTENT: &[u8] = "Content-Length: 45\r\n".as_bytes();
+const FOUND_NO_KEEP_ALIVE: &[u8] = "".as_bytes();
+const SEPARATOR_BYTES: &[u8] = "\r\n".as_bytes();
+const FOUND_BYTES: &[u8] = "HTTP/1.1 200 OK\r\n".as_bytes();
+const NOT_FOUND_BYTES: &[u8] = "HTTP/1.1 404 Not Found\r\n".as_bytes();
 const MAIN_LOG: &str = "mainlog";
 const STATS_LOG: &str = "statslog";
 const HEADER: &str =
@@ -213,7 +243,7 @@ impl Default for HttpConfig {
 			host: "0.0.0.0".to_string(),
 			port: 8080,
 			root_dir: "~/.niohttpd".to_string(),
-			server_name: "NIORuntime Httpd".to_string(),
+			server_name: format!("NIORuntime Httpd {}", VERSION),
 			request_log_params: vec![
 				"method".to_string(),
 				"uri".to_string(),
@@ -458,7 +488,7 @@ impl HttpServer {
 			}
 		)?;
 
-		log_multi!(INFO, MAIN_LOG, "{} {}", self.config.server_name, VERSION);
+		log_multi!(INFO, MAIN_LOG, "{}", self.config.server_name);
 		log_no_ts_multi!(INFO, MAIN_LOG, "{}", HEADER);
 		log_multi!(
 			INFO,
@@ -713,19 +743,129 @@ impl HttpServer {
 		wh: &WriteHandle,
 		config: &HttpConfig,
 		found: bool,
+		found_404_content: bool,
 		keep_alive: bool,
 		additional_headers: Vec<(String, String)>,
 		redirect: Option<String>,
 	) -> Result<(), Error> {
-		let response =
-			Self::build_headers(config, found, keep_alive, additional_headers, redirect)?;
-		let response = response.as_bytes();
-		wh.write(response)?;
-		if !found && !keep_alive {
+		let mut buf = vec![];
+		let mut size = 1000;
+		for i in 0..additional_headers.len() {
+			size += additional_headers[i].0.len() + additional_headers[i].1.len() + 10;
+		}
+		buf.resize(size, 0);
+		let len = Self::build_headers(
+			config,
+			found,
+			found_404_content,
+			keep_alive,
+			additional_headers,
+			redirect,
+			&mut buf,
+		)?;
+		wh.write(&buf[0..len])?;
+		if !found && !found_404_content && !keep_alive {
 			wh.close()?;
 		}
 
 		Ok(())
+	}
+
+	fn build_date(buf: &mut [u8], itt: usize) -> Result<usize, Error> {
+		let now = chrono::Utc::now();
+		let mut itt = Self::clone_in_bytes(DATE_PRE, buf, itt, DATE_PRE.len())?;
+		let day_of_week_bytes = match now.weekday() {
+			Weekday::Sun => SUN_BYTES,
+			Weekday::Mon => MON_BYTES,
+			Weekday::Tue => TUE_BYTES,
+			Weekday::Wed => WED_BYTES,
+			Weekday::Thu => THU_BYTES,
+			Weekday::Fri => FRI_BYTES,
+			Weekday::Sat => SAT_BYTES,
+		};
+		itt = Self::clone_in_bytes(day_of_week_bytes, buf, itt, day_of_week_bytes.len())?;
+		let day_of_month = now.day();
+		if day_of_month < 10 {
+			buf[itt] = '0' as u8;
+			itt += 1;
+			buf[itt] = day_of_month as u8 + '0' as u8;
+			itt += 1;
+		} else {
+			buf[itt] = '0' as u8 + (day_of_month / 10) as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + (day_of_month % 10) as u8;
+			itt += 1;
+		}
+		buf[itt] = ' ' as u8;
+		itt += 1;
+		let month = now.month();
+		let month_bytes = match month {
+			1 => JAN_BYTES,
+			2 => FEB_BYTES,
+			3 => MAR_BYTES,
+			4 => APR_BYTES,
+			5 => MAY_BYTES,
+			6 => JUN_BYTES,
+			7 => JUL_BYTES,
+			8 => AUG_BYTES,
+			9 => SEP_BYTES,
+			10 => OCT_BYTES,
+			11 => NOV_BYTES,
+			12 => DEC_BYTES,
+			_ => DEC_BYTES, // should not happen
+		};
+		itt = Self::clone_in_bytes(month_bytes, buf, itt, month_bytes.len())?;
+		itoa::write(&mut buf[itt..], now.year())?;
+		itt += 4;
+		buf[itt] = ' ' as u8;
+		itt += 1;
+		let hour = now.hour();
+		if hour < 10 {
+			buf[itt] = '0' as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + hour as u8;
+			itt += 1;
+		} else {
+			buf[itt] = '0' as u8 + (hour / 10) as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + (hour % 10) as u8;
+			itt += 1;
+		}
+		buf[itt] = ':' as u8;
+		itt += 1;
+
+		let minute = now.minute();
+		if minute < 10 {
+			buf[itt] = '0' as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + minute as u8;
+			itt += 1;
+		} else {
+			buf[itt] = '0' as u8 + (minute / 10) as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + (minute % 10) as u8;
+			itt += 1;
+		}
+		buf[itt] = ':' as u8;
+		itt += 1;
+
+		let second = now.second();
+		if second < 10 {
+			buf[itt] = '0' as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + second as u8;
+			itt += 1;
+		} else {
+			buf[itt] = '0' as u8 + (second / 10) as u8;
+			itt += 1;
+			buf[itt] = '0' as u8 + (second % 10) as u8;
+			itt += 1;
+		}
+		buf[itt] = ' ' as u8;
+		itt += 1;
+
+		itt = Self::clone_in_bytes(DATE_POST, buf, itt, DATE_POST.len())?;
+		Ok(itt)
 	}
 
 	/// Build (but do not write) headers based on specified parameters.
@@ -734,61 +874,103 @@ impl HttpServer {
 	/// * `keep-alive` - Whether or not to keep the connection alive after this response is sent.
 	/// * `additional_headers` - Additional headers to send with this response.
 	/// * `redirect` - Optional redirect for this request.
+	/// * `buf` - The buffer to write the response into. Note: the caller is responsible for
+	/// * ensuring the capacity of this buffer is sufficient.
 	pub fn build_headers(
 		config: &HttpConfig,
 		found: bool,
+		found_404_content: bool,
 		keep_alive: bool,
 		additional_headers: Vec<(String, String)>,
 		redirect: Option<String>,
-	) -> Result<String, Error> {
-		let response_404 = "<html><body>404 Page not found!</body></html>".to_string();
-		let now = chrono::Utc::now();
+		buf: &mut [u8],
+	) -> Result<usize, Error> {
+		let server_bytes = config.server_name.as_bytes();
 
-		let date = format!("Date: {}\r\n", now.format("%a, %d %h %Y %T GMT"));
-		let server = format!("Server: {} {}\r\n", config.server_name, VERSION);
-		let transfer_encoding = if found && keep_alive {
-			"Transfer-Encoding: chunked\r\n".to_string()
-		} else if !found {
-			format!("Content-Length: {}\r\n", response_404.len())
+		let transfer_encoding_bytes = if keep_alive {
+			CHUNKED_ENCODING
+		} else if !found && !found_404_content {
+			NOT_FOUND_NO_CONTENT
 		} else {
-			"".to_string()
+			FOUND_NO_KEEP_ALIVE
 		};
 
-		let not_found_message = if found {
-			"".to_string()
-		} else {
-			let response = response_404;
-			format!("{}\r\n", response)
-		};
-
-		let mut additional_headers_formatted = "".to_string();
-		for header in additional_headers {
-			additional_headers_formatted = format!(
-				"{}{}: {}\r\n",
-				additional_headers_formatted, header.0, header.1,
+		let mut itt = 0;
+		if redirect.is_some() {
+			let redir_str = format!(
+				"HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\n",
+				redirect.as_ref().unwrap_or(&"".to_string())
 			);
+			let redir_bytes = redir_str.as_bytes();
+			itt = Self::clone_in_bytes(redir_bytes, buf, itt, redir_bytes.len())?;
+		} else if found {
+			itt = Self::clone_in_bytes(FOUND_BYTES, buf, itt, FOUND_BYTES.len())?;
+		} else {
+			itt = Self::clone_in_bytes(NOT_FOUND_BYTES, buf, itt, NOT_FOUND_BYTES.len())?;
 		}
 
-		let redir_str = format!(
-			"HTTP/1.1 301 Moved Permanently\r\nLocation: {}\r\n",
-			redirect.as_ref().unwrap_or(&"".to_string())
-		);
+		itt = Self::build_date(buf, itt)?;
+		itt = if additional_headers.len() > 0 {
+			let mut additional_headers_formatted = String::new();
+			for header in additional_headers {
+				additional_headers_formatted = format!(
+					"{}{}: {}\r\n",
+					additional_headers_formatted, header.0, header.1,
+				);
+			}
+			let additional_headers_formatted_bytes = additional_headers_formatted.as_bytes();
+			Self::clone_in_bytes(
+				additional_headers_formatted_bytes,
+				buf,
+				itt,
+				additional_headers_formatted_bytes.len(),
+			)?
+		} else {
+			itt
+		};
+		itt = Self::clone_in_bytes(SERVER_PRE, buf, itt, SERVER_PRE.len())?;
+		itt = Self::clone_in_bytes(server_bytes, buf, itt, server_bytes.len())?;
+		itt = Self::clone_in_bytes(SEPARATOR_BYTES, buf, itt, SEPARATOR_BYTES.len())?;
+		itt = Self::clone_in_bytes(
+			transfer_encoding_bytes,
+			buf,
+			itt,
+			transfer_encoding_bytes.len(),
+		)?;
+		itt = Self::clone_in_bytes(SEPARATOR_BYTES, buf, itt, SEPARATOR_BYTES.len())?;
+		itt = if found || found_404_content {
+			itt
+		} else if keep_alive {
+			let not_found_message =
+				format!("{:X}\r\n{}\r\n0\r\n\r\n", RESPONSE_404.len(), RESPONSE_404);
+			let not_found_message_bytes = not_found_message.as_bytes();
+			Self::clone_in_bytes(
+				not_found_message_bytes,
+				buf,
+				itt,
+				not_found_message_bytes.len(),
+			)?
+		} else {
+			let not_found_message = format!("{}\r\n", RESPONSE_404);
+			let not_found_message_bytes = not_found_message.as_bytes();
+			Self::clone_in_bytes(
+				not_found_message_bytes,
+				buf,
+				itt,
+				not_found_message_bytes.len(),
+			)?
+		};
+		Ok(itt)
+	}
 
-		Ok(format!(
-			"{}{}{}{}{}\r\n{}",
-			if redirect.is_some() {
-				&redir_str
-			} else if found {
-				"HTTP/1.1 200 OK\r\n"
-			} else {
-				"HTTP/1.1 404 Not Found\r\n"
-			},
-			date,
-			server,
-			additional_headers_formatted,
-			transfer_encoding,
-			not_found_message,
-		))
+	fn clone_in_bytes(
+		src: &[u8],
+		dst: &mut [u8],
+		offset: usize,
+		len: usize,
+	) -> Result<usize, Error> {
+		dst[offset..offset + len].clone_from_slice(&src[0..len]);
+		Ok(offset + len)
 	}
 
 	fn create_file_from_bytes(
@@ -1408,6 +1590,7 @@ impl HttpServer {
 							&conn_data.wh,
 							&conn_data.config,
 							true,
+							true,
 							false,
 							vec![],
 							None,
@@ -1944,6 +2127,8 @@ impl HttpServer {
 		keep_alive: bool,
 	) -> Result<(), Error> {
 		let mut path = Self::get_path(config, uri)?;
+		let mut is_404 = false;
+		let mut found_404_content = true;
 		let mut flen = match metadata(path.clone()) {
 			Ok(md) => {
 				if md.is_dir() {
@@ -1951,6 +2136,7 @@ impl HttpServer {
 					match metadata(path.clone()) {
 						Ok(md) => md.len(),
 						Err(_) => {
+							is_404 = true;
 							path = format!("{}/www/404.html", config.root_dir);
 							match metadata(path.clone()) {
 								Ok(md) => md.len(),
@@ -1964,10 +2150,14 @@ impl HttpServer {
 			}
 			Err(_) => {
 				// try to return the 404 page.
+				is_404 = true;
 				path = format!("{}/www/404.html", config.root_dir);
 				match metadata(path.clone()) {
 					Ok(md) => md.len(),
-					Err(_) => 0,
+					Err(_) => {
+						found_404_content = false;
+						0
+					}
 				}
 			}
 		};
@@ -1989,7 +2179,15 @@ impl HttpServer {
 					match res {
 						Ok(amt) => {
 							if first_loop {
-								Self::write_headers(wh, config, true, keep_alive, vec![], None)?;
+								Self::write_headers(
+									wh,
+									config,
+									!is_404,
+									found_404_content,
+									keep_alive,
+									vec![],
+									None,
+								)?;
 							}
 							if keep_alive {
 								let msg_len_bytes = format!("{:X}\r\n", amt);
@@ -2018,7 +2216,15 @@ impl HttpServer {
 						}
 						Err(_) => {
 							// directory
-							Self::write_headers(wh, config, false, keep_alive, vec![], None)?;
+							Self::write_headers(
+								wh,
+								config,
+								false,
+								found_404_content,
+								keep_alive,
+								vec![],
+								None,
+							)?;
 							break;
 						}
 					}
@@ -2031,7 +2237,15 @@ impl HttpServer {
 			}
 			Err(_) => {
 				// file not found
-				Self::write_headers(wh, config, false, keep_alive, vec![], None)?;
+				Self::write_headers(
+					wh,
+					config,
+					false,
+					found_404_content,
+					keep_alive,
+					vec![],
+					None,
+				)?;
 			}
 		}
 
