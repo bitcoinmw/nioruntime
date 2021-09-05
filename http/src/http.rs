@@ -1797,7 +1797,7 @@ impl HttpServer {
 				let start_time = *START_TIME;
 				let since_start = Instant::now().duration_since(start_time).as_nanos();
 				let diff = since_start - http_context.last_log_queue_overflow_message_time;
-				// print this a maximm of once per 5 seconds
+				// print this a maximum of once per 5 seconds
 				if diff > 5_000_000 {
 					println!(
 						"WARNING: log queue overflow. More than config.max_log_queue={} items queued. Dropping item(s).",
