@@ -475,6 +475,22 @@ impl HttpServer {
 		Ok(())
 	}
 
+	fn check_config(&self) -> Result<(), Error> {
+		if self.config.stats_frequency < 1000 {
+			log_multi!(
+                        	INFO,
+                        	MAIN_LOG,
+                        	"Error: Invalid config. config.stats_frequency must be equal to or greater than 1,000 ms"
+                	);
+			Err(ErrorKind::SetupError(
+				"config.stats_frequency must be equal to or greater than 1,000 ms".to_string(),
+			)
+			.into())
+		} else {
+			Ok(())
+		}
+	}
+
 	/// Start the [`HttpServer`]. This function will print some startup parameters to the mainlog,
 	/// which is initially configured to print to both standard output and the mainlog log file
 	/// location. After the startup parameters are printed, the server has begun and logging only
@@ -491,6 +507,8 @@ impl HttpServer {
 				..Default::default()
 			}
 		)?;
+
+		self.check_config()?;
 
 		log_multi!(INFO, MAIN_LOG, "{}", self.config.server_name);
 		log_no_ts_multi!(INFO, MAIN_LOG, "{}", HEADER);
@@ -1138,7 +1156,8 @@ impl HttpServer {
 				log_no_ts_multi!(INFO, STATS_LOG, "{}", HEADER);
 			}
 
-			let qps = (http_context.stats.requests - last_requests) as f64 / 5 as f64;
+			let qps = (http_context.stats.requests - last_requests) as f64
+				/ (http_config.stats_frequency / 1000) as f64;
 			let avg_lat = if http_context.stats.lat_requests - last_lat_reqs == 0 {
 				0.0
 			} else {
