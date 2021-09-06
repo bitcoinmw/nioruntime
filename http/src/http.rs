@@ -73,7 +73,7 @@ const NOT_FOUND_BYTES: &[u8] = "HTTP/1.1 404 Not Found\r\n".as_bytes();
 const MAIN_LOG: &str = "mainlog";
 const STATS_LOG: &str = "statslog";
 const HEADER: &str =
-	"-----------------------------------------------------------------------------------------------------------------------------";
+	"-------------------------------------------------------------------------------------------------------------------------------";
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
