@@ -73,7 +73,7 @@ const NOT_FOUND_BYTES: &[u8] = "HTTP/1.1 404 Not Found\r\n".as_bytes();
 const MAIN_LOG: &str = "mainlog";
 const STATS_LOG: &str = "statslog";
 const HEADER: &str =
-	"-----------------------------------------------------------------------------------------------------------------------";
+	"-----------------------------------------------------------------------------------------------------------------------------";
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -1042,7 +1042,7 @@ impl HttpServer {
 	) -> Result<(), Error> {
 		let start = Instant::now();
 		let header_titles =
-"Statistical Log V_1.0:     REQUESTS       CONNS    CONNECTS         QPS   IDLE_DISC    RTIMEOUT     AVG_LAT     MAX_LAT"
+"Statistical Log V_1.0:         REQUESTS       CONNS        CONNECTS         QPS   IDLE_DISC    RTIMEOUT     AVG_LAT     MAX_LAT"
 .to_string();
 		let file_header = format!("{}\n{}", header_titles, HEADER);
 		log_config_multi!(
@@ -1129,11 +1129,11 @@ impl HttpServer {
 				log_no_ts_multi!(
 					INFO,
 					STATS_LOG,
-					"{}: {:12}{:12}{:12}   {}{:12}{:12}   {}   {}",
+					"{}: {:>16}{:>12}{:>16}   {}{:12}{:12}   {}   {}",
 					format_elapsed_time,
-					http_context.stats.requests,
-					http_context.stats.conns,
-					http_context.stats.connects,
+					http_context.stats.requests.to_formatted_string(&Locale::en),
+					http_context.stats.conns.to_formatted_string(&Locale::en),
+					http_context.stats.connects.to_formatted_string(&Locale::en),
 					Self::format_float(http_context.stats.requests as f64 / secs as f64),
 					http_context.stats.idledisc,
 					http_context.stats.rtimeout,
@@ -1152,13 +1152,14 @@ impl HttpServer {
 					/ ((http_context.stats.lat_requests - last_lat_reqs) * 1_000_000) as f64
 			};
 			let max_lat = http_context.stats.max_lat as f64 / 1_000_000 as f64;
+
 			log_multi!(
 				INFO,
 				STATS_LOG,
-				"{:12}{:12}{:12}   {}{:12}{:12}   {}   {}",
-				http_context.stats.requests - last_requests,
-				http_context.stats.conns,
-				http_context.stats.connects - last_connects,
+				"{:>16}{:>12}{:>16}   {}{:12}{:12}   {}   {}",
+				(http_context.stats.requests - last_requests).to_formatted_string(&Locale::en),
+				http_context.stats.conns.to_formatted_string(&Locale::en),
+				(http_context.stats.connects - last_connects).to_formatted_string(&Locale::en),
 				Self::format_float(qps),
 				http_context.stats.idledisc - last_idledisc,
 				http_context.stats.rtimeout - last_rtimeout,
