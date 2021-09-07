@@ -19,7 +19,7 @@ use std::time::Duration;
 
 mod eventhandler;
 
-pub use crate::eventhandler::{EventHandler, EventHandlerConfig, State, WriteHandle};
+pub use crate::eventhandler::{EventHandler, EventHandlerConfig, State, TlsConfig, WriteHandle};
 
 // Some needed timespec code
 
