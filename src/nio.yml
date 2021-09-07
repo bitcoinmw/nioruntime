@@ -47,3 +47,15 @@ args:
         short: d
         long: debug
         takes_value: false
+    - certs:
+        help: TLS certificate file location
+        short: e
+        long: certs
+        value_name: certs
+        takes_value: true
+    - private_key:
+        help: TLS private_key file location
+        short: p
+        long: private_key
+        value_name: pkey
+        takes_value: true

@@ -13,15 +13,18 @@
 // limitations under the License
 
 use errno::errno;
+use errno::Errno;
 use libc::{accept, c_int, c_void, EAGAIN};
 use nioruntime_log::*;
 use nioruntime_util::{Error, ErrorKind};
 use rand::Rng;
-use rustls::{ServerConfig, ServerConnection};
+use rustls::{Connection, ServerConfig, ServerConnection};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::LinkedList;
 use std::convert::TryInto;
+use std::io::Read;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::pin::Pin;
 use std::sync::mpsc::sync_channel;
@@ -89,6 +92,7 @@ pub struct WriteHandle {
 	guarded_data: Arc<RwLock<GuardedData>>,
 	global_lock: Arc<RwLock<bool>>,
 	pub callback_state: Arc<RwLock<State>>,
+	tls_conn: Option<Arc<RwLock<ServerConnection>>>,
 }
 
 impl WriteHandle {
@@ -97,6 +101,7 @@ impl WriteHandle {
 		guarded_data: Arc<RwLock<GuardedData>>,
 		connection_id: u128,
 		global_lock: Arc<RwLock<bool>>,
+		tls_conn: Option<Arc<RwLock<ServerConnection>>>,
 	) -> Self {
 		let callback_state = {
 			let guarded_data = guarded_data.write().unwrap();
@@ -108,6 +113,7 @@ impl WriteHandle {
 			connection_id,
 			global_lock,
 			callback_state,
+			tls_conn,
 		}
 	}
 
@@ -148,15 +154,25 @@ impl WriteHandle {
 		Ok(())
 	}
 
-	fn _nbwrite(&self, data: &[u8]) -> Result<usize, Error> {
-		let len = write_data(self.fd, data, &self.global_lock)?;
-		Ok(len.try_into().unwrap_or(0))
-	}
-
 	/// Write the specifed data to the connection associated with this write handle.
 	///
 	/// * `data` - The data to write to this connection.
 	pub fn write(&self, data: &[u8]) -> Result<(), Error> {
+		match &self.tls_conn {
+			Some(tls_conn) => {
+				let mut wbuf = vec![];
+				{
+					let mut tls_conn = nioruntime_util::lockw!(tls_conn);
+					tls_conn.writer().write_all(data)?;
+					tls_conn.write_tls(&mut wbuf)?;
+				}
+				self.do_write(&wbuf)
+			}
+			None => self.do_write(data),
+		}
+	}
+
+	fn do_write(&self, data: &[u8]) -> Result<(), Error> {
 		let len = data.len();
 		if len == 0 {
 			// nothing to write
@@ -391,6 +407,7 @@ where
 			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
 			global_lock: self.global_lock.clone(),
 			callback_state,
+			tls_conn: None,
 		})
 	}
 
@@ -1069,29 +1086,31 @@ where
 				let mut rng = rand::thread_rng();
 				let connection_id = rng.gen();
 
+				let tls_conn = if config.tls_config.is_some() {
+					let tls_config =
+						Arc::new(ServerConfig::clone(config.tls_config.as_ref().unwrap()));
+
+					match ServerConnection::new(tls_config) {
+						Ok(tls_conn) => Some(Arc::new(RwLock::new(tls_conn))),
+						Err(e) => {
+							error!("Error building tls_connection: {}", e.to_string());
+							None
+						}
+					}
+				} else {
+					None
+				};
+
 				let wh = WriteHandle::new(
 					res,
 					guarded_data[index].clone(),
 					connection_id,
 					global_lock.clone(),
+					tls_conn.clone(),
 				);
 				(on_accept)(connection_id, wh)?;
 				cid_map.insert(res, connection_id);
 				{
-					let tls_conn = if config.tls_config.is_some() {
-						let tls_config =
-							Arc::new(ServerConfig::clone(config.tls_config.as_ref().unwrap()));
-						match ServerConnection::new(tls_config) {
-							Ok(tls_conn) => Some(Arc::new(tls_conn)),
-							Err(e) => {
-								error!("Error building tls_connection: {}", e.to_string());
-								None
-							}
-						}
-					} else {
-						None
-					};
-
 					let mut guarded_data_next = nioruntime_util::lockw!(guarded_data_next);
 
 					guarded_data_next.nconns.push(ConnectionInfo {
@@ -1223,6 +1242,7 @@ where
 				guarded_data.clone(),
 				conn.connection_id,
 				global_lock.clone(),
+				conn.tls_conn,
 			);
 			(on_read)(&[0u8; 0], 0, wh)?;
 		}
@@ -1287,9 +1307,9 @@ where
 		} else {
 			let error = errno();
 			if errno().0 == EAGAIN {
+				errno::set_errno(Errno(0));
 				// break because we're edge triggered.
 				// a new event occurs.
-
 				return Ok((false, false, true));
 			} else {
 				// this is an actual write error.
@@ -1314,7 +1334,6 @@ where
 		let mut disconnect = false;
 		let list = write_buffers.get_mut(&connection_id);
 		let mut break_received = false;
-
 		match list {
 			Some(list) => loop {
 				if list.is_empty() || break_received {
@@ -1392,7 +1411,13 @@ where
 		if connection_info.is_some() {
 			let connection_info = connection_info.unwrap();
 			if len > 0 {
-				let wh = WriteHandle::new(fd, guarded_data, connection_id, global_lock);
+				let wh = WriteHandle::new(
+					fd,
+					guarded_data,
+					connection_id,
+					global_lock,
+					connection_info.tls_conn.clone(),
+				);
 				match connection_info.ctype {
 					ConnectionType::Inbound => (on_read)(buf, len.try_into().unwrap_or(0), wh)?,
 					ConnectionType::Outbound => {
@@ -1406,6 +1431,7 @@ where
 				let e = errno();
 				if len < 0 {
 					if e.0 == EAGAIN {
+						errno::set_errno(Errno(0));
 						do_close = false;
 					}
 				}
@@ -1651,16 +1677,25 @@ where
 							Some(conn_info) => {
 								let handle = conn_info.handle;
 								let connection_id = conn_info.connection_id;
-								match &conn_info.tls_conn {
-									Some(_tls_conn) => {
-										// for now tls not implemented
-										loop {
-											let mut buf = [0u8; BUFFER_SIZE];
-											let len = Self::do_read(
-												handle,
-												&mut buf,
-												global_lock.clone(),
-											)?;
+								match conn_info.tls_conn.clone() {
+									Some(mut tls_conn) => loop {
+										let mut buf = vec![];
+										buf.resize(BUFFER_SIZE * 4, 0u8);
+										let (raw_len, tls_len) = Self::do_tls_read(
+											handle,
+											connection_id,
+											guarded_data.clone(),
+											&mut buf,
+											global_lock.clone(),
+											&mut tls_conn,
+										)?;
+										if raw_len <= 0 || tls_len > 0 {
+											let len = if tls_len > 0 {
+												tls_len.try_into().unwrap_or(0)
+											} else {
+												raw_len
+											};
+
 											if !Self::process_read_result(
 												selector,
 												handle,
@@ -1680,7 +1715,7 @@ where
 												break;
 											}
 										}
-									}
+									},
 									None => loop {
 										let mut buf = [0u8; BUFFER_SIZE];
 										let len =
@@ -1723,21 +1758,17 @@ where
 
 					match conn_info {
 						Some(conn_info) => {
-							match &conn_info.tls_conn {
-								Some(_tls_conn) => { // for now tls not implemented
-								}
-								None => Self::process_write_event(
-									selector,
-									&output_events[i],
-									conn_info.connection_id,
-									write_buffers,
-									global_lock.clone(),
-									connection_id_map,
-									connection_info_map,
-									listener_guarded_data.clone(),
-									filter_set,
-								)?,
-							}
+							Self::process_write_event(
+								selector,
+								&output_events[i],
+								conn_info.connection_id,
+								write_buffers,
+								global_lock.clone(),
+								connection_id_map,
+								connection_info_map,
+								listener_guarded_data.clone(),
+								filter_set,
+							)?;
 						}
 						None => {
 							// looks to be spurious. connection already disconnected
@@ -1756,12 +1787,63 @@ where
 		Ok(())
 	}
 
-	fn _do_tls_read(
-		_handle: ConnectionHandle,
-		_buf: &mut [u8],
-		_global_lock: Arc<RwLock<bool>>,
-	) -> Result<isize, Error> {
-		Ok(0)
+	fn do_tls_read(
+		handle: ConnectionHandle,
+		connection_id: u128,
+		guarded_data: Arc<RwLock<GuardedData>>,
+		buf: &mut [u8],
+		global_lock: Arc<RwLock<bool>>,
+		tls_conn: &mut Arc<RwLock<ServerConnection>>,
+	) -> Result<(isize, usize), Error> {
+		let pt_len;
+		let len = Self::do_read(handle, buf, global_lock.clone())?;
+
+		let mut wbuf = vec![];
+		{
+			let mut tls_conn = nioruntime_util::lockw!(tls_conn);
+
+			tls_conn.read_tls(&mut &buf[0..len.try_into().unwrap_or(0)])?;
+
+			match tls_conn.process_new_packets() {
+				Ok(io_state) => {
+					pt_len = io_state.plaintext_bytes_to_read();
+					let mut buf2 = vec![];
+					buf2.resize(pt_len, 0u8);
+
+					tls_conn.reader().read_exact(&mut buf2)?;
+					if pt_len > 0 {
+						for i in 0..buf2.len() {
+							if i >= BUFFER_SIZE * 4 {
+								error!("too much data read from TLS connection");
+								break;
+							}
+							buf[i] = buf2[i];
+						}
+					}
+				}
+				Err(e) => {
+					warn!(
+						"error generated processing packets for handle={}. Error={}",
+						handle,
+						e.to_string()
+					);
+					return Ok((-1, 0)); // invalid text received. Close conn.
+				}
+			}
+
+			tls_conn.write_tls(&mut wbuf)?;
+		}
+
+		let wh = WriteHandle::new(
+			handle,
+			guarded_data.clone(),
+			connection_id,
+			global_lock.clone(),
+			None,
+		);
+		wh.write(&wbuf)?;
+
+		Ok((len, pt_len))
 	}
 
 	fn do_read(
@@ -2200,7 +2282,7 @@ struct ConnectionInfo {
 	connection_id: u128,
 	ctype: ConnectionType,
 	sender: Option<SyncSender<()>>,
-	tls_conn: Option<Arc<ServerConnection>>,
+	tls_conn: Option<Arc<RwLock<ServerConnection>>>,
 }
 
 struct GuardedData {
