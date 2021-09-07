@@ -505,7 +505,6 @@ impl HttpServer {
 			Some(tls_config) => format!("'{}'", tls_config.private_key_file.clone()),
 			None => "None".to_string(),
 		};
-		info!("evh_config={:?}", self.config.evh_config);
 
 		log_config_multi!(
 			MAIN_LOG,
