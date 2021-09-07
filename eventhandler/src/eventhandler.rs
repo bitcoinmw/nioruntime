@@ -256,8 +256,8 @@ impl WriteHandle {
 
 #[derive(Clone)]
 pub struct TlsConfig {
-	private_key_file: String,
-	certificates_file: String,
+	pub private_key_file: String,
+	pub certificates_file: String,
 }
 
 impl TlsConfig {
