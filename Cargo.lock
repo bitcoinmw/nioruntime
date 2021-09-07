@@ -588,6 +588,7 @@ dependencies = [
  "portpicker",
  "rand",
  "rustls",
+ "rustls-pemfile",
  "wepoll-sys",
  "winapi 0.2.8",
  "ws2_32-sys",

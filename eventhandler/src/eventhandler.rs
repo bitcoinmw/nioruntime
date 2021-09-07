@@ -23,6 +23,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::LinkedList;
 use std::convert::TryInto;
+use std::fs::File;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
@@ -70,6 +72,35 @@ const WINSOCK_BUF_SIZE: winapi::c_int = 100_000_000;
 type ConnectionHandle = i32;
 #[cfg(target_os = "windows")]
 type ConnectionHandle = u64;
+
+fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
+	let certfile = File::open(filename).expect("cannot open certificate file");
+	let mut reader = BufReader::new(certfile);
+	rustls_pemfile::certs(&mut reader)
+		.unwrap()
+		.iter()
+		.map(|v| rustls::Certificate(v.clone()))
+		.collect()
+}
+
+fn load_private_key(filename: &str) -> rustls::PrivateKey {
+	let keyfile = File::open(filename).expect("cannot open private key file");
+	let mut reader = BufReader::new(keyfile);
+
+	loop {
+		match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
+			Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
+			Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
+			None => break,
+			_ => {}
+		}
+	}
+
+	panic!(
+		"no keys found in {:?} (encrypted keys not supported)",
+		filename
+	);
+}
 
 #[derive(Eq, PartialEq, Debug)]
 pub enum State {
@@ -224,11 +255,26 @@ impl WriteHandle {
 }
 
 #[derive(Clone)]
+pub struct TlsConfig {
+	private_key_file: String,
+	certificates_file: String,
+}
+
+impl TlsConfig {
+	pub fn new(private_key_file: String, certificates_file: String) -> Self {
+		TlsConfig {
+			private_key_file,
+			certificates_file,
+		}
+	}
+}
+
+#[derive(Clone)]
 pub struct EventHandlerConfig {
 	pub thread_count: usize,
 	/// The optional TLS config. If not specified, the server will run in non-ssl
 	/// mode.
-	pub tls_config: Option<ServerConfig>,
+	pub tls_config: Option<TlsConfig>,
 }
 
 impl Default for EventHandlerConfig {
@@ -328,6 +374,7 @@ pub struct EventHandler<F, G, H, K> {
 	callbacks: Arc<RwLock<Callbacks<F, G, H, K>>>,
 	global_lock: Arc<RwLock<bool>>,
 	on_panic: Option<OnPanic>,
+	tls_server_config: Option<ServerConfig>,
 }
 
 impl<F, G, H, K> EventHandler<F, G, H, K>
@@ -629,12 +676,31 @@ where
 
 		let global_lock = Arc::new(RwLock::new(true));
 
+		let tls_server_config = if config.tls_config.is_some() {
+			let tls_config = config.tls_config.as_ref().unwrap();
+			match ServerConfig::builder()
+				.with_safe_defaults()
+				.with_no_client_auth()
+				.with_single_cert(
+					load_certs(&tls_config.certificates_file),
+					load_private_key(&tls_config.private_key_file),
+				) {
+				Ok(tls_server_config) => Some(tls_server_config),
+				Err(e) => {
+					panic!("Error loading tls configurations: {}", e.to_string());
+				}
+			}
+		} else {
+			None
+		};
+
 		EventHandler {
 			config,
 			guarded_data,
 			callbacks,
 			global_lock,
 			on_panic: None,
+			tls_server_config,
 		}
 	}
 
@@ -801,7 +867,6 @@ where
 	fn start_generic(&mut self, selectors: Vec<SelectorHandle>) -> Result<(), Error> {
 		self.ensure_handlers()?;
 
-		let config = self.config.clone();
 		let on_panic = self.on_panic.clone();
 		let global_lock = &self.global_lock;
 		let global_lock_clone = global_lock.clone();
@@ -815,6 +880,7 @@ where
 
 		let on_accept = callbacks.on_accept.as_ref().unwrap().clone();
 		let on_close = callbacks.on_close.as_ref().unwrap().clone();
+		let tls_server_config = self.tls_server_config.clone();
 		spawn(move || {
 			match Self::listener(
 				selectors_clone[0],
@@ -823,7 +889,7 @@ where
 				on_accept.clone(),
 				on_close.clone(),
 				global_lock_clone.clone(),
-				&config,
+				tls_server_config,
 			) {
 				Ok(_) => {}
 				Err(e) => {
@@ -1016,7 +1082,7 @@ where
 		global_lock: Arc<RwLock<bool>>,
 		wakeup_fd: ConnectionHandle,
 		cid_map: &mut HashMap<ConnectionHandle, u128>,
-		config: &EventHandlerConfig,
+		tls_server_config: Option<ServerConfig>,
 	) -> Result<(), Error> {
 		for i in 0..count {
 			let event = &events[i];
@@ -1098,19 +1164,21 @@ where
 				let mut rng = rand::thread_rng();
 				let connection_id = rng.gen();
 
-				let tls_conn = if config.tls_config.is_some() {
-					let tls_config =
-						Arc::new(ServerConfig::clone(config.tls_config.as_ref().unwrap()));
+				let tls_conn = match tls_server_config.clone() {
+					Some(tls_server_config) => {
+						//let tls_config =
+						//	Arc::new(ServerConfig::clone(config.tls_config.as_ref().unwrap()));
+						let tls_config = Arc::new(tls_server_config);
 
-					match ServerConnection::new(tls_config) {
-						Ok(tls_conn) => Some(Arc::new(RwLock::new(tls_conn))),
-						Err(e) => {
-							error!("Error building tls_connection: {}", e.to_string());
-							None
+						match ServerConnection::new(tls_config) {
+							Ok(tls_conn) => Some(Arc::new(RwLock::new(tls_conn))),
+							Err(e) => {
+								error!("Error building tls_connection: {}", e.to_string());
+								None
+							}
 						}
 					}
-				} else {
-					None
+					None => None,
 				};
 
 				let wh = WriteHandle::new(
@@ -1147,7 +1215,7 @@ where
 		on_accept: Pin<Box<G>>,
 		on_close: Pin<Box<H>>,
 		global_lock: Arc<RwLock<bool>>,
-		config: &EventHandlerConfig,
+		tls_server_config: Option<ServerConfig>,
 	) -> Result<(), Error> {
 		let mut cid_map = HashMap::new();
 		let mut hash_set = HashSet::new();
@@ -1221,7 +1289,7 @@ where
 				global_lock.clone(),
 				wakeup_fd,
 				&mut cid_map,
-				config,
+				tls_server_config.clone(),
 			)?;
 		}
 		Ok(())
