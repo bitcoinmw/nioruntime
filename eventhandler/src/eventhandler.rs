@@ -254,7 +254,7 @@ impl WriteHandle {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsConfig {
 	/// The location of the private_key file (privkey.pem).
 	pub private_key_file: String,
@@ -271,7 +271,7 @@ impl TlsConfig {
 	}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct EventHandlerConfig {
 	/// Number of threads for handling read/write operations. The default value is 6.
 	pub thread_count: usize,

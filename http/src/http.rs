@@ -497,6 +497,15 @@ impl HttpServer {
 	/// is printed to the mainlog file location.
 	pub fn start(&mut self) -> Result<(), Error> {
 		let addr = format!("{}:{}", self.config.host, self.config.port,);
+		let certificates_file = match self.config.evh_config.tls_config.as_ref() {
+			Some(tls_config) => format!("'{}'", tls_config.certificates_file.clone()),
+			None => "None".to_string(),
+		};
+		let private_key_file = match self.config.evh_config.tls_config.as_ref() {
+			Some(tls_config) => format!("'{}'", tls_config.private_key_file.clone()),
+			None => "None".to_string(),
+		};
+		info!("evh_config={:?}", self.config.evh_config);
 
 		log_config_multi!(
 			MAIN_LOG,
@@ -522,11 +531,11 @@ impl HttpServer {
 			"webroot:              '{}/www'",
 			self.config.root_dir
 		);
-		log_multi!(INFO, MAIN_LOG, "bind_address:         '{}'", addr);
+		log_multi!(INFO, MAIN_LOG, "bind_address:         {}", addr);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"thread_pool_size:     '{}'",
+			"thread_pool_size:     {}",
 			self.config.evh_config.thread_count,
 		);
 		log_multi!(
@@ -538,13 +547,13 @@ impl HttpServer {
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"request_log_max_size: '{}'",
+			"request_log_max_size: {}",
 			Self::format_bytes(self.config.request_log_max_size)
 		);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"request_log_max_age:  '{}'",
+			"request_log_max_age:  {}",
 			Self::format_time(self.config.request_log_max_age_millis)
 		);
 		log_multi!(
@@ -556,13 +565,13 @@ impl HttpServer {
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"mainlog_max_size:     '{}'",
+			"mainlog_max_size:     {}",
 			Self::format_bytes(self.config.main_log_max_size)
 		);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"mainlog_max_age:      '{}'",
+			"mainlog_max_age:      {}",
 			Self::format_time(self.config.main_log_max_age_millis)
 		);
 		log_multi!(
@@ -574,27 +583,35 @@ impl HttpServer {
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"stats_log_max_size:   '{}'",
+			"stats_log_max_size:   {}",
 			Self::format_bytes(self.config.stats_log_max_size)
 		);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"stats_log_max_age:    '{}'",
+			"stats_log_max_age:    {}",
 			Self::format_time(self.config.stats_log_max_age_millis)
 		);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"stats_frequency:      '{}'",
+			"stats_frequency:      {}",
 			Self::format_time(self.config.stats_frequency.into())
 		);
 		log_multi!(
 			INFO,
 			MAIN_LOG,
-			"max_log_queue:        '{}'",
+			"max_log_queue:        {}",
 			self.config.max_log_queue.to_formatted_string(&Locale::en),
 		);
+		log_multi!(
+			INFO,
+			MAIN_LOG,
+			"tls_cert_file:        {}",
+			certificates_file,
+		);
+		log_multi!(INFO, MAIN_LOG, "tls_private_key_file: {}", private_key_file,);
+
 		if self.config.debug {
 			log_multi!(WARN, MAIN_LOG, "WARNING! flag set:    'debug'");
 		}
