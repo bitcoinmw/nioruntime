@@ -256,7 +256,9 @@ impl WriteHandle {
 
 #[derive(Clone)]
 pub struct TlsConfig {
+	/// The location of the private_key file (privkey.pem).
 	pub private_key_file: String,
+	/// The location of the certificates file (fullchain.pem).
 	pub certificates_file: String,
 }
 
