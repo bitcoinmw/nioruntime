@@ -271,6 +271,7 @@ impl TlsConfig {
 
 #[derive(Clone)]
 pub struct EventHandlerConfig {
+	/// Number of threads for handling read/write operations. The default value is 6.
 	pub thread_count: usize,
 	/// The optional TLS config. If not specified, the server will run in non-ssl
 	/// mode.

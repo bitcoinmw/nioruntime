@@ -231,7 +231,7 @@ pub struct HttpConfig {
 	pub on_panic: OnPanic,
 	/// The handler that is called every second by the Housekeeper thread.
 	pub on_housekeeper: Housekeeper,
-	/// The EventHandler Configuration
+	/// The EventHandler Configuration.
 	pub evh_config: EventHandlerConfig,
 	/// The maximum number of entries to allow in the log queue before dropping logging items.
 	/// The default value is 100,000.
