@@ -1692,7 +1692,6 @@ where
 								match conn_info.tls_conn.clone() {
 									Some(mut tls_conn) => loop {
 										let mut buf = vec![];
-										buf.resize(BUFFER_SIZE * 4, 0u8);
 										let (raw_len, tls_len) = Self::do_tls_read(
 											handle,
 											connection_id,
@@ -1803,11 +1802,12 @@ where
 		handle: ConnectionHandle,
 		connection_id: u128,
 		guarded_data: Arc<RwLock<GuardedData>>,
-		buf: &mut [u8],
+		buf: &mut Vec<u8>,
 		global_lock: Arc<RwLock<bool>>,
 		tls_conn: &mut Arc<RwLock<ServerConnection>>,
 	) -> Result<(isize, usize), Error> {
 		let pt_len;
+		buf.resize(BUFFER_SIZE, 0u8);
 		let len = Self::do_read(handle, buf, global_lock.clone())?;
 
 		let mut wbuf = vec![];
@@ -1819,19 +1819,8 @@ where
 			match tls_conn.process_new_packets() {
 				Ok(io_state) => {
 					pt_len = io_state.plaintext_bytes_to_read();
-					let mut buf2 = vec![];
-					buf2.resize(pt_len, 0u8);
-
-					tls_conn.reader().read_exact(&mut buf2)?;
-					if pt_len > 0 {
-						for i in 0..buf2.len() {
-							if i >= BUFFER_SIZE * 4 {
-								error!("too much data read from TLS connection");
-								break;
-							}
-							buf[i] = buf2[i];
-						}
-					}
+					buf.resize(pt_len, 0u8);
+					tls_conn.reader().read_exact(buf)?;
 				}
 				Err(e) => {
 					warn!(
