@@ -61,6 +61,7 @@ debug!();
 
 const MAIN_LOG: &str = "mainlog";
 const BUFFER_SIZE: usize = 1024;
+const TLS_CHUNKS: usize = 32768;
 const MAX_EVENTS: i32 = 100;
 #[cfg(target_os = "windows")]
 const WINSOCK_BUF_SIZE: winapi::c_int = 100_000_000;
@@ -163,8 +164,19 @@ impl WriteHandle {
 				let mut wbuf = vec![];
 				{
 					let mut tls_conn = nioruntime_util::lockw!(tls_conn);
-					tls_conn.writer().write_all(data)?;
-					tls_conn.write_tls(&mut wbuf)?;
+					let mut start = 0;
+					loop {
+						let mut end = data.len();
+						if end - start > TLS_CHUNKS {
+							end = start + TLS_CHUNKS;
+						}
+						tls_conn.writer().write_all(&data[start..end])?;
+						tls_conn.write_tls(&mut wbuf)?;
+						if end == data.len() {
+							break;
+						}
+						start += TLS_CHUNKS;
+					}
 				}
 				self.do_write(&wbuf)
 			}
@@ -1830,7 +1842,6 @@ where
 					return Ok((-1, 0)); // invalid text received. Close conn.
 				}
 			}
-
 			tls_conn.write_tls(&mut wbuf)?;
 		}
 
