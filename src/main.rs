@@ -28,12 +28,14 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
 use errno::errno;
+use native_tls::TlsConnector;
 use nioruntime_evh::EventHandler;
 use nioruntime_evh::EventHandlerConfig;
+use nioruntime_evh::TlsConfig;
 use nioruntime_http::HttpConfig;
 use nioruntime_http::HttpServer;
 use nioruntime_log::*;
-use nioruntime_util::Error;
+use nioruntime_util::{Error, ErrorKind};
 use rand::Rng;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -80,17 +82,52 @@ fn client_thread(
 	tlat_max: Arc<Mutex<u128>>,
 	min: u32,
 	max: u32,
+	tls: bool,
 ) -> Result<(), Error> {
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
-	let (mut stream, fd) = {
+	let (mut stream, mut tls_stream, fd) = {
 		let _lock = tlat_sum.lock();
-		let stream = TcpStream::connect("127.0.0.1:9999")?;
+		let (mut stream, mut tls_stream) = if tls {
+			let connector = TlsConnector::builder()
+				.danger_accept_invalid_hostnames(true)
+				.build()
+				.unwrap();
+			(
+				None,
+				Some(
+					connector
+						.connect("example.com", TcpStream::connect("127.0.0.1:9999")?)
+						.unwrap(),
+				),
+			)
+		} else {
+			(Some(TcpStream::connect("127.0.0.1:9999")?), None)
+		};
+
+		let fd;
 		#[cfg(unix)]
-		let fd = stream.as_raw_fd();
+		match stream {
+			Some(ref mut stream) => {
+				fd = stream.as_raw_fd();
+			}
+			None => {
+				let tls_stream = tls_stream.as_mut().unwrap();
+				fd = tls_stream.get_ref().as_raw_fd();
+			}
+		}
 		#[cfg(target_os = "windows")]
-		let fd = stream.as_raw_socket();
-		(stream, fd)
+		match stream {
+			Some(stream) => {
+				fd = stream.as_raw_socket();
+			}
+			None => {
+				let tls_stream = tls_stream.unwrap();
+				fd = tls_stream.as_raw_socket();
+			}
+		}
+
+		(stream, tls_stream, fd)
 	};
 	let buf = &mut [0u8; MAX_BUF];
 	let buf2 = &mut [0u8; MAX_BUF];
@@ -111,7 +148,13 @@ fn client_thread(
 		for i in 0..num {
 			buf[i as usize + 5] = ((i + offt) % 128) as u8;
 		}
-		let res = stream.write(&buf[0..(num as usize + 5)]);
+		let res = match stream {
+			Some(ref mut stream) => stream.write(&buf[0..(num as usize + 5)]),
+			None => {
+				let stream = tls_stream.as_mut().unwrap();
+				stream.write(&buf[0..(num as usize + 5)])
+			}
+		};
 
 		match res {
 			Ok(_x) => {}
@@ -123,7 +166,14 @@ fn client_thread(
 
 		let mut len_sum = 0;
 		loop {
-			let res = stream.read(&mut buf2[len_sum..]);
+			let res = match stream {
+				Some(ref mut stream) => stream.read(&mut buf2[len_sum..]),
+				None => {
+					let stream = tls_stream.as_mut().unwrap();
+					stream.read(&mut buf2[len_sum..])
+				}
+			};
+
 			match res {
 				Ok(_) => {}
 				Err(ref e) => {
@@ -140,7 +190,14 @@ fn client_thread(
 
 		if num == 99990 {
 			// we expect a close here. Try one more read
-			let len = stream.read(&mut buf2[0..])?;
+			let len = match stream {
+				Some(ref mut stream) => stream.read(&mut buf2[0..])?,
+				None => {
+					let stream = tls_stream.as_mut().unwrap();
+					stream.read(&mut buf2[0..])?
+				}
+			};
+
 			// len should be 0
 			assert_eq!(len, 0);
 			// not that only a single request is currently supported in this mode.
@@ -210,6 +267,24 @@ fn real_main() -> Result<(), Error> {
 	let max = args.is_present("max");
 	let min = args.is_present("min");
 	let http = args.is_present("http");
+	let certs = args.is_present("certs");
+	let private_key = args.is_present("private_key");
+	let tls = args.is_present("tls");
+
+	if (certs && !private_key) || (!certs && private_key) {
+		return Err(ErrorKind::SetupError(
+			"either both or neither certs or private_key must be specified".to_string(),
+		)
+		.into());
+	}
+
+	let tls_config = match certs {
+		true => Some(TlsConfig {
+			certificates_file: args.value_of("certs").unwrap().to_string(),
+			private_key_file: args.value_of("private_key").unwrap().to_string(),
+		}),
+		false => None,
+	};
 
 	let threads = match threads {
 		true => args.value_of("threads").unwrap().parse().unwrap(),
@@ -239,6 +314,10 @@ fn real_main() -> Result<(), Error> {
 	if http {
 		let config = HttpConfig {
 			debug: false,
+			evh_config: EventHandlerConfig {
+				tls_config,
+				..Default::default()
+			},
 			..Default::default()
 		};
 		let mut http_server: HttpServer = HttpServer::new(config);
@@ -268,7 +347,7 @@ fn real_main() -> Result<(), Error> {
 				let tlat_max = tlat_max.clone();
 				jhs.push(std::thread::spawn(move || {
 					let res =
-						client_thread(count, id, tlat_sum.clone(), tlat_max.clone(), min, max);
+						client_thread(count, id, tlat_sum.clone(), tlat_max.clone(), min, max, tls);
 					match res {
 						Ok(_) => {}
 						Err(e) => {
@@ -303,7 +382,7 @@ fn real_main() -> Result<(), Error> {
 		info!("Listener Started");
 		let mut eh = EventHandler::new(EventHandlerConfig {
 			thread_count: 6,
-			tls_config: None,
+			tls_config,
 		});
 
 		let buffers: Arc<Mutex<HashMap<u128, Arc<Mutex<Buffer>>>>> =

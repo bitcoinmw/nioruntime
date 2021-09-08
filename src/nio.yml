@@ -59,3 +59,8 @@ args:
         long: private_key
         value_name: pkey
         takes_value: true
+    - tls:
+        help: Whether to use tls mode for the client
+        short: l
+        long: tls
+        takes_value: false
