@@ -1,0 +1,23 @@
+[package]
+name = "nioruntime_err"
+version = "0.0.1"
+authors = ["BMW Developers"]
+description = "error for nioruntime"
+license = "Apache-2.0"
+repository = "https://github.com/bitcoinmw/nioruntime"
+keywords = [ "crypto", "nioruntime", "mimblewimble" ]
+exclude = ["**/*.nio"]
+edition = "2018"
+
+[dependencies]
+
+failure = "0.1"
+failure_derive = "0.1"
+futures = "0.3.0"
+lazy_static = "1.4.0"
+nix = "0.22.0"
+chrono = "0.4"
+rand = "0.8.4"
+serde = { version = "1.0", features = ["derive"] }
+byteorder = "1"
+bytes = "0.5"
