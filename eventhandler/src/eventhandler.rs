@@ -73,6 +73,30 @@ type ConnectionHandle = i32;
 #[cfg(target_os = "windows")]
 type ConnectionHandle = u64;
 
+/// Internal macro used to log to the main log. Applications should use the default logger (or another
+/// user specified logger). See [`nioruntime_log`] for details on logging.
+#[macro_export]
+macro_rules! mainlogerror {
+        ($a:expr) => {{
+                const MAIN_LOG: &str = "mainlog";
+                nioruntime_log::log_multi!(
+                        nioruntime_log::ERROR,
+                        MAIN_LOG,
+                        $a,
+                );
+        }};
+        ($a:expr,$($b:tt)*)=>{{
+                const MAIN_LOG: &str = "mainlog";
+                nioruntime_log::log_multi!(
+                        nioruntime_log::ERROR,
+                        MAIN_LOG,
+                        $a,
+                        $($b)*
+                );
+        }};
+
+}
+
 fn load_certs(filename: &str) -> Vec<rustls::Certificate> {
 	let certfile = File::open(filename).expect("cannot open certificate file");
 	let mut reader = BufReader::new(certfile);
@@ -744,7 +768,7 @@ where
 					_pipe_listener = Some(listener);
 				}
 				Err(e) => {
-					info!("Error creating socket_pipe on windows, {}", e.to_string());
+					mainlogerror!("Error creating socket_pipe on windows, {}", e.to_string());
 				}
 			}
 		}
@@ -1067,7 +1091,7 @@ where
 				let res = unsafe { ws2_32::closesocket(fd) };
 				if res != 0 {
 					let e = errno();
-					info!("error closing socket: {}", e.to_string());
+					mainlogerror!("error closing socket: {}", e.to_string());
 					return Err(ErrorKind::InternalError("Already closed".to_string()).into());
 				}
 			}
@@ -1141,7 +1165,7 @@ where
 					let ioctl_res = unsafe { ws2_32::ioctlsocket(res, fionbio as c_int, &mut 1) };
 
 					if ioctl_res != 0 {
-						info!("complete fion with error: {}", errno().to_string());
+						mainlogerror!("complete fion with error: {}", errno().to_string());
 					}
 
 					let sockoptres = unsafe {
@@ -1155,7 +1179,7 @@ where
 					};
 
 					if sockoptres != 0 {
-						info!("setsockopt resulted in error: {}", errno().to_string());
+						mainlogerror!("setsockopt resulted in error: {}", errno().to_string());
 					}
 				}
 				let index = *next_index % guarded_data.len();
@@ -1176,7 +1200,7 @@ where
 						match ServerConnection::new(tls_config) {
 							Ok(tls_conn) => Some(Arc::new(RwLock::new(tls_conn))),
 							Err(e) => {
-								error!("Error building tls_connection: {}", e.to_string());
+								mainlogerror!("Error building tls_connection: {}", e.to_string());
 								None
 							}
 						}
@@ -1397,7 +1421,7 @@ where
 			} else {
 				// this is an actual write error.
 				// close the connection.
-				info!("write error: {}", error.to_string());
+				mainlogerror!("write error: {}", error.to_string());
 				return Ok((true, true, true));
 			}
 		}
@@ -1541,9 +1565,11 @@ where
 			}
 		} else {
 			if len > 0 {
-				error!(
+				mainlogerror!(
 					"error reading {} bytes on unknown fd = {}, cid={}",
-					len, fd, connection_id
+					len,
+					fd,
+					connection_id
 				);
 			}
 			Ok(false)
@@ -1894,7 +1920,9 @@ where
 					tls_conn.reader().read_exact(buf)?;
 				}
 				Err(e) => {
-					warn!(
+					log_multi!(
+						WARN,
+						MAIN_LOG,
 						"error generated processing packets for handle={}. Error={}",
 						handle,
 						e.to_string()
@@ -1963,7 +1991,7 @@ where
 		);
 		match res {
 			Ok(_) => {}
-			Err(e) => info!("Error epoll_ctl4: {}, fd={}, delete", e, connection_handle),
+			Err(e) => mainlogerror!("Error epoll_ctl4: {}, fd={}, delete", e, connection_handle),
 		}
 
 		Ok(())
@@ -1996,7 +2024,7 @@ where
 		};
 
 		if ret_count < 0 {
-			info!(
+			mainlogerror!(
 				"Error in kevent (remove handle): kevs={:?}, error={}",
 				kevs,
 				errno()
@@ -2068,7 +2096,7 @@ where
 				};
 				if res != 0 {
 					filter_set.remove(&evt.fd);
-					info!(
+					mainlogerror!(
 						"epoll_ctl (write) resulted in an unexpected error: {}, fd={}, op={}, epoll_ctl_add={}",
 						errno().to_string(), evt.fd, op, EPOLL_CTL_ADD,
 					);
@@ -2093,7 +2121,7 @@ where
 				};
 
 				if res != 0 {
-					info!(
+					mainlogerror!(
 						"epoll_ctl (del) resulted in unexpected error: {}",
 						errno().to_string(),
 					);
@@ -2144,7 +2172,7 @@ where
 					};
 
 					if res != 0 {
-						info!(
+						mainlogerror!(
 							"Unexpected error with EPOLLHUP. res = {}, err={}",
 							res,
 							errno().to_string(),
@@ -2185,7 +2213,7 @@ where
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
-					Err(e) => info!("Error epoll_ctl1: {}, fd={}, op={:?}", e, fd, op),
+					Err(e) => mainlogerror!("Error epoll_ctl1: {}, fd={}, op={:?}", e, fd, op),
 				}
 			} else if evt.etype == GenericEventType::AddReadET {
 				let fd = evt.fd;
@@ -2204,7 +2232,7 @@ where
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
-					Err(e) => info!("Error epoll_ctl2: {}, fd={}, op={:?}", e, fd, op),
+					Err(e) => mainlogerror!("Error epoll_ctl2: {}, fd={}, op={:?}", e, fd, op),
 				}
 			} else if evt.etype == GenericEventType::AddWriteET {
 				let fd = evt.fd;
@@ -2224,7 +2252,7 @@ where
 				let res = epoll_ctl(epollfd, op, evt.fd, &mut event);
 				match res {
 					Ok(_) => {}
-					Err(e) => info!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
+					Err(e) => mainlogerror!("Error epoll_ctl3: {}, fd={}, op={:?}", e, fd, op),
 				}
 			} else {
 				return Err(
@@ -2268,7 +2296,7 @@ where
 				}
 			}
 			Err(e) => {
-				info!("Error with epoll wait = {}", e.to_string());
+				mainlogerror!("Error with epoll wait = {}", e.to_string());
 			}
 		}
 		Ok(ret_count_adjusted)
@@ -2312,7 +2340,7 @@ where
 		};
 
 		if ret_count < 0 {
-			info!("Error in kevent: kevs={:?}, error={}", kevs, errno());
+			mainlogerror!("Error in kevent: kevs={:?}, error={}", kevs, errno());
 		}
 
 		let mut ret_count_adjusted = output_events.len();
