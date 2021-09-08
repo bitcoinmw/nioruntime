@@ -16,10 +16,10 @@ use bytefmt;
 use chrono::prelude::*;
 use dirs;
 use lazy_static::lazy_static;
+use nioruntime_err::{Error, ErrorKind};
 pub use nioruntime_evh::{EventHandler, EventHandlerConfig, State, WriteHandle};
 use nioruntime_log::*;
 use nioruntime_util::threadpool::OnPanic;
-use nioruntime_util::{Error, ErrorKind};
 use num_format::{Locale, ToFormattedString};
 use rand::Rng;
 use std::collections::HashMap;
@@ -365,7 +365,7 @@ impl HttpContext {
 /// ```
 /// use nioruntime_http::HttpConfig;
 /// use nioruntime_http::HttpServer;
-/// use nioruntime_util::Error;
+/// use nioruntime_err::Error;
 ///
 /// fn test() -> Result<(), Error> {
 ///     let config = HttpConfig {

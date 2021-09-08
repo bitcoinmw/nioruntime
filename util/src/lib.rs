@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod error;
+mod macros;
 pub mod ser;
 pub mod threadpool;
-
-pub use crate::error::{Error, ErrorKind};

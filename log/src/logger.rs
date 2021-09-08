@@ -18,7 +18,7 @@
 
 use chrono::{DateTime, Local, Utc};
 use lazy_static::lazy_static;
-use nioruntime_util::{Error, ErrorKind};
+use nioruntime_err::{Error, ErrorKind};
 use std::collections::HashMap;
 use std::fs::{canonicalize, metadata, File, OpenOptions};
 use std::io::Write;
@@ -694,7 +694,7 @@ macro_rules! log_config_multi {
 					}
 				}
 			}
-			Err(e) => Err(nioruntime_util::ErrorKind::PoisonError(format!(
+			Err(e) => Err(nioruntime_err::ErrorKind::PoisonError(format!(
 				"log generated poison error: {}",
 				e
 			))
@@ -738,7 +738,7 @@ macro_rules! log_config {
 					}
 				}
 			}
-			Err(e) => Err(nioruntime_util::ErrorKind::PoisonError(format!(
+			Err(e) => Err(nioruntime_err::ErrorKind::PoisonError(format!(
 				"log generated poison error: {}",
 				e
 			))

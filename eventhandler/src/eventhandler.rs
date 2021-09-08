@@ -15,8 +15,8 @@
 use errno::errno;
 use errno::Errno;
 use libc::{accept, c_int, c_void, EAGAIN};
+use nioruntime_err::{Error, ErrorKind};
 use nioruntime_log::*;
-use nioruntime_util::{Error, ErrorKind};
 use rand::Rng;
 use rustls::{Connection, ServerConfig, ServerConnection};
 use std::collections::HashMap;
@@ -312,7 +312,7 @@ impl Default for EventHandlerConfig {
 /// use std::net::{TcpListener, TcpStream};
 /// use std::sync::{RwLock, Arc};
 /// use nioruntime_evh::EventHandler;
-/// use nioruntime_util::Error;
+/// use nioruntime_err::Error;
 /// use nioruntime_evh::EventHandlerConfig;
 ///
 /// nioruntime_log::info!();
@@ -512,7 +512,7 @@ where
 	/// # Examples
 	/// ```
 	/// use nioruntime_evh::{EventHandler, EventHandlerConfig};
-	/// use nioruntime_util::Error;
+	/// use nioruntime_err::Error;
 	///
 	/// fn main() -> Result<(), Error> {
 	///     let mut eh = EventHandler::new(EventHandlerConfig::default());
@@ -548,7 +548,7 @@ where
 	/// # Examples
 	/// ```
 	/// use nioruntime_evh::EventHandler;
-	/// use nioruntime_util::Error;
+	/// use nioruntime_err::Error;
 	/// use nioruntime_log::*;
 	///
 	/// // set log level to info
@@ -585,7 +585,7 @@ where
 	/// # Examples
 	/// ```
 	/// use nioruntime_evh::EventHandler;
-	/// use nioruntime_util::Error;
+	/// use nioruntime_err::Error;
 	/// use nioruntime_log::*;
 	///
 	/// // set log level to info
@@ -623,7 +623,7 @@ where
 	/// # Examples
 	/// ```
 	/// use nioruntime_evh::EventHandler;
-	/// use nioruntime_util::Error;
+	/// use nioruntime_err::Error;
 	/// use nioruntime_log::*;
 	///
 	/// // set log level to info

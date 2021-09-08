@@ -613,6 +613,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "native-tls",
+ "nioruntime_err",
  "nioruntime_evh",
  "nioruntime_http",
  "nioruntime_log",
@@ -625,6 +626,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nioruntime_err"
+version = "0.0.1"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "chrono",
+ "failure",
+ "failure_derive",
+ "futures",
+ "lazy_static",
+ "nix",
+ "rand",
+ "serde",
+]
+
+[[package]]
 name = "nioruntime_evh"
 version = "0.0.1"
 dependencies = [
@@ -632,6 +649,7 @@ dependencies = [
  "futures",
  "kqueue-sys",
  "libc",
+ "nioruntime_err",
  "nioruntime_log",
  "nioruntime_util",
  "nix",
@@ -654,6 +672,7 @@ dependencies = [
  "fsutils",
  "itoa",
  "lazy_static",
+ "nioruntime_err",
  "nioruntime_evh",
  "nioruntime_log",
  "nioruntime_util",
@@ -670,6 +689,7 @@ dependencies = [
  "failure_derive",
  "futures",
  "lazy_static",
+ "nioruntime_err",
  "nioruntime_util",
  "nix",
  "rand",
@@ -686,6 +706,7 @@ dependencies = [
  "failure_derive",
  "futures",
  "lazy_static",
+ "nioruntime_err",
  "nix",
  "rand",
  "serde",

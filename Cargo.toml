@@ -12,7 +12,7 @@ build = "src/build/build.rs"
 edition = "2018"
 
 [workspace]
-members = ["log", "http", "eventhandler", "util"]
+members = ["log", "http", "eventhandler", "util", "error"]
 
 [dependencies]
 
@@ -20,6 +20,7 @@ nioruntime_log  = { path = "./log"          }
 nioruntime_http = { path = "./http"         }
 nioruntime_util = { path = "./util"         }
 nioruntime_evh  = { path = "./eventhandler" }
+nioruntime_err  = { path = "./error"        }
 
 ws2_32-sys = "0.2.1"
 errno = "0.2.7"

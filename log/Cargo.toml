@@ -12,6 +12,7 @@ edition = "2018"
 [dependencies]
 
 nioruntime_util = { path = "../util" }
+nioruntime_err = { path = "../error" }
 failure = "0.1"
 failure_derive = "0.1"
 futures = "0.3.0"

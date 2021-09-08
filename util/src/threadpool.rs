@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::error::{Error, ErrorKind};
 use futures::executor::block_on;
 use lazy_static::lazy_static;
+use nioruntime_err::{Error, ErrorKind};
 use rand;
 use std::collections::HashMap;
 use std::future::Future;
@@ -277,7 +277,10 @@ impl ThreadPoolImpl {
 					ErrorKind::PoisonError(format!("tx.lock stop tp: {}", e.to_string())).into();
 				error
 			})?;
-			tx.send((f, true))?;
+			tx.send((f, true)).map_err(|_e| {
+				let error: Error = ErrorKind::InternalError("send failed".to_string()).into();
+				error
+			})?;
 		}
 		Ok(())
 	}
@@ -293,7 +296,10 @@ impl ThreadPoolImpl {
 					ErrorKind::PoisonError(format!("tx.lock tp: {}", e.to_string())).into();
 				error
 			})?;
-			tx.send((f, false))?;
+			tx.send((f, false)).map_err(|_e| {
+				let error: Error = ErrorKind::InternalError("send failed".to_string()).into();
+				error
+			})?;
 		}
 		Ok(())
 	}
