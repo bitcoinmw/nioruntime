@@ -1,6 +1,6 @@
 [package]
 name = "nioruntime"
-version = "0.0.1"
+version = "0.0.2-beta1"
 authors = ["BitcoinMW Developers <bitcoinmw@protonmail.com>"]
 description = "A runtime for use with BitcoinMW"
 license = "Apache-2.0"
