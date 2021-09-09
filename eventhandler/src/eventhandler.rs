@@ -59,7 +59,16 @@ use libc::{close, fcntl, pipe, read, write};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
-debug!();
+// windows deps
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
+#[cfg(windows)]
+use wepoll_sys::{
+	epoll_create, epoll_ctl, epoll_data_t, epoll_event, epoll_wait, EPOLLIN, EPOLLOUT, EPOLLRDHUP,
+	EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
+};
+
+info!();
 
 const MAIN_LOG: &str = "mainlog";
 const BUFFER_SIZE: usize = 1024;
@@ -402,6 +411,8 @@ pub struct EventHandler<F, G, H, K> {
 	global_lock: Arc<RwLock<bool>>,
 	on_panic: Option<OnPanic>,
 	tls_server_config: Option<ServerConfig>,
+	_pipe_listener: Vec<Option<TcpListener>>,
+	_pipe_stream: Vec<Option<TcpStream>>,
 }
 
 impl<F, G, H, K> EventHandler<F, G, H, K>
@@ -728,13 +739,19 @@ where
 			global_lock,
 			on_panic: None,
 			tls_server_config,
+			_pipe_listener: vec![],
+			_pipe_stream: vec![],
 		}
 	}
 
 	/// Start the event handler.
 	pub fn start(&mut self) -> Result<(), Error> {
+		for _ in 0..self.guarded_data.len() {
+			self._pipe_listener.push(None);
+			self._pipe_stream.push(None);
+		}
 		for i in 0..self.guarded_data.len() {
-			let (rx, tx) = Self::build_pipe()?;
+			let (rx, tx) = self.build_pipe(i)?;
 			let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[i]);
 			guarded_data.wakeup_tx = tx;
 			guarded_data.wakeup_rx = rx;
@@ -756,27 +773,33 @@ where
 		Ok(())
 	}
 
-	fn build_pipe() -> Result<(ConnectionHandle, ConnectionHandle), Error> {
-		let mut retfds = [0i32; 2];
-		let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
+	fn build_pipe(&mut self, _i: usize) -> Result<(ConnectionHandle, ConnectionHandle), Error> {
 		#[cfg(target_os = "windows")]
 		{
+			let mut retfds = [0i32; 2];
+			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
 			let res = Self::socket_pipe(fds);
 			match res {
 				Ok((listener, stream)) => {
-					_pipe_stream = Some(stream);
-					_pipe_listener = Some(listener);
+					self._pipe_listener[_i] = Some(listener);
+					self._pipe_stream[_i] = Some(stream);
 				}
 				Err(e) => {
 					mainlogerror!("Error creating socket_pipe on windows, {}", e.to_string());
 				}
 			}
+			Ok((
+				retfds[0].try_into().unwrap_or(0),
+				retfds[1].try_into().unwrap_or(0),
+			))
 		}
 		#[cfg(unix)]
-		unsafe {
-			pipe(fds)
-		};
-		Ok((retfds[0], retfds[1]))
+		{
+			let mut retfds = [0i32; 2];
+			let fds: *mut c_int = &mut retfds as *mut _ as *mut c_int;
+			unsafe { pipe(fds) };
+			Ok((retfds[0], retfds[1]))
+		}
 	}
 
 	#[cfg(target_os = "linux")]
@@ -803,7 +826,7 @@ where
 	fn do_start(&mut self) -> Result<(), Error> {
 		let mut selectors = vec![];
 		for _ in 0..self.config.thread_count + 1 {
-			selectors.push(unsafe { kqueue() });
+			selectors.push(unsafe { epoll_create(1) });
 		}
 		self.start_generic(selectors)?;
 		Ok(())
@@ -891,13 +914,39 @@ where
 		Ok((handle, connection_id))
 	}
 
+	#[cfg(target_os = "windows")]
+	fn socket_pipe(fds: *mut i32) -> Result<(TcpListener, TcpStream), Error> {
+		let port = portpicker::pick_unused_port().unwrap_or(9999);
+		let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+		let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+		let res = unsafe {
+			accept(
+				listener.as_raw_socket().try_into().unwrap_or(0),
+				&mut libc::sockaddr {
+					..std::mem::zeroed()
+				},
+				&mut (std::mem::size_of::<libc::sockaddr>() as u32)
+					.try_into()
+					.unwrap_or(0),
+			)
+		};
+		let fds: &mut [i32] = unsafe { std::slice::from_raw_parts_mut(fds, 2) };
+		fds[0] = res as i32;
+		fds[1] = stream.as_raw_socket().try_into().unwrap_or(0);
+
+		Ok((listener, stream))
+	}
+
 	fn start_generic(&mut self, selectors: Vec<SelectorHandle>) -> Result<(), Error> {
 		self.ensure_handlers()?;
 
 		let on_panic = self.on_panic.clone();
 		let global_lock = &self.global_lock;
 		let global_lock_clone = global_lock.clone();
-		let selectors_clone = selectors.clone();
+		#[cfg(unix)]
+		let selectors_clone = selectors[0];
+		#[cfg(windows)]
+		let selectors_clone = selectors[0] as u64;
 		let guarded_data = self.guarded_data[0].clone();
 		let callbacks = nioruntime_util::lockr!(self.callbacks);
 		let mut guarded_data_vec = vec![];
@@ -909,8 +958,10 @@ where
 		let on_close = callbacks.on_close.as_ref().unwrap().clone();
 		let tls_server_config = self.tls_server_config.clone();
 		spawn(move || {
+			#[cfg(windows)]
+			let selectors_clone = selectors_clone as *mut c_void;
 			match Self::listener(
-				selectors_clone[0],
+				selectors_clone,
 				guarded_data,
 				&mut guarded_data_vec,
 				on_accept.clone(),
@@ -932,7 +983,10 @@ where
 
 		// start r/w threads
 		for i in 0..self.config.thread_count {
-			let selectors = selectors.clone();
+			#[cfg(unix)]
+			let selectors_clone = selectors[i + 1] as i32;
+			#[cfg(windows)]
+			let selectors_clone = selectors[i + 1] as u64;
 			let listener_guarded_data = self.guarded_data[0].clone();
 			let guarded_data = self.guarded_data[i + 1].clone();
 			let on_read = callbacks.on_read.as_ref().unwrap().clone();
@@ -964,7 +1018,6 @@ where
 			}
 
 			spawn(move || loop {
-				let selectors = selectors.clone();
 				let listener_guarded_data = listener_guarded_data.clone();
 				let guarded_data = guarded_data.clone();
 				let guarded_data_clone = guarded_data.clone();
@@ -981,8 +1034,10 @@ where
 				let counter = counter.clone();
 				let res = res.clone();
 				let jh = spawn(move || {
+					#[cfg(windows)]
+					let selectors_clone = selectors_clone as *mut c_void;
 					match Self::rwthread(
-						selectors[i + 1],
+						selectors_clone,
 						listener_guarded_data,
 						guarded_data_clone,
 						on_read,
@@ -1132,7 +1187,6 @@ where
 							.unwrap_or(0),
 					)
 				};
-
 				#[cfg(target_os = "windows")]
 				let res = unsafe {
 					ws2_32::accept(
@@ -1167,7 +1221,6 @@ where
 					if ioctl_res != 0 {
 						mainlogerror!("complete fion with error: {}", errno().to_string());
 					}
-
 					let sockoptres = unsafe {
 						ws2_32::setsockopt(
 							res,
@@ -1277,7 +1330,7 @@ where
 				#[cfg(unix)]
 				let _ = unsafe { close(selector) };
 				#[cfg(target_os = "windows")]
-				let _ = unsafe { ws2_32::closesocket(selector) };
+				let _ = unsafe { ws2_32::closesocket(selector as u64) };
 				break;
 			}
 
@@ -1295,8 +1348,7 @@ where
 				if guarded_data.wakeup_scheduled {
 					wakeup = true;
 					guarded_data.wakeup_scheduled = false;
-					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-					let res = unsafe { read(wakeup_fd, cbuf, 1) };
+					let res = do_read_bytes(wakeup_fd, &mut [0u8; 1])?;
 					if res <= 0 {
 						log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
 					}
@@ -1537,7 +1589,8 @@ where
 				let mut do_close = true;
 				let e = errno();
 				if len < 0 {
-					if e.0 == EAGAIN {
+					if e.0 == EAGAIN || len == -2 {
+						// -2 is windows would block
 						errno::set_errno(Errno(0));
 						do_close = false;
 					}
@@ -1619,7 +1672,7 @@ where
 				None => {
 					// the connection already closed
 					log_multi!(
-						INFO,
+						DEBUG,
 						MAIN_LOG,
 						"connection not found write_buffer: '{}', map='{:?}'",
 						write_buffer.connection_id,
@@ -1708,7 +1761,7 @@ where
 				#[cfg(unix)]
 				let _ = unsafe { close(selector) };
 				#[cfg(target_os = "windows")]
-				let _ = unsafe { ws2_32::closesocket(selector) };
+				let _ = unsafe { ws2_32::closesocket(selector as u64) };
 				break;
 			}
 
@@ -1725,8 +1778,7 @@ where
 				if guarded_data.wakeup_scheduled {
 					wakeup = true;
 					guarded_data.wakeup_scheduled = false;
-					let cbuf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-					let res = unsafe { read(wakeup_fd, cbuf, 1) };
+					let res = do_read_bytes(wakeup_fd, &mut [0u8; 1])?;
 					if res <= 0 {
 						log_multi!(ERROR, MAIN_LOG, "read error on wakeupfd");
 					}
@@ -1888,7 +1940,9 @@ where
 							);
 						}
 					}
-				} //_ => {}
+				}
+				#[cfg(windows)]
+				_ => {}
 			}
 			**counter += 1;
 		}
@@ -1958,10 +2012,17 @@ where
 		};
 		#[cfg(target_os = "windows")]
 		let len = {
-			let cbuf: *mut i8 = &mut buf as *mut _ as *mut i8;
-			unsafe { ws2_32::recv(handle, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) }
+			let cbuf: *mut i8 = buf as *mut _ as *mut i8;
+			errno::set_errno(Errno(0));
+			let mut len =
+				unsafe { ws2_32::recv(handle, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) };
+			if errno().0 == 10035 {
+				// would block
+				len = -2;
+			}
+			len
 		};
-		Ok(len)
+		Ok(len.try_into().unwrap_or(-1))
 	}
 
 	#[cfg(target_os = "windows")]
@@ -1970,6 +2031,31 @@ where
 		connection_handle: ConnectionHandle,
 		filter_set: &mut HashSet<ConnectionHandle>,
 	) -> Result<(), Error> {
+		filter_set.remove(&connection_handle);
+		let data = epoll_data_t {
+			fd: connection_handle.try_into().unwrap_or(0),
+		};
+		let mut event = epoll_event {
+			events: EPOLLIN | EPOLLOUT | EPOLLRDHUP,
+			data,
+		};
+
+		let res = unsafe {
+			epoll_ctl(
+				selector,
+				EPOLL_CTL_DEL.try_into().unwrap(),
+				connection_handle.try_into().unwrap_or(0),
+				&mut event,
+			)
+		};
+
+		if res != 0 {
+			mainlogerror!(
+				"Error epoll_ctl4: {}, fd={}, delete",
+				errno(),
+				connection_handle
+			);
+		}
 		Ok(())
 	}
 
@@ -2039,12 +2125,13 @@ where
 		input_events: Vec<GenericEvent>,
 		output_events: &mut Vec<GenericEvent>,
 		filter_set: &mut HashSet<ConnectionHandle>,
-		wakeup: bool,
+		_wakeup: bool,
 	) -> Result<usize, Error> {
 		for evt in input_events {
 			if evt.etype == GenericEventType::AddReadET
 				|| evt.etype == GenericEventType::AddReadET
 				|| evt.etype == GenericEventType::DelWrite
+				|| evt.etype == GenericEventType::AddReadLT
 			{
 				let op = if filter_set.remove(&evt.fd) {
 					EPOLL_CTL_MOD
@@ -2061,7 +2148,7 @@ where
 				};
 				let res = unsafe {
 					epoll_ctl(
-						win_selector,
+						selector,
 						op.try_into().unwrap_or(0),
 						evt.fd as usize,
 						&mut event,
@@ -2088,7 +2175,7 @@ where
 				};
 				let res = unsafe {
 					epoll_ctl(
-						win_selector,
+						selector,
 						op.try_into().unwrap_or(0),
 						evt.fd.try_into().unwrap_or(0),
 						&mut event,
@@ -2113,7 +2200,7 @@ where
 
 				let res = unsafe {
 					epoll_ctl(
-						win_selector,
+						selector,
 						EPOLL_CTL_DEL.try_into().unwrap_or(0),
 						evt.fd.try_into().unwrap_or(0),
 						&mut event,
@@ -2134,7 +2221,7 @@ where
 		}
 		let mut events: [epoll_event; MAX_EVENTS as usize] =
 			unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-		let results = unsafe { epoll_wait(win_selector, events.as_mut_ptr(), MAX_EVENTS, 3000) };
+		let results = unsafe { epoll_wait(selector, events.as_mut_ptr(), MAX_EVENTS, 3000) };
 		let mut ret_count_adjusted = 0;
 
 		if results > 0 {
@@ -2164,7 +2251,7 @@ where
 					};
 					let res = unsafe {
 						epoll_ctl(
-							win_selector,
+							selector,
 							EPOLL_CTL_DEL.try_into().unwrap_or(0),
 							fd.try_into().unwrap_or(0),
 							&mut event,
@@ -2399,10 +2486,16 @@ struct GuardedData {
 impl GuardedData {
 	fn wakeup(&mut self) -> Result<(), Error> {
 		if !self.wakeup_scheduled {
-			let buf: *mut c_void = &mut [0u8; 1] as *mut _ as *mut c_void;
-			let res = unsafe { write(self.wakeup_tx, buf, 1) };
+			let res = write_bytes(self.wakeup_tx, &mut [0u8; 1])?;
 			if res <= 0 {
-				log_multi!(ERROR, MAIN_LOG, "Error writing to wakup tx {}", res);
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"Error writing to wakup tx {}, error={}, wakeup={}",
+					res,
+					errno().to_string(),
+					self.wakeup_tx,
+				);
 			}
 			self.wakeup_scheduled = true;
 		}
@@ -2442,9 +2535,11 @@ enum ActionType {
 enum GenericEventType {
 	AddReadET,
 	AddReadLT,
-	//	DelRead,
 	AddWriteET,
-	//	DelWrite,
+	#[cfg(windows)]
+	DelRead,
+	#[cfg(windows)]
+	DelWrite,
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -2481,12 +2576,31 @@ impl GenericEvent {
 	}
 }
 
+fn do_read_bytes(handle: ConnectionHandle, buf: &mut [u8]) -> Result<i32, Error> {
+	#[cfg(unix)]
+	let res = {
+		let cbuf: *mut c_void = buf as *mut _ as *mut c_void;
+		unsafe { read(handle, cbuf, buf.len()) }
+	};
+	#[cfg(target_os = "windows")]
+	let res = {
+		let cbuf: *mut i8 = buf as *mut _ as *mut i8;
+		unsafe { ws2_32::recv(handle, cbuf, buf.len().try_into().unwrap_or(0), 0) }
+	};
+
+	Ok(res.try_into().unwrap_or(-1))
+}
+
 fn write_data(
 	handle: ConnectionHandle,
-	buf: &[u8],
+	buf: &mut [u8],
 	global_lock: &Arc<RwLock<bool>>,
 ) -> Result<isize, Error> {
 	let _lock = nioruntime_util::lockr!(global_lock);
+	write_bytes(handle, buf)
+}
+
+fn write_bytes(handle: ConnectionHandle, buf: &mut [u8]) -> Result<isize, Error> {
 	#[cfg(unix)]
 	let len = {
 		let cbuf: *const c_void = buf as *const _ as *const c_void;
@@ -2494,11 +2608,10 @@ fn write_data(
 	};
 	#[cfg(target_os = "windows")]
 	let len = {
-		let cbuf: *const i8 = &buf as *const _ as *const i8;
-		unsafe { ws2_32::send(handle, cbuf, (buf.len()).into(), 0) }
+		let cbuf: *mut i8 = buf as *mut _ as *mut i8;
+		unsafe { ws2_32::send(handle, cbuf, (buf.len()).try_into().unwrap_or(0), 0) }
 	};
-
-	Ok(len)
+	Ok(len.try_into().unwrap_or(0))
 }
 
 #[cfg(unix)]

@@ -14,20 +14,10 @@
 
 debug!();
 
-#[cfg(unix)]
-use libc::close;
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
-
-// windows specific deps
-#[cfg(target_os = "windows")]
-use std::os::windows::io::AsRawSocket;
-
 use byte_tools::copy;
 use byteorder::{LittleEndian, ReadBytesExt};
 use clap::load_yaml;
 use clap::App;
-use errno::errno;
 use native_tls::TlsConnector;
 use nioruntime_err::{Error, ErrorKind};
 use nioruntime_evh::EventHandler;
@@ -38,7 +28,6 @@ use nioruntime_http::HttpServer;
 use nioruntime_log::*;
 use rand::Rng;
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::io::Cursor;
 use std::io::Read;
 use std::io::Write;
@@ -86,9 +75,9 @@ fn client_thread(
 ) -> Result<(), Error> {
 	let mut lat_sum = 0.0;
 	let mut lat_max = 0;
-	let (mut stream, mut tls_stream, fd) = {
+	let (mut stream, mut tls_stream) = {
 		let _lock = tlat_sum.lock();
-		let (mut stream, mut tls_stream) = if tls {
+		let (stream, tls_stream) = if tls {
 			let connector = TlsConnector::builder()
 				.danger_accept_invalid_hostnames(true)
 				.build()
@@ -105,29 +94,7 @@ fn client_thread(
 			(Some(TcpStream::connect("127.0.0.1:9999")?), None)
 		};
 
-		let fd;
-		#[cfg(unix)]
-		match stream {
-			Some(ref mut stream) => {
-				fd = stream.as_raw_fd();
-			}
-			None => {
-				let tls_stream = tls_stream.as_mut().unwrap();
-				fd = tls_stream.get_ref().as_raw_fd();
-			}
-		}
-		#[cfg(target_os = "windows")]
-		match stream {
-			Some(stream) => {
-				fd = stream.as_raw_socket();
-			}
-			None => {
-				let tls_stream = tls_stream.unwrap();
-				fd = tls_stream.as_raw_socket();
-			}
-		}
-
-		(stream, tls_stream, fd)
+		(stream, tls_stream)
 	};
 	let buf = &mut [0u8; MAX_BUF];
 	let buf2 = &mut [0u8; MAX_BUF];
@@ -177,7 +144,7 @@ fn client_thread(
 			match res {
 				Ok(_) => {}
 				Err(ref e) => {
-					info!("Read Error: {}, fd = {}", e.to_string(), fd);
+					info!("Read Error: {}", e.to_string());
 					assert!(false);
 				}
 			}
@@ -221,22 +188,9 @@ fn client_thread(
 			assert_eq!(buf2[i as usize + 5], ((i + offt) % 128) as u8);
 		}
 		// clear buf2
-		for i in 0..len_sum {
+		for i in 0..MAX_BUF {
 			buf2[i] = 0;
 		}
-	}
-
-	{
-		let _lock = tlat_sum.lock();
-		#[cfg(unix)]
-		let close_res = unsafe { close(fd.try_into().unwrap_or(0)) };
-		#[cfg(target_os = "windows")]
-		let close_res = unsafe { ws2_32::closesocket(fd.try_into().unwrap_or(0)) };
-		if close_res != 0 {
-			let e = errno();
-			info!("error close {} (fd={})", e.to_string(), fd);
-		}
-		drop(stream);
 	}
 
 	{
