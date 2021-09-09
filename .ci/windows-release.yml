@@ -22,17 +22,17 @@ steps:
     condition:  and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/tags/'), eq(variables['CI_JOB'], 'release' ))
     inputs:
       sourceFolder: '$(Build.SourcesDirectory)\target\release'
-      contents: 'bmw-wallet.exe'
-      targetFolder: '$(Build.BinariesDirectory)\bmw_wallet'
+      contents: 'nioruntime.exe'
+      targetFolder: '$(Build.BinariesDirectory)\nioruntime'
   - task: ArchiveFiles@2
     displayName: Gather assets
     condition:  and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/tags/'), eq(variables['CI_JOB'], 'release' ))
     inputs:
-      rootFolderOrFile: '$(Build.BinariesDirectory)\bmw_wallet'
+      rootFolderOrFile: '$(Build.BinariesDirectory)\nioruntime'
       archiveType: 'zip'
-      archiveFile: '$(Build.ArtifactStagingDirectory)\bmw_wallet-$(build.my_tag)-$(build.platform).zip'
+      archiveFile: '$(Build.ArtifactStagingDirectory)\nioruntime-$(build.my_tag)-$(build.platform).zip'
   - script: |
-      powershell -Command "cd $(Build.ArtifactStagingDirectory); get-filehash -algorithm sha256 bmw_wallet-$(build.my_tag)-$(build.platform).zip | Format-List |  Out-String | ForEach-Object { $_.Trim() } > bmw_wallet-$(build.my_tag)-$(build.platform)-sha256sum.txt"
+      powershell -Command "cd $(Build.ArtifactStagingDirectory); get-filehash -algorithm sha256 nioruntime-$(build.my_tag)-$(build.platform).zip | Format-List |  Out-String | ForEach-Object { $_.Trim() } > nioruntime-$(build.my_tag)-$(build.platform)-sha256sum.txt"
     displayName: Create Checksum
     condition:  and(succeeded(), contains(variables['Build.SourceBranch'], 'refs/tags/'), eq(variables['CI_JOB'], 'release' ))
   - task: GithubRelease@0
@@ -40,14 +40,14 @@ steps:
     condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/'), eq(variables['CI_JOB'], 'release' ))
     inputs:
       gitHubConnection: 'github.com_snape479'
-      repositoryName: 'bitcoinmw/bmw_wallet'
+      repositoryName: 'bitcoinmw/nioruntime'
       action: 'edit'
       target: '$(build.sourceVersion)'
       tagSource: 'manual'
       tag: '$(build.my_tag)'
       assets: |
-        $(Build.ArtifactStagingDirectory)\bmw_wallet-$(build.my_tag)-$(build.platform).zip
-        $(Build.ArtifactStagingDirectory)\bmw_wallet-$(build.my_tag)-$(build.platform)-sha256sum.txt
+        $(Build.ArtifactStagingDirectory)\nioruntime-$(build.my_tag)-$(build.platform).zip
+        $(Build.ArtifactStagingDirectory)\nioruntime-$(build.my_tag)-$(build.platform)-sha256sum.txt
       title: '$(build.my_tag)'
       assetUploadMode: 'replace'
       addChangeLog: true
