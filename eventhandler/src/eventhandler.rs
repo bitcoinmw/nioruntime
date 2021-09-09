@@ -1416,17 +1416,6 @@ where
 			};
 			input_events.push(ge);
 
-			match conn.tls_conn {
-				Some(_tls_conn) => {
-					let ge = GenericEvent {
-						fd: conn.handle,
-						etype: GenericEventType::AddWriteET,
-					};
-					input_events.push(ge);
-				}
-				None => {}
-			}
-
 			if conn.sender.is_some() {
 				let _ = conn.sender.unwrap().send(());
 			}
