@@ -495,7 +495,7 @@ where
 		))]
 		let (fd, connection_id) = self.add(stream.as_raw_fd(), ActionType::AddStream)?;
 		#[cfg(target_os = "windows")]
-		let (fd, connection_id) = self.add(stream.as_raw_socket(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add(stream.as_raw_socket().into(), ActionType::AddStream)?;
 
 		let callback_state = Arc::new(RwLock::new(State::Init));
 		Ok(WriteHandle {
@@ -1143,7 +1143,7 @@ where
 				#[cfg(unix)]
 				let res = unsafe { close(fd) };
 				#[cfg(target_os = "windows")]
-				let res = unsafe { ws2_32::closesocket(fd) };
+				let res = unsafe { ws2_32::closesocket(fd.try_into().unwrap_or(0)) };
 				if res != 0 {
 					let e = errno();
 					mainlogerror!("error closing socket: {}", e.to_string());
@@ -1190,7 +1190,7 @@ where
 				#[cfg(target_os = "windows")]
 				let res = unsafe {
 					ws2_32::accept(
-						event.fd,
+						event.fd.try_into().unwrap_or(0),
 						&mut winapi::ws2def::SOCKADDR {
 							..std::mem::zeroed()
 						},
@@ -1262,19 +1262,19 @@ where
 				};
 
 				let wh = WriteHandle::new(
-					res,
+					res.into(),
 					guarded_data[index].clone(),
 					connection_id,
 					global_lock.clone(),
 					tls_conn.clone(),
 				);
 				(on_accept)(connection_id, wh)?;
-				cid_map.insert(res, connection_id);
+				cid_map.insert(res.into(), connection_id);
 				{
 					let mut guarded_data_next = nioruntime_util::lockw!(guarded_data_next);
 
 					guarded_data_next.nconns.push(ConnectionInfo {
-						handle: res,
+						handle: res.into(),
 						connection_id,
 						ctype: ConnectionType::Inbound,
 						sender: None,
@@ -1330,7 +1330,7 @@ where
 				#[cfg(unix)]
 				let _ = unsafe { close(selector) };
 				#[cfg(target_os = "windows")]
-				let _ = unsafe { ws2_32::closesocket(selector as u64) };
+				let _ = unsafe { ws2_32::closesocket((selector as u64).try_into().unwrap_or(0)) };
 				break;
 			}
 
@@ -1785,7 +1785,7 @@ where
 				#[cfg(unix)]
 				let _ = unsafe { close(selector) };
 				#[cfg(target_os = "windows")]
-				let _ = unsafe { ws2_32::closesocket(selector as u64) };
+				let _ = unsafe { ws2_32::closesocket((selector as u64).try_into().unwrap_or(0)) };
 				break;
 			}
 
@@ -2041,8 +2041,14 @@ where
 		let len = {
 			let cbuf: *mut i8 = buf as *mut _ as *mut i8;
 			errno::set_errno(Errno(0));
-			let mut len =
-				unsafe { ws2_32::recv(handle, cbuf, BUFFER_SIZE.try_into().unwrap_or(0), 0) };
+			let mut len = unsafe {
+				ws2_32::recv(
+					handle.try_into().unwrap_or(0),
+					cbuf,
+					BUFFER_SIZE.try_into().unwrap_or(0),
+					0,
+				)
+			};
 			if errno().0 == 10035 {
 				// would block
 				len = -2;
@@ -2612,7 +2618,14 @@ fn do_read_bytes(handle: ConnectionHandle, buf: &mut [u8]) -> Result<i32, Error>
 	#[cfg(target_os = "windows")]
 	let res = {
 		let cbuf: *mut i8 = buf as *mut _ as *mut i8;
-		unsafe { ws2_32::recv(handle, cbuf, buf.len().try_into().unwrap_or(0), 0) }
+		unsafe {
+			ws2_32::recv(
+				handle.try_into().unwrap_or(0),
+				cbuf,
+				buf.len().try_into().unwrap_or(0),
+				0,
+			)
+		}
 	};
 
 	Ok(res.try_into().unwrap_or(-1))
@@ -2636,7 +2649,14 @@ fn write_bytes(handle: ConnectionHandle, buf: &mut [u8]) -> Result<isize, Error>
 	#[cfg(target_os = "windows")]
 	let len = {
 		let cbuf: *mut i8 = buf as *mut _ as *mut i8;
-		unsafe { ws2_32::send(handle, cbuf, (buf.len()).try_into().unwrap_or(0), 0) }
+		unsafe {
+			ws2_32::send(
+				handle.try_into().unwrap_or(0),
+				cbuf,
+				(buf.len()).try_into().unwrap_or(0),
+				0,
+			)
+		}
 	};
 	Ok(len.try_into().unwrap_or(0))
 }
