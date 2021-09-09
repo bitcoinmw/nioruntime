@@ -1342,7 +1342,6 @@ where
 				&mut hash_set,
 				wakeup,
 			)?;
-
 			{
 				let mut guarded_data = nioruntime_util::lockw!(guarded_data);
 				if guarded_data.wakeup_scheduled {
@@ -1416,6 +1415,17 @@ where
 			};
 			input_events.push(ge);
 
+			match conn.tls_conn {
+				Some(_tls_conn) => {
+					let ge = GenericEvent {
+						fd: conn.handle,
+						etype: GenericEventType::AddWriteET,
+					};
+					input_events.push(ge);
+				}
+				None => {}
+			}
+
 			if conn.sender.is_some() {
 				let _ = conn.sender.unwrap().send(());
 			}
@@ -1478,43 +1488,54 @@ where
 		connection_info_map: &mut HashMap<ConnectionHandle, ConnectionInfo>,
 		listener_guarded_data: Arc<RwLock<GuardedData>>,
 		filter_set: &mut HashSet<ConnectionHandle>,
+		_input_events: &mut Vec<GenericEvent>,
 	) -> Result<(), Error> {
 		let mut disconnect = false;
 		let list = write_buffers.get_mut(&connection_id);
 		let mut break_received = false;
-		match list {
-			Some(list) => loop {
-				if list.is_empty() || break_received {
-					break;
-				}
-
+		let empty = match list {
+			Some(list) => {
 				loop {
-					let front = list.front_mut();
-					match front {
-						Some(mut front) => {
-							let (pop, disc, br) =
-								Self::do_write(event.fd, &mut front, global_lock.clone())?;
-							if disc {
-								break_received = true;
-								disconnect = true;
+					if list.is_empty() || break_received {
+						break;
+					}
+
+					loop {
+						let front = list.front_mut();
+						match front {
+							Some(mut front) => {
+								let (pop, disc, br) =
+									Self::do_write(event.fd, &mut front, global_lock.clone())?;
+								if disc {
+									break_received = true;
+									disconnect = true;
+									break;
+								}
+								if pop {
+									// if all was written, pop
+									list.pop_front();
+								}
+								if br {
+									break_received = true;
+									break;
+								}
+							}
+							None => {
 								break;
 							}
-							if pop {
-								// if all was written, pop
-								list.pop_front();
-							}
-							if br {
-								break_received = true;
-								break;
-							}
-						}
-						None => {
-							break;
 						}
 					}
 				}
-			},
-			None => {}
+				list.is_empty()
+			}
+			None => true,
+		};
+
+		// since windows is edge triggered, if list is empty, we need to add a DelWrite event to
+		// avoid infinite loop
+		if empty {
+			#[cfg(windows)]
+			Self::disable_write(_input_events, event.fd)?;
 		}
 
 		if disconnect {
@@ -1536,6 +1557,19 @@ where
 			}
 		}
 
+		Ok(())
+	}
+
+	#[cfg(windows)]
+	fn disable_write(
+		input_events: &mut Vec<GenericEvent>,
+		fd: ConnectionHandle,
+	) -> Result<(), Error> {
+		let ge = GenericEvent {
+			fd,
+			etype: GenericEventType::DelWrite,
+		};
+		input_events.push(ge);
 		Ok(())
 	}
 
@@ -1717,6 +1751,7 @@ where
 			on_client_read.clone(),
 			guarded_data.clone(),
 			&mut hash_set,
+			&mut input_events,
 		)?;
 
 		if *res != 0 {
@@ -1776,6 +1811,7 @@ where
 				}
 			}
 
+			input_events.clear();
 			*counter = 0;
 			Self::process_events(
 				selector,
@@ -1792,10 +1828,10 @@ where
 				on_client_read.clone(),
 				guarded_data.clone(),
 				&mut hash_set,
+				&mut input_events,
 			)?;
 
 			output_events.clear();
-			input_events.clear();
 		}
 		Ok(())
 	}
@@ -1815,6 +1851,7 @@ where
 		on_client_read: Pin<Box<K>>,
 		guarded_data: Arc<RwLock<GuardedData>>,
 		filter_set: &mut HashSet<ConnectionHandle>,
+		input_events: &mut Vec<GenericEvent>,
 	) -> Result<(), Error> {
 		for i in **counter..**res {
 			match output_events[i].etype {
@@ -1917,6 +1954,7 @@ where
 								connection_info_map,
 								listener_guarded_data.clone(),
 								filter_set,
+								input_events,
 							)?;
 						}
 						None => {
