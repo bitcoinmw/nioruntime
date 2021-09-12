@@ -676,6 +676,7 @@ where
 		self.add(
 			listener.as_raw_socket().try_into().unwrap_or(0),
 			ActionType::AddListener,
+			None,
 		)?;
 		Ok(())
 	}
