@@ -27,6 +27,7 @@ rand = "0.8.4"
 futures = "0.3.0"
 rustls = "0.20.0-beta1"
 rustls-pemfile = "0.2.0"
+webpki-roots = "0.22"
 
 nioruntime_util = { path = "../util"  }
 nioruntime_log  = { path = "../log"   }

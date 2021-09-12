@@ -18,7 +18,9 @@ use libc::{accept, c_int, c_void, EAGAIN};
 use nioruntime_err::{Error, ErrorKind};
 use nioruntime_log::*;
 use rand::Rng;
-use rustls::{Connection, ServerConfig, ServerConnection};
+use rustls::{
+	ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection,
+};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::LinkedList;
@@ -34,6 +36,7 @@ use std::sync::mpsc::SyncSender;
 use std::sync::RwLockWriteGuard;
 use std::sync::{Arc, RwLock};
 use std::thread::spawn;
+use webpki_roots;
 
 pub type OnPanic = fn() -> Result<(), Error>;
 
@@ -157,7 +160,8 @@ pub struct WriteHandle {
 	guarded_data: Arc<RwLock<GuardedData>>,
 	global_lock: Arc<RwLock<bool>>,
 	pub callback_state: Arc<RwLock<State>>,
-	tls_conn: Option<Arc<RwLock<ServerConnection>>>,
+	tls_server: Option<Arc<RwLock<ServerConnection>>>,
+	tls_client: Option<Arc<RwLock<ClientConnection>>>,
 }
 
 impl WriteHandle {
@@ -166,7 +170,8 @@ impl WriteHandle {
 		guarded_data: Arc<RwLock<GuardedData>>,
 		connection_id: u128,
 		global_lock: Arc<RwLock<bool>>,
-		tls_conn: Option<Arc<RwLock<ServerConnection>>>,
+		tls_client: Option<Arc<RwLock<ClientConnection>>>,
+		tls_server: Option<Arc<RwLock<ServerConnection>>>,
 	) -> Self {
 		let callback_state = {
 			let guarded_data = guarded_data.write().unwrap();
@@ -178,7 +183,8 @@ impl WriteHandle {
 			connection_id,
 			global_lock,
 			callback_state,
-			tls_conn,
+			tls_server,
+			tls_client,
 		}
 	}
 
@@ -211,7 +217,8 @@ impl WriteHandle {
 			connection_id: self.connection_id,
 			ctype: ConnectionType::Inbound,
 			sender: None,
-			tls_conn: None,
+			tls_server: None,
+			tls_client: None,
 		};
 		guarded_data.aconns.push(conn);
 		guarded_data.wakeup()?;
@@ -223,7 +230,7 @@ impl WriteHandle {
 	///
 	/// * `data` - The data to write to this connection.
 	pub fn write(&self, data: &[u8]) -> Result<(), Error> {
-		match &self.tls_conn {
+		match &self.tls_server {
 			Some(tls_conn) => {
 				let mut wbuf = vec![];
 				{
@@ -244,7 +251,29 @@ impl WriteHandle {
 				}
 				self.do_write(&wbuf)
 			}
-			None => self.do_write(data),
+			None => match &self.tls_client {
+				Some(tls_conn) => {
+					let mut wbuf = vec![];
+					{
+						let mut tls_conn = nioruntime_util::lockw!(tls_conn);
+						let mut start = 0;
+						loop {
+							let mut end = data.len();
+							if end - start > TLS_CHUNKS {
+								end = start + TLS_CHUNKS;
+							}
+							tls_conn.writer().write_all(&data[start..end])?;
+							tls_conn.write_tls(&mut wbuf)?;
+							if end == data.len() {
+								break;
+							}
+							start += TLS_CHUNKS;
+						}
+					}
+					self.do_write(&wbuf)
+				}
+				None => self.do_write(data),
+			},
 		}
 	}
 
@@ -302,6 +331,39 @@ impl TlsConfig {
 			certificates_file,
 		}
 	}
+}
+
+fn make_config(
+	trusted_cert_full_chain_file: Option<&str>,
+) -> Result<Arc<rustls::ClientConfig>, Error> {
+	let mut root_store = RootCertStore::empty();
+	root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0);
+	match trusted_cert_full_chain_file {
+		Some(trusted_cert_full_chain_file) => {
+			let full_chain_certs = load_certs(trusted_cert_full_chain_file);
+			for i in 0..full_chain_certs.len() {
+				root_store.add(&full_chain_certs[i]).map_err(|e| {
+					let error: Error = ErrorKind::SetupError(format!(
+						"adding certificate to root store generated error: {}",
+						e.to_string()
+					))
+					.into();
+					error
+				})?;
+			}
+		}
+		None => {}
+	}
+
+	let config = ClientConfig::builder()
+		.with_safe_default_cipher_suites()
+		.with_safe_default_kx_groups()
+		.with_safe_default_protocol_versions()
+		.unwrap()
+		.with_root_certificates(root_store, &[])
+		.with_no_client_auth();
+
+	Ok(Arc::new(config))
 }
 
 #[derive(Clone, Debug)]
@@ -422,6 +484,83 @@ where
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	K: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 {
+	pub fn add_tls_stream(
+		&mut self,
+		stream: &TcpStream,
+		server_name: &str,
+		trusted_certificate: Option<&str>,
+	) -> Result<WriteHandle, Error> {
+		// make sure we have a client on_read handler configured
+		{
+			let callbacks = nioruntime_util::lockr!(self.callbacks);
+
+			match callbacks.on_read {
+				Some(_) => {}
+				None => {
+					return Err(ErrorKind::SetupError(
+						"on_read callback must be registered first".to_string(),
+					)
+					.into());
+				}
+			}
+		}
+
+		stream.set_nonblocking(true)?;
+
+		#[cfg(target_os = "windows")]
+		{
+			let fd = stream.as_raw_socket();
+
+			let sockoptres = unsafe {
+				ws2_32::setsockopt(
+					fd,
+					winapi::SOL_SOCKET,
+					winapi::SO_SNDBUF,
+					&WINSOCK_BUF_SIZE as *const _ as *const i8,
+					std::mem::size_of_val(&WINSOCK_BUF_SIZE) as winapi::c_int,
+				)
+			};
+
+			if sockoptres != 0 {
+				log_multi!(
+					ERROR,
+					MAIN_LOG,
+					"setsockopt resulted in error: {}",
+					errno().to_string()
+				);
+			}
+		}
+
+		let config = make_config(trusted_certificate)?;
+		let tls_client = Some(Arc::new(RwLock::new(
+			ClientConnection::new(config, server_name.try_into().unwrap()).unwrap(),
+		)));
+
+		#[cfg(unix)]
+		let (fd, connection_id) = self.add(
+			stream.as_raw_fd(),
+			ActionType::AddTlsStream,
+			tls_client.clone(),
+		)?;
+		#[cfg(target_os = "windows")]
+		let (fd, connection_id) = self.add(
+			stream.as_raw_socket().into(),
+			ActionType::AddTlsStream,
+			tls_client.clone(),
+		)?;
+
+		let callback_state = Arc::new(RwLock::new(State::Init));
+		Ok(WriteHandle {
+			fd,
+			connection_id,
+			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
+			global_lock: self.global_lock.clone(),
+			callback_state,
+			tls_server: None,
+			tls_client,
+		})
+	}
+
 	/// Add a [`TcpStream`] to this EventHandler.
 	///
 	/// This function adds the specified [`TcpStream`] to this [`EventHandler`]. When data is read
@@ -493,9 +632,9 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, connection_id) = self.add(stream.as_raw_fd(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add(stream.as_raw_fd(), ActionType::AddStream, None)?;
 		#[cfg(target_os = "windows")]
-		let (fd, connection_id) = self.add(stream.as_raw_socket().into(), ActionType::AddStream)?;
+		let (fd, connection_id) = self.add(stream.as_raw_socket().into(), ActionType::AddStream, None)?;
 
 		let callback_state = Arc::new(RwLock::new(State::Init));
 		Ok(WriteHandle {
@@ -504,7 +643,8 @@ where
 			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
 			global_lock: self.global_lock.clone(),
 			callback_state,
-			tls_conn: None,
+			tls_server: None,
+			tls_client: None,
 		})
 	}
 
@@ -531,7 +671,7 @@ where
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
 		#[cfg(unix)]
-		self.add(listener.as_raw_fd(), ActionType::AddListener)?;
+		self.add(listener.as_raw_fd(), ActionType::AddListener, None)?;
 		#[cfg(target_os = "windows")]
 		self.add(
 			listener.as_raw_socket().try_into().unwrap_or(0),
@@ -872,6 +1012,7 @@ where
 		&mut self,
 		handle: ConnectionHandle,
 		atype: ActionType,
+		tls_client: Option<Arc<RwLock<ClientConnection>>>,
 	) -> Result<(ConnectionHandle, u128), Error> {
 		let mut rng = rand::thread_rng();
 		let connection_id = rng.gen();
@@ -887,7 +1028,8 @@ where
 				ConnectionType::Outbound
 			},
 			sender: Some(tx.clone()),
-			tls_conn: None,
+			tls_server: None,
+			tls_client,
 		};
 
 		{
@@ -897,7 +1039,7 @@ where
 					guarded_data.nconns.push(conn);
 					guarded_data.wakeup()?;
 				}
-				ActionType::AddStream => {
+				ActionType::AddStream | ActionType::AddTlsStream => {
 					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[1]);
 					guarded_data.nconns.push(conn);
 					guarded_data.wakeup()?;
@@ -1266,6 +1408,7 @@ where
 					guarded_data[index].clone(),
 					connection_id,
 					global_lock.clone(),
+					None,
 					tls_conn.clone(),
 				);
 				(on_accept)(connection_id, wh)?;
@@ -1278,7 +1421,8 @@ where
 						connection_id,
 						ctype: ConnectionType::Inbound,
 						sender: None,
-						tls_conn,
+						tls_server: tls_conn,
+						tls_client: None,
 					});
 					guarded_data_next.wakeup()?;
 				}
@@ -1400,7 +1544,8 @@ where
 				guarded_data.clone(),
 				conn.connection_id,
 				global_lock.clone(),
-				conn.tls_conn,
+				conn.tls_client,
+				conn.tls_server,
 			);
 			(on_read)(&[0u8; 0], 0, wh)?;
 		}
@@ -1414,17 +1559,6 @@ where
 				etype: GenericEventType::AddReadET,
 			};
 			input_events.push(ge);
-
-			match conn.tls_conn {
-				Some(_tls_conn) => {
-					let ge = GenericEvent {
-						fd: conn.handle,
-						etype: GenericEventType::AddWriteET,
-					};
-					input_events.push(ge);
-				}
-				None => {}
-			}
 
 			if conn.sender.is_some() {
 				let _ = conn.sender.unwrap().send(());
@@ -1551,7 +1685,8 @@ where
 					connection_id,
 					ctype: ConnectionType::Inbound,
 					sender: None,
-					tls_conn: None,
+					tls_client: None,
+					tls_server: None,
 				});
 				listener_guarded_data.wakeup()?;
 			}
@@ -1598,7 +1733,8 @@ where
 					guarded_data,
 					connection_id,
 					global_lock,
-					connection_info.tls_conn.clone(),
+					connection_info.tls_client.clone(),
+					connection_info.tls_server.clone(),
 				);
 				match connection_info.ctype {
 					ConnectionType::Inbound => (on_read)(buf, len.try_into().unwrap_or(0), wh)?,
@@ -1632,7 +1768,8 @@ where
 							connection_id,
 							ctype: ConnectionType::Inbound,
 							sender: None,
-							tls_conn: None,
+							tls_client: None,
+							tls_server: None,
 						});
 						listener_guarded_data.wakeup()?;
 					}
@@ -1864,7 +2001,7 @@ where
 							Some(conn_info) => {
 								let handle = conn_info.handle;
 								let connection_id = conn_info.connection_id;
-								match conn_info.tls_conn.clone() {
+								match conn_info.tls_server.clone() {
 									Some(mut tls_conn) => loop {
 										let mut buf = vec![];
 										let (raw_len, tls_len) = Self::do_tls_read(
@@ -1902,28 +2039,70 @@ where
 											}
 										}
 									},
-									None => loop {
-										let mut buf = [0u8; BUFFER_SIZE];
-										let len =
-											Self::do_read(handle, &mut buf, global_lock.clone())?;
-										if !Self::process_read_result(
-											selector,
-											handle,
-											listener_guarded_data.clone(),
-											guarded_data.clone(),
-											&buf,
-											len,
-											connection_id,
-											on_read.clone(),
-											on_client_read.clone(),
-											connection_id_map,
-											connection_info_map,
-											write_buffers,
-											global_lock.clone(),
-											filter_set,
-										)? {
-											break;
-										}
+									None => match conn_info.tls_client.clone() {
+										Some(mut tls_conn) => loop {
+											let mut buf = vec![];
+											let (raw_len, tls_len) = Self::do_tls_client_read(
+												handle,
+												connection_id,
+												guarded_data.clone(),
+												&mut buf,
+												global_lock.clone(),
+												&mut tls_conn,
+											)?;
+											if raw_len <= 0 || tls_len > 0 {
+												let len = if tls_len > 0 {
+													tls_len.try_into().unwrap_or(0)
+												} else {
+													raw_len
+												};
+
+												if !Self::process_read_result(
+													selector,
+													handle,
+													listener_guarded_data.clone(),
+													guarded_data.clone(),
+													&buf,
+													len,
+													connection_id,
+													on_read.clone(),
+													on_client_read.clone(),
+													connection_id_map,
+													connection_info_map,
+													write_buffers,
+													global_lock.clone(),
+													filter_set,
+												)? {
+													break;
+												}
+											}
+										},
+										None => loop {
+											let mut buf = [0u8; BUFFER_SIZE];
+											let len = Self::do_read(
+												handle,
+												&mut buf,
+												global_lock.clone(),
+											)?;
+											if !Self::process_read_result(
+												selector,
+												handle,
+												listener_guarded_data.clone(),
+												guarded_data.clone(),
+												&buf,
+												len,
+												connection_id,
+												on_read.clone(),
+												on_client_read.clone(),
+												connection_id_map,
+												connection_info_map,
+												write_buffers,
+												global_lock.clone(),
+												filter_set,
+											)? {
+												break;
+											}
+										},
 									},
 								}
 							}
@@ -1976,6 +2155,55 @@ where
 		Ok(())
 	}
 
+	fn do_tls_client_read(
+		handle: ConnectionHandle,
+		connection_id: u128,
+		guarded_data: Arc<RwLock<GuardedData>>,
+		buf: &mut Vec<u8>,
+		global_lock: Arc<RwLock<bool>>,
+		tls_conn: &mut Arc<RwLock<ClientConnection>>,
+	) -> Result<(isize, usize), Error> {
+		let pt_len;
+		buf.resize(BUFFER_SIZE, 0u8);
+		let len = Self::do_read(handle, buf, global_lock.clone())?;
+		let mut wbuf = vec![];
+		{
+			let mut tls_conn = nioruntime_util::lockw!(tls_conn);
+
+			tls_conn.read_tls(&mut &buf[0..len.try_into().unwrap_or(0)])?;
+
+			match tls_conn.process_new_packets() {
+				Ok(io_state) => {
+					pt_len = io_state.plaintext_bytes_to_read();
+					buf.resize(pt_len, 0u8);
+					tls_conn.reader().read_exact(buf)?;
+				}
+				Err(e) => {
+					log_multi!(
+						WARN,
+						MAIN_LOG,
+						"error generated processing packets for handle={}. Error={}",
+						handle,
+						e.to_string()
+					);
+					return Ok((-1, 0)); // invalid text received. Close conn.
+				}
+			}
+			tls_conn.write_tls(&mut wbuf)?;
+		}
+		let wh = WriteHandle::new(
+			handle,
+			guarded_data.clone(),
+			connection_id,
+			global_lock.clone(),
+			None,
+			None,
+		);
+		wh.write(&wbuf)?;
+
+		Ok((len, pt_len))
+	}
+
 	fn do_tls_read(
 		handle: ConnectionHandle,
 		connection_id: u128,
@@ -1987,7 +2215,6 @@ where
 		let pt_len;
 		buf.resize(BUFFER_SIZE, 0u8);
 		let len = Self::do_read(handle, buf, global_lock.clone())?;
-
 		let mut wbuf = vec![];
 		{
 			let mut tls_conn = nioruntime_util::lockw!(tls_conn);
@@ -2020,7 +2247,9 @@ where
 			connection_id,
 			global_lock.clone(),
 			None,
+			None,
 		);
+
 		wh.write(&wbuf)?;
 
 		Ok((len, pt_len))
@@ -2501,7 +2730,8 @@ struct ConnectionInfo {
 	connection_id: u128,
 	ctype: ConnectionType,
 	sender: Option<SyncSender<()>>,
-	tls_conn: Option<Arc<RwLock<ServerConnection>>>,
+	tls_server: Option<Arc<RwLock<ServerConnection>>>,
+	tls_client: Option<Arc<RwLock<ClientConnection>>>,
 }
 
 struct GuardedData {
@@ -2562,6 +2792,7 @@ pub(crate) struct StreamWriteBuffer {
 enum ActionType {
 	AddStream,
 	AddListener,
+	AddTlsStream,
 }
 
 #[derive(Debug, PartialEq, Clone, Eq, Hash)]
@@ -2956,5 +3187,66 @@ fn test_large_messages() -> Result<(), Error> {
 		}
 		std::thread::sleep(std::time::Duration::from_millis(10));
 	}
+	Ok(())
+}
+
+#[test]
+fn test_ssl() -> Result<(), Error> {
+	use std::net::TcpListener;
+	use std::net::TcpStream;
+
+	let listener = TcpListener::bind("127.0.0.1:9483")?;
+	let stream = TcpStream::connect("127.0.0.1:9483")?;
+	let mut eh = EventHandler::new(EventHandlerConfig {
+		tls_config: Some(TlsConfig {
+			certificates_file: "./src/resources/end.fullchain".to_string(),
+			private_key_file: "./src/resources/end.rsa".to_string(),
+		}),
+		..EventHandlerConfig::default()
+	});
+
+	// echo
+	eh.set_on_read(|buf, len, wh| {
+		info!("server read {}", len);
+		match len {
+			// just close the connection with no response
+			7 => {
+				let _ = wh.close();
+			}
+			// close if len == 5, otherwise keep open
+			_ => {
+				let _ = wh.write(&buf[0..len])?;
+				if len == 5 {
+					wh.close()?;
+				}
+			}
+		}
+		Ok(())
+	})?;
+
+	eh.set_on_accept(|_, _| Ok(()))?;
+	eh.set_on_close(|_| Ok(()))?;
+	let complete = Arc::new(RwLock::new(false));
+	let complete_clone = complete.clone();
+	eh.set_on_client_read(move |buf, len, _wh| {
+		info!("client_read={:?}", &buf[0..len]);
+		assert_eq!(&buf[0..len], [1, 2, 3, 4, 5, 6]);
+		let mut complete = complete_clone.write().unwrap();
+		*complete = true;
+		Ok(())
+	})?;
+
+	eh.start()?;
+	eh.add_tcp_listener(&listener)?;
+	let wh = eh.add_tls_stream(&stream, "localhost", Some("./src/resources/end.fullchain"))?;
+	wh.write(&[1, 2, 3, 4, 5, 6])?;
+	loop {
+		std::thread::sleep(std::time::Duration::from_millis(10));
+		let complete = complete.write().unwrap();
+		if *complete {
+			break;
+		}
+	}
+
 	Ok(())
 }

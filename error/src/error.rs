@@ -39,6 +39,9 @@ pub enum ErrorKind {
 	/// Internal Error
 	#[fail(display = "Internal Error: {}", _0)]
 	InternalError(String),
+	/// TLS Error
+	#[fail(display = "TLS Error: {}", _0)]
+	TLSError(String),
 	/// Stale Fd
 	#[fail(display = "Stale Fd Error: {}", _0)]
 	StaleFdError(String),
@@ -161,6 +164,14 @@ impl From<ParseIntError> for Error {
 	fn from(e: ParseIntError) -> Error {
 		Error {
 			inner: Context::new(ErrorKind::ParseIntError(format!("{}", e))),
+		}
+	}
+}
+
+impl From<rustls::Error> for Error {
+	fn from(e: rustls::Error) -> Error {
+		Error {
+			inner: Context::new(ErrorKind::TLSError(format!("{}", e))),
 		}
 	}
 }
