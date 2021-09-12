@@ -484,6 +484,27 @@ where
 	H: Fn(u128) -> Result<(), Error> + Send + 'static + Clone + Sync,
 	K: Fn(&[u8], usize, WriteHandle) -> Result<(), Error> + Send + 'static + Clone + Sync + Unpin,
 {
+	/// Add a [`TcpStream`] to this EventHandler and use tls with this TcpStream.
+	///
+	/// This function adds the specified [`TcpStream`] to this [`EventHandler`] marked as tls.
+	/// When data is read on this [`TcpStream`], the callback specified by [`EventHandler::set_on_client_read`] will be
+	/// executed and the user can respond accordingly. Please note that
+	/// the EventHanlder is only responsible for handling reads/writes/closes (when an error occurs,
+	/// or the user specifies) on the stream. The calling function must ensure that the [`TcpStream`]
+	/// stays in scope because [`TcpStream`]'s drop function will close the socket which will result
+	/// in the [`EventHandler`] detecting the close of the socket and taking appropriate action.
+	/// Also note that the caller is responsible for managing this resource. The [`EventHandler`] will
+	/// never close a connection unless it is instructed by the caller through the [`WriteHandle`] interface
+	/// or if an error occurs or the other side of the connection closes. Also, once the [`TcpStream`] is
+	/// registered with the [`EventHandler`], all reads/writes to this stream should occur through the
+	/// [`EventHandler`] interface. Calling functions in [`TcpStream`] like [`std::io::Read`] or
+	/// [`std::io::Write`] will result in undefined behavior. If the stream closes for any reason, the
+	/// callback specified by [`EventHandler::set_on_close`] will be executed to notify the user.
+	/// This function returns the [`WriteHandle`]
+	/// that may be used to write to the socket.
+	/// See the example above on how to do that.
+	/// This function will result in an error if an i/o error occurs while trying to configure the stream
+	/// or the [`EventHandler`] has not been configured using the [`EventHandler::set_on_client_read`] function.
 	pub fn add_tls_stream(
 		&mut self,
 		stream: &TcpStream,
@@ -494,11 +515,11 @@ where
 		{
 			let callbacks = nioruntime_util::lockr!(self.callbacks);
 
-			match callbacks.on_read {
+			match callbacks.on_client_read {
 				Some(_) => {}
 				None => {
 					return Err(ErrorKind::SetupError(
-						"on_read callback must be registered first".to_string(),
+						"on_client_read callback must be registered first".to_string(),
 					)
 					.into());
 				}
@@ -587,17 +608,17 @@ where
 	/// that may be used to write to the socket.
 	/// See the example above on how to do that.
 	/// This function will result in an error if an i/o error occurs while trying to configure the stream
-	/// or the [`EventHandler`] has not been started by calling the [`EventHandler::start`] function.
+	/// or the [`EventHandler`] has not been configured using the [`EventHandler::set_on_client_read`] function.
 	pub fn add_tcp_stream(&mut self, stream: &TcpStream) -> Result<WriteHandle, Error> {
 		// make sure we have a client on_read handler configured
 		{
 			let callbacks = nioruntime_util::lockr!(self.callbacks);
 
-			match callbacks.on_read {
+			match callbacks.on_client_read {
 				Some(_) => {}
 				None => {
 					return Err(ErrorKind::SetupError(
-						"on_read callback must be registered first".to_string(),
+						"on_client_read callback must be registered first".to_string(),
 					)
 					.into());
 				}
