@@ -1033,6 +1033,9 @@ where
 			tls_client,
 		};
 
+		let next_index: usize = rng.gen();
+		let next_index = (next_index % (self.guarded_data.len() - 1)) + 1;
+
 		{
 			match atype {
 				ActionType::AddListener => {
@@ -1041,7 +1044,7 @@ where
 					guarded_data.wakeup()?;
 				}
 				ActionType::AddStream | ActionType::AddTlsStream => {
-					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[1]);
+					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[next_index]);
 					guarded_data.nconns.push(conn);
 					guarded_data.wakeup()?;
 				}
