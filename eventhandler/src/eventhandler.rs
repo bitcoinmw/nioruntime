@@ -536,24 +536,30 @@ where
 			ClientConnection::new(config, server_name.try_into().unwrap()).unwrap(),
 		)));
 
+		let mut rng = rand::thread_rng();
+		let gd_index: usize = rng.gen();
+		let gd_index = (gd_index % (self.guarded_data.len() - 1)) + 1;
+
 		#[cfg(unix)]
 		let (fd, connection_id) = self.add(
 			stream.as_raw_fd(),
 			ActionType::AddTlsStream,
 			tls_client.clone(),
+			gd_index,
 		)?;
 		#[cfg(target_os = "windows")]
 		let (fd, connection_id) = self.add(
 			stream.as_raw_socket().into(),
 			ActionType::AddTlsStream,
 			tls_client.clone(),
+			gd_index,
 		)?;
 
 		let callback_state = Arc::new(RwLock::new(State::Init));
 		Ok(WriteHandle {
 			fd,
 			connection_id,
-			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
+			guarded_data: self.guarded_data[gd_index].clone(),
 			global_lock: self.global_lock.clone(),
 			callback_state,
 			tls_server: None,
@@ -624,6 +630,10 @@ where
 			}
 		}
 
+		let mut rng = rand::thread_rng();
+		let gd_index: usize = rng.gen();
+		let gd_index = (gd_index % (self.guarded_data.len() - 1)) + 1;
+
 		#[cfg(any(
 			target_os = "linux",
 			target_os = "macos",
@@ -632,15 +642,20 @@ where
 			netbsd,
 			openbsd
 		))]
-		let (fd, connection_id) = self.add(stream.as_raw_fd(), ActionType::AddStream, None)?;
+		let (fd, connection_id) = self.add(stream.as_raw_fd(), ActionType::AddStream, None, gd_index)?;
 		#[cfg(target_os = "windows")]
-		let (fd, connection_id) = self.add(stream.as_raw_socket().into(), ActionType::AddStream, None)?;
+		let (fd, connection_id) = self.add(
+			stream.as_raw_socket().into(),
+			ActionType::AddStream,
+			None,
+			gd_index,
+		)?;
 
 		let callback_state = Arc::new(RwLock::new(State::Init));
 		Ok(WriteHandle {
 			fd,
 			connection_id,
-			guarded_data: self.guarded_data[1].clone(), // TODO: not always 1.
+			guarded_data: self.guarded_data[gd_index].clone(),
 			global_lock: self.global_lock.clone(),
 			callback_state,
 			tls_server: None,
@@ -671,12 +686,13 @@ where
 		// must be nonblocking
 		listener.set_nonblocking(true)?;
 		#[cfg(unix)]
-		self.add(listener.as_raw_fd(), ActionType::AddListener, None)?;
+		self.add(listener.as_raw_fd(), ActionType::AddListener, None, 0)?;
 		#[cfg(target_os = "windows")]
 		self.add(
 			listener.as_raw_socket().try_into().unwrap_or(0),
 			ActionType::AddListener,
 			None,
+			0,
 		)?;
 		Ok(())
 	}
@@ -1014,6 +1030,7 @@ where
 		handle: ConnectionHandle,
 		atype: ActionType,
 		tls_client: Option<Arc<RwLock<ClientConnection>>>,
+		gd_index: usize,
 	) -> Result<(ConnectionHandle, u128), Error> {
 		let mut rng = rand::thread_rng();
 		let connection_id = rng.gen();
@@ -1033,9 +1050,6 @@ where
 			tls_client,
 		};
 
-		let next_index: usize = rng.gen();
-		let next_index = (next_index % (self.guarded_data.len() - 1)) + 1;
-
 		{
 			match atype {
 				ActionType::AddListener => {
@@ -1044,7 +1058,7 @@ where
 					guarded_data.wakeup()?;
 				}
 				ActionType::AddStream | ActionType::AddTlsStream => {
-					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[next_index]);
+					let mut guarded_data = nioruntime_util::lockw!(self.guarded_data[gd_index]);
 					guarded_data.nconns.push(conn);
 					guarded_data.wakeup()?;
 				}
