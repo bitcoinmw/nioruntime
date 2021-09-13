@@ -3238,8 +3238,8 @@ fn test_ssl() -> Result<(), Error> {
 	let stream = TcpStream::connect("127.0.0.1:9483")?;
 	let mut eh = EventHandler::new(EventHandlerConfig {
 		tls_config: Some(TlsConfig {
-			certificates_file: "./src/resources/end.fullchain".to_string(),
-			private_key_file: "./src/resources/end.rsa".to_string(),
+			certificates_file: "./src/resources/cert.pem".to_string(),
+			private_key_file: "./src/resources/key.pem".to_string(),
 		}),
 		..EventHandlerConfig::default()
 	});
@@ -3277,7 +3277,7 @@ fn test_ssl() -> Result<(), Error> {
 
 	eh.start()?;
 	eh.add_tcp_listener(&listener)?;
-	let wh = eh.add_tls_stream(&stream, "localhost", Some("./src/resources/end.fullchain"))?;
+	let wh = eh.add_tls_stream(&stream, "localhost", Some("./src/resources/cert.pem"))?;
 	wh.write(&[1, 2, 3, 4, 5, 6])?;
 	loop {
 		std::thread::sleep(std::time::Duration::from_millis(10));
