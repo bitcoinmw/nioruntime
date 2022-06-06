@@ -25,7 +25,7 @@ nioruntime_err  = { path = "./error"        }
 ws2_32-sys = "0.2.1"
 errno = "0.2.7"
 libc = "^0.2.17"
-nix = "0.22.0"
+nix = "0.22.2"
 rand = "0.8.4"
 byte-tools = "0.3.1"
 byteorder = "1.4.2"
